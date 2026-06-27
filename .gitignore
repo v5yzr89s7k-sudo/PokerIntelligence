@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# macOS
+.DS_Store
+
+# Runtime generated files
+runtime/current_hand_frames/
+runtime/debug_crops/
+runtime/failed_hands/
+
+# Generated outputs
+output/
+current_hand_state.json
+latest_state.json
+latest_hand.txt
+session_log.jsonl
+
+# Logs
+*.log
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE/editor
+.vscode/
+.idea/

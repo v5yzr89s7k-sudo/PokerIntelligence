@@ -1,0 +1,8 @@
+{
+  "capture_fps": 3,
+  "debug_mode": false,
+  "keep_failed_hands": true,
+  "cleanup_after_hand": true,
+  "save_keyframes": true,
+  "max_failed_hand_images": 20
+}

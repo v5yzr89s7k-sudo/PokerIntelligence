@@ -1,0 +1,23 @@
+{
+  "screenshot_folder": "screenshots",
+  "output_folder": "output",
+  "debug_crop_folder": "output/debug_crops",
+  "capture_interval_seconds": 1.0,
+  "capture_mode": "fullscreen",
+  "acr_window_title_hint": "ACR",
+  "max_screenshots_to_keep": 200,
+  "ocr_lang": "eng",
+  "tesseract_config": "--psm 6",
+  "regions_relative": {
+    "tournament_header": [0.00, 0.00, 1.00, 0.16],
+    "hero_area": [0.36, 0.73, 0.28, 0.25],
+    "hero_cards": [0.40, 0.70, 0.20, 0.12],
+    "hero_stack": [0.40, 0.83, 0.22, 0.08],
+    "action_buttons": [0.28, 0.83, 0.50, 0.14],
+    "pot_area": [0.39, 0.38, 0.23, 0.08],
+    "board_area": [0.32, 0.30, 0.36, 0.15],
+    "table_ring": [0.06, 0.16, 0.88, 0.66],
+    "left_players": [0.02, 0.18, 0.32, 0.62],
+    "right_players": [0.66, 0.18, 0.32, 0.62]
+  }
+}
