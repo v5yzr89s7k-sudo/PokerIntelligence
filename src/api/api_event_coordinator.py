@@ -335,14 +335,7 @@ def main():
         hero_visible = changes.hero_cards_visible
         count = changes.board_count
 
-        if any([
-            changes.hero_changed,
-            changes.board_changed,
-            changes.pot_changed,
-            changes.dealer_changed,
-            changes.action_buttons_changed,
-            bool(changes.stack_changed_seats),
-        ]):
+        if changes.has_changes():
             print("[LOCAL]", changes)
 
         state = maybe_read_hero(state, hero_visible)

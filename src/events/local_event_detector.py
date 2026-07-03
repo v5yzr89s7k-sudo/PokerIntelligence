@@ -48,6 +48,16 @@ class ChangeSet:
     board_count: int = 0
     hero_cards_visible: bool = False
 
+    def has_changes(self):
+        return any([
+            self.hero_changed,
+            self.board_changed,
+            self.pot_changed,
+            self.dealer_changed,
+            self.action_buttons_changed,
+            bool(self.stack_changed_seats),
+        ])
+
 
 class LocalEventDetector:
     def __init__(self):
