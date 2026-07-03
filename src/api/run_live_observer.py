@@ -1,0 +1,41 @@
+from pathlib import Path
+import subprocess
+import sys
+import time
+import signal
+
+ROOT = Path(__file__).resolve().parents[2]
+
+procs = []
+
+def start(name, args):
+    print(f"[RUNNER] starting {name}")
+    p = subprocess.Popen([sys.executable, *args], cwd=ROOT)
+    procs.append((name, p))
+
+def stop_all(*_):
+    print("\n[RUNNER] stopping")
+    for name, p in procs:
+        if p.poll() is None:
+            print(f"[RUNNER] stopping {name}")
+            p.terminate()
+    for name, p in procs:
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, stop_all)
+signal.signal(signal.SIGTERM, stop_all)
+
+start("state_machine", ["src/api/api_event_state_machine.py"])
+time.sleep(0.5)
+start("coordinator", ["src/api/api_event_coordinator.py"])
+
+while True:
+    for name, p in procs:
+        if p.poll() is not None:
+            print(f"[RUNNER] {name} exited with code {p.returncode}")
+            stop_all()
+    time.sleep(1)
