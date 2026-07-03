@@ -11,6 +11,7 @@ CURSOR = ROOT / "runtime/live/api_event_state_machine_cursor.txt"
 STATE_PATH = ROOT / "runtime/live/api_event_state_machine_state.json"
 
 from src.api.live_hand_event_writer import new_hand, set_board, close_hand, set_table_snapshot
+from src.api.position_engine import assign_positions
 
 
 def read_cursor():
@@ -30,6 +31,8 @@ def default_state():
         "board": [],
         "hero_position": "unknown",
         "players": [],
+        "dealer_button_seat": "",
+        "positions": {},
         "hand_started_at": None,
         "hand_complete": False,
         "result": None,
@@ -82,13 +85,17 @@ def transition_for_board_len(n):
 
 def handle_table_snapshot(state, event):
     players = event.get("players") or []
-    hero_position = event.get("hero_position") or "unknown"
+    dealer_button_seat = event.get("dealer_button_seat") or ""
+    positions = assign_positions(players, dealer_button_seat)
+    hero_position = positions.get("hero") or event.get("hero_position") or "unknown"
 
     state["players"] = players
+    state["dealer_button_seat"] = dealer_button_seat
+    state["positions"] = positions
     state["hero_position"] = hero_position
 
     if state.get("phase") != "WAITING":
-        set_table_snapshot(players, hero_position)
+        set_table_snapshot(players, hero_position, dealer_button_seat, positions)
 
     print("[STATE] table_snapshot", hero_position, f"players={len(players)}")
     return state
@@ -115,7 +122,9 @@ def handle_hero_cards(state, event):
     new_hand(
         players=state.get("players", []),
         hero_cards=cards,
-        hero_position=state.get("hero_position", "unknown")
+        hero_position=state.get("hero_position", "unknown"),
+        dealer_button_seat=state.get("dealer_button_seat", ""),
+        positions=state.get("positions", {})
     )
     print("[STATE] WAITING -> PREFLOP", cards)
 

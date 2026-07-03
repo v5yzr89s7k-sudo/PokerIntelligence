@@ -12,11 +12,13 @@ HISTORY.mkdir(parents=True, exist_ok=True)
 def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def new_hand(players, hero_cards, hero_position):
+def new_hand(players, hero_cards, hero_position, dealer_button_seat="", positions=None):
     state = {
         "hand_started_at": now(),
         "hero_cards": hero_cards,
         "hero_position": hero_position,
+        "dealer_button_seat": dealer_button_seat,
+        "positions": positions or {},
         "players": players,
         "streets": {
             "preflop": [],
@@ -48,13 +50,15 @@ def render(state):
     lines.append("-" * 60)
 
     if state.get("dealer_button_seat"):
-        lines.append(f"Dealer Button: {state['dealer_button_seat']}")
+        btn_pos = state.get("positions", {}).get(state["dealer_button_seat"], state["dealer_button_seat"])
+        lines.append(f"Dealer Button: {btn_pos}")
         lines.append("")
 
     hero_stack = ""
 
     for player in state["players"]:
         seat = player.get("seat","")
+        position = state.get("positions", {}).get(seat, "unknown")
         name = player.get("name","")
         stack = player.get("stack_text") or (
             f"{player.get('stack_bb')} BB" if player.get("stack_bb") is not None else ""
@@ -63,7 +67,7 @@ def render(state):
         if player.get("is_hero"):
             hero_stack = stack
 
-        lines.append(f"{seat:<18} {name:<18} {stack}")
+        lines.append(f"{position:<8} {name:<18} {stack}")
 
     lines.append("")
     lines.append(f"Hero Position: {state['hero_position']}")
@@ -106,9 +110,11 @@ def render(state):
     LIVE.write_text("\n".join(lines) + "\n")
 
 
-def set_table_snapshot(players, hero_position):
+def set_table_snapshot(players, hero_position, dealer_button_seat="", positions=None):
     state = load()
     state["players"] = players or state.get("players", [])
+    state["dealer_button_seat"] = dealer_button_seat or state.get("dealer_button_seat", "")
+    state["positions"] = positions or state.get("positions", {})
     if hero_position:
         state["hero_position"] = hero_position
     save(state)
