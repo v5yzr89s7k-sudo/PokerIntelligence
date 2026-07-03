@@ -44,13 +44,31 @@ def render(state):
     lines.append("=" * 60)
     lines.append(f"Started: {state['hand_started_at']}")
     lines.append("")
-    lines.append("PLAYERS / STACKS")
+    lines.append("TABLE")
     lines.append("-" * 60)
-    for p in state["players"]:
-        lines.append(f"{p.get('seat','')}: {p.get('name','')} - {p.get('stack_bb','')} BB")
+
+    if state.get("dealer_button_seat"):
+        lines.append(f"Dealer Button: {state['dealer_button_seat']}")
+        lines.append("")
+
+    hero_stack = ""
+
+    for player in state["players"]:
+        seat = player.get("seat","")
+        name = player.get("name","")
+        stack = player.get("stack_text") or (
+            f"{player.get('stack_bb')} BB" if player.get("stack_bb") is not None else ""
+        )
+
+        if player.get("is_hero"):
+            hero_stack = stack
+
+        lines.append(f"{seat:<18} {name:<18} {stack}")
+
     lines.append("")
-    lines.append(f"Hero position: {state['hero_position']}")
-    lines.append(f"Hero cards: {' '.join(state['hero_cards'])}")
+    lines.append(f"Hero Position: {state['hero_position']}")
+    lines.append(f"Hero Stack: {hero_stack}")
+    lines.append(f"Hero Cards: {' '.join(state['hero_cards'])}")
     lines.append("")
 
     lines.append("PREFLOP")
