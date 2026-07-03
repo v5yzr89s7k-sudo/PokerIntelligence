@@ -3,11 +3,20 @@ import cv2
 import numpy as np
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 GEOM = json.load(open(ROOT / "config/geometry.json"))
 CAPTURE = ROOT / "src/vision/window_capture.py"
+
+from src.events.detectors.hero_detector import hero_changed
+from src.events.detectors.board_detector import board_changed
+from src.events.detectors.pot_detector import pot_changed
+from src.events.detectors.stack_detector import stack_changed
+from src.events.detectors.action_buttons_detector import action_buttons_changed
+from src.events.detectors.dealer_detector import dealer_changed
 
 
 
@@ -48,15 +57,12 @@ class LocalEventDetector:
 
         changes = ChangeSet()
 
-        for rect in GEOM["hero_cards"].values():
-            if region_changed(self.previous_frame, frame, rect):
-                changes.hero_changed = True
-                break
-
-        for rect in GEOM["board"].values():
-            if region_changed(self.previous_frame, frame, rect):
-                changes.board_changed = True
-                break
+        changes.hero_changed = hero_changed(self.previous_frame, frame, GEOM)
+        changes.board_changed = board_changed(self.previous_frame, frame, GEOM)
+        changes.pot_changed = pot_changed(self.previous_frame, frame, GEOM)
+        changes.dealer_changed = dealer_changed(self.previous_frame, frame, GEOM)
+        changes.action_buttons_changed = action_buttons_changed(self.previous_frame, frame, GEOM)
+        changes.stack_changed_seats = stack_changed(self.previous_frame, frame, GEOM)
 
         self.previous_frame = frame
         return changes
