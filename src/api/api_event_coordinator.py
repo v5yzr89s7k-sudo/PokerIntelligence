@@ -12,6 +12,7 @@ GEOM = json.load(open(ROOT / "config/geometry.json"))
 
 HERO_READER = ROOT / "src/api/hero_cards_api_reader.py"
 BOARD_READER = ROOT / "src/api/board_api_reader.py"
+SNAPSHOT_READER = ROOT / "src/api/table_snapshot_api_reader.py"
 
 EVENT_LOG = ROOT / "runtime/live/api_events.jsonl"
 COORD_STATE = ROOT / "runtime/live/api_event_coordinator_state.json"
@@ -174,6 +175,16 @@ def maybe_read_hero(state, hero_visible):
         state["phase"] = "PREFLOP"
         state["hero_clear_seen"] = 0
         emit({"type": "hero_cards", "hero_cards": cards})
+
+        snapshot = run_json(SNAPSHOT_READER)
+        if snapshot:
+            emit({
+                "type": "table_snapshot",
+                "players": snapshot.get("players") or [],
+                "hero_position": snapshot.get("hero_position") or "unknown",
+                "dealer_button_seat": snapshot.get("dealer_button_seat") or "",
+                "confidence": snapshot.get("confidence"),
+            })
 
     return state
 
