@@ -15,7 +15,7 @@ from src.events.detectors.hero_detector import hero_changed
 from src.events.detectors.board_detector import board_changed
 from src.events.detectors.pot_detector import pot_changed
 from src.events.detectors.stack_detector import stack_changed
-from src.events.detectors.action_buttons_detector import action_buttons_changed
+from src.events.detectors.action_buttons_detector import action_buttons_changed, action_buttons_visible
 from src.events.detectors.dealer_detector import dealer_changed
 from src.events.detectors.card_presence import count_board_cards, hero_cards_visible
 
@@ -44,6 +44,7 @@ class ChangeSet:
     pot_changed: bool = False
     dealer_changed: bool = False
     action_buttons_changed: bool = False
+    action_buttons_visible: bool = False
     stack_changed_seats: list = field(default_factory=list)
     board_count: int = 0
     hero_cards_visible: bool = False
@@ -55,6 +56,7 @@ class ChangeSet:
             self.pot_changed,
             self.dealer_changed,
             self.action_buttons_changed,
+            self.action_buttons_visible,
             bool(self.stack_changed_seats),
         ])
 
@@ -75,6 +77,7 @@ class LocalEventDetector:
         changes.pot_changed = pot_changed(self.previous_frame, frame, GEOM)
         changes.dealer_changed = dealer_changed(self.previous_frame, frame, GEOM)
         changes.action_buttons_changed = action_buttons_changed(self.previous_frame, frame, GEOM)
+        changes.action_buttons_visible = action_buttons_visible(frame, GEOM)
         changes.stack_changed_seats = stack_changed(self.previous_frame, frame, GEOM)
         changes.board_count = count_board_cards(frame, GEOM)
         changes.hero_cards_visible = hero_cards_visible(frame, GEOM)
