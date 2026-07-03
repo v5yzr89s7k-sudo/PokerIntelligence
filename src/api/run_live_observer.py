@@ -8,6 +8,26 @@ ROOT = Path(__file__).resolve().parents[2]
 
 procs = []
 
+def reset_runtime():
+    live = ROOT / "runtime/live"
+    live.mkdir(parents=True, exist_ok=True)
+
+    (live / "api_events.jsonl").write_text("")
+
+    for name in [
+        "api_event_state_machine_cursor.txt",
+        "api_event_state_machine_state.json",
+        "current_hand_state.json",
+        "current_hand.txt",
+        "api_event_coordinator_state.json",
+    ]:
+        path = live / name
+        if path.exists():
+            path.unlink()
+
+    print("[RUNNER] reset live runtime")
+
+
 def start(name, args):
     print(f"[RUNNER] starting {name}")
     p = subprocess.Popen([sys.executable, *args], cwd=ROOT)
@@ -29,6 +49,7 @@ def stop_all(*_):
 signal.signal(signal.SIGINT, stop_all)
 signal.signal(signal.SIGTERM, stop_all)
 
+reset_runtime()
 start("state_machine", ["src/api/api_event_state_machine.py"])
 time.sleep(0.5)
 start("coordinator", ["src/api/api_event_coordinator.py"])
