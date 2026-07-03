@@ -37,8 +37,21 @@ def prepare_images(path):
     table = ROOT / "runtime/api/table_frame.jpg"
     cv2.imwrite(str(table), img, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
 
-    # bottom-center hero-card crop, enlarged
-    hero = img[430:590, 360:575]
+    geometry = json.load(open(ROOT / "config/geometry.json"))
+    hero_cards = geometry.get("hero_cards") or geometry.get("hole_cards", {}).get("hero", {})
+
+    xs = [r["x"] for r in hero_cards.values()]
+    ys = [r["y"] for r in hero_cards.values()]
+    x2s = [r["x"] + r["width"] for r in hero_cards.values()]
+    y2s = [r["y"] + r["height"] for r in hero_cards.values()]
+
+    pad = 12
+    x1 = max(0, int(min(xs) - pad))
+    y1 = max(0, int(min(ys) - pad))
+    x2 = min(img.shape[1], int(max(x2s) + pad))
+    y2 = min(img.shape[0], int(max(y2s) + pad))
+
+    hero = img[y1:y2, x1:x2]
     hero = cv2.resize(hero, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
     hero_path = ROOT / "runtime/api/hero_crop_enlarged.jpg"
     cv2.imwrite(str(hero_path), hero, [int(cv2.IMWRITE_JPEG_QUALITY), 90])

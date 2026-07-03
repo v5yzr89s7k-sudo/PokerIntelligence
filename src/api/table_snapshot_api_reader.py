@@ -31,7 +31,9 @@ Return RAW JSON ONLY:
 }
 
 Rules:
-- Hero is always bottom center.
+- Hero is always the bottom-center player only.
+- Do NOT label the bottom-left player as hero.
+- The hero seat is directly above the Fold/Call/Raise buttons at the bottom center.
 - Identify occupied seats only.
 - Use seat labels exactly:
   seat_top,
