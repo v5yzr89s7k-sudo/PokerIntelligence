@@ -1,5 +1,5 @@
 from pathlib import Path
-import base64, json, subprocess, cv2
+import base64, json, subprocess, cv2, sys
 from openai import OpenAI
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -58,8 +58,11 @@ def prepare_images(path):
 
     return table, hero_path
 
-subprocess.run(["python3", str(CAPTURE)], cwd=str(ROOT), check=True)
-latest = sorted(CAPTURE_DIR.glob("acr_table_*.png"))[-1]
+if len(sys.argv) > 1:
+    latest = Path(sys.argv[1]).expanduser().resolve()
+else:
+    subprocess.run(["python3", str(CAPTURE)], cwd=str(ROOT), check=True)
+    latest = sorted(CAPTURE_DIR.glob("acr_table_*.png"))[-1]
 table, hero_crop = prepare_images(latest)
 
 response = client.responses.create(
