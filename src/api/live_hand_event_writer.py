@@ -160,6 +160,14 @@ def set_board(board):
     if state["hero_folded"]:
         return
     state["board"] = board
+    status = state.setdefault("live_status", {})
+    status["hero_to_act"] = False
+    if len(board) == 3:
+        status["current_street"] = "FLOP"
+    elif len(board) == 4:
+        status["current_street"] = "TURN"
+    elif len(board) == 5:
+        status["current_street"] = "RIVER"
     save(state)
     render(state)
 
