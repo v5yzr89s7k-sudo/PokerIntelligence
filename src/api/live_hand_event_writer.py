@@ -29,7 +29,11 @@ def new_hand(players, hero_cards, hero_position, dealer_button_seat="", position
         "board": [],
         "result": "",
         "hero_folded": False,
-        "closed": False
+        "closed": False,
+        "live_status": {
+            "current_street": "PREFLOP",
+            "hero_to_act": False
+        }
     }
     save(state)
     render(state)
@@ -101,6 +105,13 @@ def render(state):
         lines.append("")
         lines.append("HERO FOLDED - LIVE STREET TRACKING STOPPED")
 
+    lines.append("")
+    lines.append("LIVE STATUS")
+    lines.append("-" * 60)
+    status = state.get("live_status", {})
+    lines.append(f"Current Street: {status.get('current_street', '')}")
+    lines.append(f"Hero To Act: {'YES' if status.get('hero_to_act') else 'NO'}")
+
     if state["result"]:
         lines.append("")
         lines.append("RESULT")
@@ -120,6 +131,17 @@ def set_table_snapshot(players, hero_position, dealer_button_seat="", positions=
     save(state)
     render(state)
 
+
+
+def set_live_status(current_street=None, hero_to_act=None):
+    state = load()
+    status = state.setdefault("live_status", {})
+    if current_street is not None:
+        status["current_street"] = current_street
+    if hero_to_act is not None:
+        status["hero_to_act"] = hero_to_act
+    save(state)
+    render(state)
 
 def add_action(street, action):
     state = load()

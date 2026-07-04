@@ -10,7 +10,7 @@ EVENT_LOG = ROOT / "runtime/live/api_events.jsonl"
 CURSOR = ROOT / "runtime/live/api_event_state_machine_cursor.txt"
 STATE_PATH = ROOT / "runtime/live/api_event_state_machine_state.json"
 
-from src.api.live_hand_event_writer import new_hand, set_board, close_hand, set_table_snapshot
+from src.api.live_hand_event_writer import new_hand, set_board, close_hand, set_table_snapshot, set_live_status
 from src.api.position_engine import assign_positions
 
 
@@ -36,6 +36,7 @@ def default_state():
         "hand_started_at": None,
         "hand_complete": False,
         "result": None,
+        "hero_to_act": False,
     }
 
 
@@ -157,6 +158,19 @@ def handle_board(state, event):
     return state
 
 
+
+def handle_hero_decision(state, event):
+    if state["phase"] == "WAITING":
+        return state
+
+    state["hero_to_act"] = True
+    set_live_status(
+        current_street=state.get("phase", "unknown"),
+        hero_to_act=True
+    )
+    print("[STATE] hero_decision", state.get("phase"))
+    return state
+
 def handle_hand_complete(state, event):
     if state["phase"] == "WAITING":
         return state
@@ -183,6 +197,9 @@ def handle_event(state, event):
 
     if t == "board":
         return handle_board(state, event)
+
+    if t == "hero_decision":
+        return handle_hero_decision(state, event)
 
     if t == "hand_complete":
         return handle_hand_complete(state, event)
