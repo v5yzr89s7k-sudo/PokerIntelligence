@@ -10,6 +10,9 @@ sys.path.insert(0, str(ROOT))
 from src.events.detectors.action_buttons_detector import action_buttons_visible
 from src.events.detectors.hero_turn_detector import hero_nameplate_blinking_rolling
 from src.events.local_event_detector import LocalEventDetector
+from src.observer.continuous_observer import ContinuousObserver
+from src.observer.observation_timeline import ObservationTimeline
+from src.observer.observation_correlator import ObservationCorrelator
 
 CAPTURE = ROOT / "src/vision/window_capture.py"
 CAPTURE_DIR = ROOT / "runtime/window_captures"
@@ -22,6 +25,8 @@ SNAPSHOT_READER = ROOT / "src/api/table_snapshot_api_reader.py"
 EVENT_LOG = ROOT / "runtime/live/api_events.jsonl"
 COORD_STATE = ROOT / "runtime/live/api_event_coordinator_state.json"
 OBS_LOG = ROOT / "runtime/live/local_observations.jsonl"
+TIMELINE_JSON = ROOT / "runtime/live/current_observation_timeline.json"
+CORRELATOR_JSON = ROOT / "runtime/live/current_observation_correlator.json"
 EVENT_LOG.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -382,6 +387,9 @@ def main():
     print(f"Events: {EVENT_LOG}")
     state = load_state()
     local_detector = LocalEventDetector()
+    observer = ContinuousObserver()
+    timeline = ObservationTimeline()
+    correlator = ObservationCorrelator()
 
     while True:
         frame = capture()
@@ -394,6 +402,15 @@ def main():
         img = cv2.resize(img, (934, 696))
         changes = local_detector.detect(img)
         log_observation(changes)
+
+        observations = observer.ingest_changes(
+            changes,
+            street=state.get("phase", "WAITING")
+        )
+        timeline.add_many(observations)
+        timeline.write_json(TIMELINE_JSON)
+        correlator.ingest(observations)
+        CORRELATOR_JSON.write_text(json.dumps(correlator.summary(), indent=2))
 
         hero_visible = changes.hero_cards_visible
         count = changes.board_count
