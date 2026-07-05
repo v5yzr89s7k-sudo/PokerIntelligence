@@ -10,7 +10,7 @@ EVENT_LOG = ROOT / "runtime/live/api_events.jsonl"
 CURSOR = ROOT / "runtime/live/api_event_state_machine_cursor.txt"
 STATE_PATH = ROOT / "runtime/live/api_event_state_machine_state.json"
 
-from src.api.live_hand_event_writer import new_hand, set_board, close_hand, set_table_snapshot, set_live_status
+from src.api.live_hand_event_writer import new_hand, set_board, close_hand, set_table_snapshot, set_live_status, add_timeline_event
 from src.api.position_engine import assign_positions
 
 
@@ -37,6 +37,7 @@ def default_state():
         "hand_complete": False,
         "result": None,
         "hero_to_act": False,
+        "timeline": [],
     }
 
 
@@ -57,6 +58,19 @@ def load_state():
 
 def save_state(state):
     STATE_PATH.write_text(json.dumps(state, indent=2))
+
+
+def record_timeline(state, label):
+    state.setdefault("timeline", []).append({
+        "ts": time.time(),
+        "phase": state.get("phase", "unknown"),
+        "event": label,
+    })
+    try:
+        add_timeline_event(label)
+    except Exception as e:
+        print("[WARN] timeline writer failed", e)
+    return state
 
 
 
@@ -127,6 +141,7 @@ def handle_hero_cards(state, event):
         dealer_button_seat=state.get("dealer_button_seat", ""),
         positions=state.get("positions", {})
     )
+    state = record_timeline(state, f"hero_cards {' '.join(cards)}")
     print("[STATE] WAITING -> PREFLOP", cards)
 
     return state
@@ -153,6 +168,7 @@ def handle_board(state, event):
     state["board"] = board
 
     set_board(board)
+    state = record_timeline(state, f"board {next_phase} {' '.join(board)}")
     print(f"[STATE] board -> {next_phase}", board)
 
     return state
@@ -168,6 +184,7 @@ def handle_hero_decision(state, event):
         current_street=state.get("phase", "unknown"),
         hero_to_act=True
     )
+    state = record_timeline(state, f"hero_decision {state.get('phase')}")
     print("[STATE] hero_decision", state.get("phase"))
     return state
 
@@ -181,6 +198,7 @@ def handle_hero_action_complete(state, event):
         current_street=state.get("phase", "unknown"),
         hero_to_act=False
     )
+    state = record_timeline(state, f"hero_action_complete {state.get('phase')}")
     print("[STATE] hero_action_complete", state.get("phase"))
     return state
 
@@ -193,6 +211,7 @@ def handle_hand_complete(state, event):
     state["hand_complete"] = True
     state["result"] = result
 
+    state = record_timeline(state, f"hand_complete {result}")
     close_hand(result)
     print("[STATE] -> COMPLETE", result)
 

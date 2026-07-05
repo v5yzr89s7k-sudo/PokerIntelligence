@@ -28,6 +28,7 @@ def new_hand(players, hero_cards, hero_position, dealer_button_seat="", position
         },
         "board": [],
         "result": "",
+        "timeline": [],
         "hero_folded": False,
         "closed": False,
         "live_status": {
@@ -112,6 +113,14 @@ def render(state):
     lines.append(f"Current Street: {status.get('current_street', '')}")
     lines.append(f"Hero To Act: {'YES' if status.get('hero_to_act') else 'NO'}")
 
+    timeline = state.get("timeline", [])
+    if timeline:
+        lines.append("")
+        lines.append("EVENT TIMELINE")
+        lines.append("-" * 60)
+        for item in timeline:
+            lines.append(item)
+
     if state["result"]:
         lines.append("")
         lines.append("RESULT")
@@ -142,6 +151,14 @@ def set_live_status(current_street=None, hero_to_act=None):
         status["hero_to_act"] = hero_to_act
     save(state)
     render(state)
+
+def add_timeline_event(label):
+    state = load()
+    timeline = state.setdefault("timeline", [])
+    timeline.append(f"{now()} | {label}")
+    save(state)
+    render(state)
+
 
 def add_action(street, action):
     state = load()

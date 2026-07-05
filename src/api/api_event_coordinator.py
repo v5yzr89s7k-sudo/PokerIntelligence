@@ -176,8 +176,8 @@ def local_hero_blink_visible():
         capture_fn=capture,
         latest_capture_fn=latest_capture,
         geometry=GEOM,
-        samples=6,
-        delay=0.18,
+        samples=4,
+        delay=0.10,
         threshold=5.0,
     )
     print(f"[HERO_BLINK] blink={blink} max_diff={max_diff:.2f} diffs={[round(d, 2) for d in diffs]}")
@@ -282,14 +282,35 @@ def maybe_read_board(state, count, frame):
     board = data.get("board") or []
 
     if len(board) > confirmed:
-        state["confirmed_board_len"] = len(board)
-        if len(board) == 3:
+        expected_next = 3 if confirmed == 0 else confirmed + 1
+
+        if expected_next not in (3, 4, 5):
+            print(f"[BOARD] invalid expected_next={expected_next}; ignoring")
+            return state
+
+        if len(board) < expected_next:
+            print(f"[BOARD] API returned len={len(board)} expected_next={expected_next}; will retry")
+            return state
+
+        # Enforce sequential street transitions even if API sees ahead.
+        board_to_emit = board[:expected_next]
+        state["confirmed_board_len"] = expected_next
+
+        if state.get("hero_decision_active"):
+            emit({"type": "hero_action_complete"})
+            state["hero_decision_active"] = False
+
+        if expected_next == 3:
             state["phase"] = "FLOP"
-        elif len(board) == 4:
+        elif expected_next == 4:
             state["phase"] = "TURN"
-        elif len(board) == 5:
+        elif expected_next == 5:
             state["phase"] = "RIVER"
-        emit({"type": "board", "board": board})
+
+        if len(board) > expected_next:
+            print(f"[BOARD] API saw len={len(board)}; emitting sequential len={expected_next}")
+
+        emit({"type": "board", "board": board_to_emit})
     else:
         print(f"[BOARD] API returned len={len(board)} confirmed={confirmed}; will retry")
 
@@ -357,15 +378,26 @@ def main():
         hero_visible = local_hero_cards_visible(frame)
         count = local_board_count(frame)
         buttons_visible = local_action_buttons_visible(frame)
+
+        state = maybe_read_hero(state, hero_visible, count, frame)
+
+        before_board_len = state.get("confirmed_board_len", 0)
+        state = maybe_read_board(state, count, frame)
+        board_emitted_this_cycle = state.get("confirmed_board_len", 0) != before_board_len
+
+        # Do not mix a street transition and a Hero turn event in the same observation cycle.
+        # Let the state machine consume the board event first, then evaluate Hero turn on the next frame.
+        if board_emitted_this_cycle:
+            save_state(state)
+            time.sleep(0.5)
+            continue
+
         blink_visible = False
         if state.get("phase") != "WAITING" and hero_visible:
             blink_visible = local_hero_blink_visible()
 
         hero_turn_visible = blink_visible or buttons_visible
-
-        state = maybe_read_hero(state, hero_visible, count, frame)
         state = maybe_emit_hero_decision(state, hero_turn_visible, hero_visible)
-        state = maybe_read_board(state, count, frame)
         state = maybe_complete_early(state, count, hero_visible)
         state = maybe_complete_hand(state, count)
 
