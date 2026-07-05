@@ -19,6 +19,8 @@ from src.events.detectors.action_buttons_detector import action_buttons_changed,
 from src.events.detectors.dealer_detector import dealer_changed
 from src.events.detectors.card_presence import count_board_cards, hero_cards_visible
 from src.events.detectors.hero_turn_detector import hero_nameplate_blinking
+from src.events.detectors.bet_region_detector import bet_region_occupancy
+from src.events.detectors.bet_region_state_tracker import BetRegionStateTracker
 
 
 
@@ -49,6 +51,11 @@ class ChangeSet:
     hero_nameplate_blinking: bool = False
     stack_changed_seats: list = field(default_factory=list)
     stack_change_details: dict = field(default_factory=dict)
+    bet_region_occupancy: dict = field(default_factory=dict)
+    occupied_bet_regions: list = field(default_factory=list)
+    bet_region_transitions: dict = field(default_factory=dict)
+    bet_region_appeared: list = field(default_factory=list)
+    bet_region_cleared: list = field(default_factory=list)
     board_count: int = 0
     hero_cards_visible: bool = False
 
@@ -62,6 +69,8 @@ class ChangeSet:
             self.action_buttons_visible,
             self.hero_nameplate_blinking,
             bool(self.stack_changed_seats),
+            bool(self.bet_region_appeared),
+            bool(self.bet_region_cleared),
         ])
 
     def to_dict(self):
@@ -75,6 +84,11 @@ class ChangeSet:
             "hero_nameplate_blinking": self.hero_nameplate_blinking,
             "stack_changed_seats": list(self.stack_changed_seats),
             "stack_change_details": self.stack_change_details,
+            "bet_region_occupancy": self.bet_region_occupancy,
+            "occupied_bet_regions": list(self.occupied_bet_regions),
+            "bet_region_transitions": self.bet_region_transitions,
+            "bet_region_appeared": list(self.bet_region_appeared),
+            "bet_region_cleared": list(self.bet_region_cleared),
             "board_count": self.board_count,
             "hero_cards_visible": self.hero_cards_visible,
             "has_changes": self.has_changes(),
@@ -98,6 +112,12 @@ class ChangeSet:
             parts.append("hero_nameplate_blinking")
         if self.stack_changed_seats:
             parts.append("stack_changed=" + ",".join(self.stack_changed_seats))
+        if self.occupied_bet_regions:
+            parts.append("bet_regions=" + ",".join(self.occupied_bet_regions))
+        if self.bet_region_appeared:
+            parts.append("bet_region_appeared=" + ",".join(self.bet_region_appeared))
+        if self.bet_region_cleared:
+            parts.append("bet_region_cleared=" + ",".join(self.bet_region_cleared))
         if self.hero_cards_visible:
             parts.append("hero_cards_visible")
         return " ".join(parts) if parts else "no_change"
@@ -106,6 +126,7 @@ class ChangeSet:
 class LocalEventDetector:
     def __init__(self):
         self.previous_frame = None
+        self.bet_region_tracker = BetRegionStateTracker()
 
     def detect(self, frame):
         if self.previous_frame is None:
@@ -124,6 +145,20 @@ class LocalEventDetector:
         changes.stack_changed_seats = [
             seat for seat, info in changes.stack_change_details.items()
             if info.get("changed")
+        ]
+        changes.bet_region_occupancy = bet_region_occupancy(frame, GEOM)
+        changes.occupied_bet_regions = [
+            seat for seat, info in changes.bet_region_occupancy.items()
+            if info.get("occupied")
+        ]
+        changes.bet_region_transitions = self.bet_region_tracker.update(changes.bet_region_occupancy)
+        changes.bet_region_appeared = [
+            seat for seat, info in changes.bet_region_transitions.items()
+            if info.get("appeared")
+        ]
+        changes.bet_region_cleared = [
+            seat for seat, info in changes.bet_region_transitions.items()
+            if info.get("cleared")
         ]
         changes.board_count = count_board_cards(frame, GEOM)
         changes.hero_cards_visible = hero_cards_visible(frame, GEOM)

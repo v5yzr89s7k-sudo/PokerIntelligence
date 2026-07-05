@@ -5,6 +5,7 @@ from src.observer.observation_types import (
     BOARD_CHANGED,
     STACK_CHANGED,
     BET_REGION_OCCUPIED,
+    BET_REGION_CLEARED,
     HERO_CARDS_VISIBLE,
     ACTION_BUTTONS_VISIBLE,
     DEALER_CHANGED,
@@ -32,13 +33,22 @@ def observations_from_changes(changes, street="unknown") -> List[Observation]:
             payload=details.get(seat) or {},
         ))
 
-    for seat in getattr(changes, "occupied_bet_regions", []) or []:
-        details = getattr(changes, "bet_region_occupancy", {}) or {}
+    transitions = getattr(changes, "bet_region_transitions", {}) or {}
+
+    for seat in getattr(changes, "bet_region_appeared", []) or []:
         observations.append(Observation(
             type=BET_REGION_OCCUPIED,
             street=street,
             seat=seat,
-            payload=details.get(seat) or {},
+            payload=transitions.get(seat) or {},
+        ))
+
+    for seat in getattr(changes, "bet_region_cleared", []) or []:
+        observations.append(Observation(
+            type=BET_REGION_CLEARED,
+            street=street,
+            seat=seat,
+            payload=transitions.get(seat) or {},
         ))
 
     if getattr(changes, "hero_cards_visible", False):
