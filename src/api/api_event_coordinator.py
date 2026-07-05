@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from src.events.detectors.action_buttons_detector import action_buttons_visible
 from src.events.detectors.hero_turn_detector import hero_nameplate_blinking_rolling
+from src.events.local_event_detector import LocalEventDetector
 
 CAPTURE = ROOT / "src/vision/window_capture.py"
 CAPTURE_DIR = ROOT / "runtime/window_captures"
@@ -371,13 +372,22 @@ def main():
     print("api_event_coordinator running event-only mode. Ctrl+C to stop.")
     print(f"Events: {EVENT_LOG}")
     state = load_state()
+    local_detector = LocalEventDetector()
 
     while True:
         frame = capture()
 
-        hero_visible = local_hero_cards_visible(frame)
-        count = local_board_count(frame)
-        buttons_visible = local_action_buttons_visible(frame)
+        img = cv2.imread(str(frame)) if frame else None
+        if img is None:
+            time.sleep(0.5)
+            continue
+
+        img = cv2.resize(img, (934, 696))
+        changes = local_detector.detect(img)
+
+        hero_visible = changes.hero_cards_visible
+        count = changes.board_count
+        buttons_visible = changes.action_buttons_visible
 
         state = maybe_read_hero(state, hero_visible, count, frame)
 
