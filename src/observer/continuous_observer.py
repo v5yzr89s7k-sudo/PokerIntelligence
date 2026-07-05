@@ -51,8 +51,13 @@ def observations_from_changes(changes, street="unknown") -> List[Observation]:
             payload=transitions.get(seat) or {},
         ))
 
-    if getattr(changes, "hero_cards_visible", False):
-        observations.append(Observation(type=HERO_CARDS_VISIBLE, street=street, seat="hero"))
+    if getattr(changes, "hero_cards_appeared", False):
+        observations.append(Observation(
+            type=HERO_CARDS_VISIBLE,
+            street=street,
+            seat="hero",
+            payload=getattr(changes, "hero_cards_transition", {}) or {},
+        ))
 
     if getattr(changes, "action_buttons_visible", False):
         observations.append(Observation(type=ACTION_BUTTONS_VISIBLE, street=street, seat="hero"))

@@ -21,6 +21,7 @@ from src.events.detectors.card_presence import count_board_cards, hero_cards_vis
 from src.events.detectors.hero_turn_detector import hero_nameplate_blinking
 from src.events.detectors.bet_region_detector import bet_region_occupancy
 from src.events.detectors.bet_region_state_tracker import BetRegionStateTracker
+from src.events.transition_engine import TransitionEngine
 
 
 
@@ -58,6 +59,9 @@ class ChangeSet:
     bet_region_cleared: list = field(default_factory=list)
     board_count: int = 0
     hero_cards_visible: bool = False
+    hero_cards_transition: dict = field(default_factory=dict)
+    hero_cards_appeared: bool = False
+    hero_cards_cleared: bool = False
 
     def has_changes(self):
         return any([
@@ -71,6 +75,8 @@ class ChangeSet:
             bool(self.stack_changed_seats),
             bool(self.bet_region_appeared),
             bool(self.bet_region_cleared),
+            self.hero_cards_appeared,
+            self.hero_cards_cleared,
         ])
 
     def to_dict(self):
@@ -91,6 +97,9 @@ class ChangeSet:
             "bet_region_cleared": list(self.bet_region_cleared),
             "board_count": self.board_count,
             "hero_cards_visible": self.hero_cards_visible,
+            "hero_cards_transition": self.hero_cards_transition,
+            "hero_cards_appeared": self.hero_cards_appeared,
+            "hero_cards_cleared": self.hero_cards_cleared,
             "has_changes": self.has_changes(),
         }
 
@@ -118,8 +127,10 @@ class ChangeSet:
             parts.append("bet_region_appeared=" + ",".join(self.bet_region_appeared))
         if self.bet_region_cleared:
             parts.append("bet_region_cleared=" + ",".join(self.bet_region_cleared))
-        if self.hero_cards_visible:
-            parts.append("hero_cards_visible")
+        if self.hero_cards_appeared:
+            parts.append("hero_cards_appeared")
+        if self.hero_cards_cleared:
+            parts.append("hero_cards_cleared")
         return " ".join(parts) if parts else "no_change"
 
 
@@ -127,6 +138,7 @@ class LocalEventDetector:
     def __init__(self):
         self.previous_frame = None
         self.bet_region_tracker = BetRegionStateTracker()
+        self.transition_engine = TransitionEngine()
 
     def detect(self, frame):
         if self.previous_frame is None:
@@ -163,6 +175,8 @@ class LocalEventDetector:
         changes.board_count = count_board_cards(frame, GEOM)
         changes.hero_cards_visible = hero_cards_visible(frame, GEOM)
         changes.hero_nameplate_blinking = hero_nameplate_blinking(self.previous_frame, frame, GEOM)
+
+        changes = self.transition_engine.apply(changes)
 
         self.previous_frame = frame
         return changes
