@@ -13,6 +13,7 @@ from src.events.local_event_detector import LocalEventDetector
 from src.observer.continuous_observer import ContinuousObserver
 from src.observer.observation_timeline import ObservationTimeline
 from src.observer.observation_correlator import ObservationCorrelator
+from src.observer.action_episode_manager import ActionEpisodeManager
 
 CAPTURE = ROOT / "src/vision/window_capture.py"
 CAPTURE_DIR = ROOT / "runtime/window_captures"
@@ -27,6 +28,7 @@ COORD_STATE = ROOT / "runtime/live/api_event_coordinator_state.json"
 OBS_LOG = ROOT / "runtime/live/local_observations.jsonl"
 TIMELINE_JSON = ROOT / "runtime/live/current_observation_timeline.json"
 CORRELATOR_JSON = ROOT / "runtime/live/current_observation_correlator.json"
+EPISODES_JSON = ROOT / "runtime/live/current_action_episodes.json"
 EVENT_LOG.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -390,6 +392,7 @@ def main():
     observer = ContinuousObserver()
     timeline = ObservationTimeline()
     correlator = ObservationCorrelator()
+    episode_manager = ActionEpisodeManager()
 
     while True:
         frame = capture()
@@ -411,6 +414,10 @@ def main():
         timeline.write_json(TIMELINE_JSON)
         correlator.ingest(observations)
         CORRELATOR_JSON.write_text(json.dumps(correlator.summary(), indent=2))
+
+        if state.get("phase") != "WAITING":
+            episode_manager.ingest(observations)
+            EPISODES_JSON.write_text(json.dumps(episode_manager.summary(), indent=2))
 
         hero_visible = changes.hero_cards_visible
         count = changes.board_count
