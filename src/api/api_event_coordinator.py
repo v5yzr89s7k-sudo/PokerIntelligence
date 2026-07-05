@@ -195,6 +195,11 @@ def maybe_emit_hero_decision(state, visible, hero_visible):
         state["hero_decision_active"] = True
         return state
 
+    if not visible and state.get("hero_decision_active"):
+        emit({"type": "hero_action_complete"})
+        state["hero_decision_active"] = False
+        return state
+
     if not visible:
         state["hero_decision_active"] = False
 

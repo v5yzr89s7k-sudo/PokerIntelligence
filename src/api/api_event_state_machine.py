@@ -171,6 +171,19 @@ def handle_hero_decision(state, event):
     print("[STATE] hero_decision", state.get("phase"))
     return state
 
+
+def handle_hero_action_complete(state, event):
+    if state["phase"] == "WAITING":
+        return state
+
+    state["hero_to_act"] = False
+    set_live_status(
+        current_street=state.get("phase", "unknown"),
+        hero_to_act=False
+    )
+    print("[STATE] hero_action_complete", state.get("phase"))
+    return state
+
 def handle_hand_complete(state, event):
     if state["phase"] == "WAITING":
         return state
@@ -200,6 +213,9 @@ def handle_event(state, event):
 
     if t == "hero_decision":
         return handle_hero_decision(state, event)
+
+    if t == "hero_action_complete":
+        return handle_hero_action_complete(state, event)
 
     if t == "hand_complete":
         return handle_hand_complete(state, event)
