@@ -3,8 +3,12 @@ import json
 import time
 import subprocess
 import cv2
+import sys
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+from src.events.detectors.action_buttons_detector import action_buttons_visible
+from src.events.detectors.hero_turn_detector import hero_nameplate_blinking_rolling
 
 CAPTURE = ROOT / "src/vision/window_capture.py"
 CAPTURE_DIR = ROOT / "runtime/window_captures"
@@ -31,6 +35,7 @@ def fresh_state():
         "hero_clear_seen": 0,
         "hero_visible_seen": 0,
         "last_event": None,
+        "hero_decision_active": False,
     }
 
 
@@ -150,11 +155,62 @@ def run_json(script):
         return None
 
 
-def maybe_read_hero(state, hero_visible):
+
+def local_action_buttons_visible():
+    path = latest_capture()
+    if not path:
+        return False
+
+    img = cv2.imread(str(path))
+    if img is None:
+        return False
+
+    img = cv2.resize(img, (934, 696))
+    return action_buttons_visible(img, GEOM)
+
+
+def local_hero_blink_visible():
+    blink, max_diff, diffs = hero_nameplate_blinking_rolling(
+        capture_fn=capture,
+        latest_capture_fn=latest_capture,
+        geometry=GEOM,
+        samples=6,
+        delay=0.18,
+        threshold=5.0,
+    )
+    print(f"[HERO_BLINK] blink={blink} max_diff={max_diff:.2f} diffs={[round(d, 2) for d in diffs]}")
+    return blink
+
+
+def maybe_emit_hero_decision(state, visible, hero_visible):
+    if state.get("phase") == "WAITING":
+        state["hero_decision_active"] = False
+        return state
+
+    if visible:
+        print(f"[HERO_DECISION_CHECK] visible={visible} hero_visible={hero_visible} phase={state.get('phase')} active={state.get('hero_decision_active')}")
+
+    if visible and hero_visible and not state.get("hero_decision_active"):
+        emit({"type": "hero_decision"})
+        state["hero_decision_active"] = True
+        return state
+
+    if not visible:
+        state["hero_decision_active"] = False
+
+    return state
+
+
+def maybe_read_hero(state, hero_visible, board_count):
     if state.get("phase") != "WAITING":
         return state
 
     if not hero_visible:
+        return state
+
+    if board_count != 0:
+        print(f"[HERO] visible but board_count={board_count}; waiting for clean hand")
+        state["hero_visible_seen"] = 0
         return state
 
     state["hero_visible_seen"] = state.get("hero_visible_seen", 0) + 1
@@ -292,8 +348,15 @@ def main():
         capture()
         hero_visible = local_hero_cards_visible()
         count = local_board_count()
+        buttons_visible = local_action_buttons_visible()
+        blink_visible = False
+        if state.get("phase") != "WAITING" and hero_visible:
+            blink_visible = local_hero_blink_visible()
 
-        state = maybe_read_hero(state, hero_visible)
+        hero_turn_visible = blink_visible or buttons_visible
+
+        state = maybe_read_hero(state, hero_visible, count)
+        state = maybe_emit_hero_decision(state, hero_turn_visible, hero_visible)
         state = maybe_read_board(state, count)
         state = maybe_complete_early(state, count, hero_visible)
         state = maybe_complete_hand(state, count)
