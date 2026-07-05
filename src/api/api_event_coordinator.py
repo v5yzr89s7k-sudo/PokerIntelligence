@@ -72,6 +72,7 @@ def capture():
         stderr=subprocess.DEVNULL,
         check=True,
     )
+    return latest_capture()
 
 
 def latest_capture():
@@ -89,8 +90,7 @@ def card_present(c):
     return (gray > 145).mean() > 0.08
 
 
-def local_board_count():
-    path = latest_capture()
+def local_board_count(path):
     if not path:
         return 0
 
@@ -108,8 +108,7 @@ def local_board_count():
     return count
 
 
-def local_hero_cards_visible():
-    path = latest_capture()
+def local_hero_cards_visible(path):
     if not path:
         return False
 
@@ -131,9 +130,13 @@ def local_hero_cards_visible():
     return seen >= 2
 
 
-def run_json(script):
+def run_json(script, frame=None):
+    cmd = ["python3", str(script)]
+    if frame:
+        cmd.append(str(frame))
+
     p = subprocess.run(
-        ["python3", str(script)],
+        cmd,
         cwd=str(ROOT),
         text=True,
         capture_output=True,
@@ -156,8 +159,7 @@ def run_json(script):
 
 
 
-def local_action_buttons_visible():
-    path = latest_capture()
+def local_action_buttons_visible(path):
     if not path:
         return False
 
@@ -206,7 +208,7 @@ def maybe_emit_hero_decision(state, visible, hero_visible):
     return state
 
 
-def maybe_read_hero(state, hero_visible, board_count):
+def maybe_read_hero(state, hero_visible, board_count, frame):
     if state.get("phase") != "WAITING":
         return state
 
@@ -226,7 +228,7 @@ def maybe_read_hero(state, hero_visible, board_count):
     if state["hero_read"]:
         return state
 
-    data = run_json(HERO_READER)
+    data = run_json(HERO_READER, frame)
     if not data:
         return state
 
@@ -237,7 +239,7 @@ def maybe_read_hero(state, hero_visible, board_count):
         state["hero_clear_seen"] = 0
         emit({"type": "hero_cards", "hero_cards": cards})
 
-        snapshot = run_json(SNAPSHOT_READER)
+        snapshot = run_json(SNAPSHOT_READER, frame)
         if snapshot:
             emit({
                 "type": "table_snapshot",
@@ -250,7 +252,7 @@ def maybe_read_hero(state, hero_visible, board_count):
     return state
 
 
-def maybe_read_board(state, count):
+def maybe_read_board(state, count, frame):
     if state.get("phase") == "WAITING":
         return state
 
@@ -273,7 +275,7 @@ def maybe_read_board(state, count):
     state["last_api_attempt_ts"] = now
     print(f"[BOARD] local_count={count} confirmed={confirmed}; calling API")
 
-    data = run_json(BOARD_READER)
+    data = run_json(BOARD_READER, frame)
     if not data:
         return state
 
@@ -350,19 +352,20 @@ def main():
     state = load_state()
 
     while True:
-        capture()
-        hero_visible = local_hero_cards_visible()
-        count = local_board_count()
-        buttons_visible = local_action_buttons_visible()
+        frame = capture()
+
+        hero_visible = local_hero_cards_visible(frame)
+        count = local_board_count(frame)
+        buttons_visible = local_action_buttons_visible(frame)
         blink_visible = False
         if state.get("phase") != "WAITING" and hero_visible:
             blink_visible = local_hero_blink_visible()
 
         hero_turn_visible = blink_visible or buttons_visible
 
-        state = maybe_read_hero(state, hero_visible, count)
+        state = maybe_read_hero(state, hero_visible, count, frame)
         state = maybe_emit_hero_decision(state, hero_turn_visible, hero_visible)
-        state = maybe_read_board(state, count)
+        state = maybe_read_board(state, count, frame)
         state = maybe_complete_early(state, count, hero_visible)
         state = maybe_complete_hand(state, count)
 
