@@ -70,15 +70,32 @@ def save_state(state):
 def emit(event):
     event["ts"] = time.time()
     EVENT_LOG.open("a").write(json.dumps(event) + "\n")
-    print("[EVENT]", event)
+
+    kind = event.get("type")
+    if kind == "hero_cards":
+        print(f"[HAND] Hero cards: {' '.join(event.get('hero_cards') or [])}")
+    elif kind == "table_snapshot":
+        print(f"[HAND] Table snapshot: players={len(event.get('players') or [])} dealer={event.get('dealer_button_seat') or 'unknown'} hero_position={event.get('hero_position') or 'unknown'}")
+    elif kind == "hero_decision":
+        print("[ACTION] Hero to act")
+    elif kind == "hero_action_complete":
+        print("[ACTION] Hero action complete")
+    elif kind == "board":
+        board = event.get("board") or []
+        street = {3: "FLOP", 4: "TURN", 5: "RIVER"}.get(len(board), "BOARD")
+        print(f"[BOARD] {street}: {' '.join(board)}")
+    elif kind == "hand_complete":
+        print(f"[HAND] Complete: {event.get('result')}")
+    else:
+        print("[EVENT]", event)
 
 
 def log_observation(changes):
     payload = changes.to_dict()
     payload["ts"] = time.time()
     OBS_LOG.open("a").write(json.dumps(payload) + "\n")
-    if payload.get("has_changes"):
-        print("[OBS]", changes.summary())
+    # Detailed local observations are written to local_observations.jsonl.
+    # Keep terminal output focused on hand/action/board events.
 
 
 def capture():
@@ -197,7 +214,6 @@ def local_hero_blink_visible():
         delay=0.10,
         threshold=5.0,
     )
-    print(f"[HERO_BLINK] blink={blink} max_diff={max_diff:.2f} diffs={[round(d, 2) for d in diffs]}")
     return blink
 
 
@@ -205,9 +221,6 @@ def maybe_emit_hero_decision(state, visible, hero_visible):
     if state.get("phase") == "WAITING":
         state["hero_decision_active"] = False
         return state
-
-    if visible:
-        print(f"[HERO_DECISION_CHECK] visible={visible} hero_visible={hero_visible} phase={state.get('phase')} active={state.get('hero_decision_active')}")
 
     if visible and hero_visible and not state.get("hero_decision_active"):
         emit({"type": "hero_decision"})
@@ -239,7 +252,6 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
 
     state["hero_visible_seen"] = state.get("hero_visible_seen", 0) + 1
     if state["hero_visible_seen"] < 2:
-        print(f"[HERO] visible {state['hero_visible_seen']}/2")
         return state
 
     if state["hero_read"]:
@@ -286,11 +298,9 @@ def maybe_read_board(state, count, frame):
 
     # Do not spam API while waiting for the visual/API state to catch up.
     if now - last_attempt < 1.25:
-        print(f"[BOARD] local_count={count} confirmed={confirmed}; cooldown")
         return state
 
     state["last_api_attempt_ts"] = now
-    print(f"[BOARD] local_count={count} confirmed={confirmed}; calling API")
 
     data = run_json(BOARD_READER, frame)
     if not data:
@@ -324,9 +334,6 @@ def maybe_read_board(state, count, frame):
         elif expected_next == 5:
             state["phase"] = "RIVER"
 
-        if len(board) > expected_next:
-            print(f"[BOARD] API saw len={len(board)}; emitting sequential len={expected_next}")
-
         emit({"type": "board", "board": board_to_emit})
     else:
         print(f"[BOARD] API returned len={len(board)} confirmed={confirmed}; will retry")
@@ -345,7 +352,6 @@ def maybe_complete_early(state, count, hero_visible):
     # If hero cards disappear, hero is out of the hand or the hand has ended.
     if not hero_visible:
         state["hero_clear_seen"] = state.get("hero_clear_seen", 0) + 1
-        print(f"[HAND] hero cards not visible {state['hero_clear_seen']}/4")
     else:
         state["hero_clear_seen"] = 0
 
@@ -356,7 +362,6 @@ def maybe_complete_early(state, count, hero_visible):
     # If board clears after any street, the hand ended before showdown/river completion.
     if phase in ("FLOP", "TURN") and count == 0:
         state["board_clear_seen"] = state.get("board_clear_seen", 0) + 1
-        print(f"[HAND] board cleared before river {state['board_clear_seen']}/4")
         if state["board_clear_seen"] >= 4:
             emit({"type": "hand_complete", "result": "Board cleared before river"})
             return fresh_state()
@@ -373,7 +378,6 @@ def maybe_complete_hand(state, count):
 
     if count == 0:
         state["board_clear_seen"] = state.get("board_clear_seen", 0) + 1
-        print(f"[HAND] river complete; board clear seen {state['board_clear_seen']}/4")
     else:
         state["board_clear_seen"] = 0
 
