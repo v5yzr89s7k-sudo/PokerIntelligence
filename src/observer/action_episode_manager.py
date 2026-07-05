@@ -108,17 +108,28 @@ class ActionEpisodeManager:
             seat = self._episode_seat(obs)
             street = obs.street or "unknown"
 
-            # Pot changes are table-level, but they often confirm active chip-commit episodes.
-            # Attach them to currently active seat episodes on the same street instead of
-            # creating a standalone table episode when possible.
+            # Pot changes are table-level, but they should only strengthen episodes
+            # that already have direct chip-commit evidence. Do not spray pot_changed
+            # across every stack-change episode.
             if obs.type == POT_CHANGED and seat == "table":
                 matched = False
                 for ep in list(self.active_by_seat.values()):
-                    if not ep.closed and ep.street == street:
+                    kinds = {o.get("type") for o in ep.observations}
+                    if (
+                        not ep.closed
+                        and ep.street == street
+                        and BET_REGION_OCCUPIED in kinds
+                    ):
                         ep.add(obs)
                         matched = True
                 if matched:
                     continue
+                continue
+
+            # A clear without an active episode is usually stale animation cleanup.
+            # Do not create a new episode from a lone cleared signal.
+            if obs.type == BET_REGION_CLEARED and seat not in self.active_by_seat:
+                continue
 
             ep = self.active_by_seat.get(seat)
             if ep is None or ep.closed or ep.street != street:
