@@ -63,6 +63,43 @@ class ChangeSet:
             bool(self.stack_changed_seats),
         ])
 
+    def to_dict(self):
+        return {
+            "hero_changed": self.hero_changed,
+            "board_changed": self.board_changed,
+            "pot_changed": self.pot_changed,
+            "dealer_changed": self.dealer_changed,
+            "action_buttons_changed": self.action_buttons_changed,
+            "action_buttons_visible": self.action_buttons_visible,
+            "hero_nameplate_blinking": self.hero_nameplate_blinking,
+            "stack_changed_seats": list(self.stack_changed_seats),
+            "board_count": self.board_count,
+            "hero_cards_visible": self.hero_cards_visible,
+            "has_changes": self.has_changes(),
+        }
+
+    def summary(self):
+        parts = []
+        if self.hero_changed:
+            parts.append("hero_changed")
+        if self.board_changed:
+            parts.append(f"board_changed/count={self.board_count}")
+        if self.pot_changed:
+            parts.append("pot_changed")
+        if self.dealer_changed:
+            parts.append("dealer_changed")
+        if self.action_buttons_changed:
+            parts.append("action_buttons_changed")
+        if self.action_buttons_visible:
+            parts.append("action_buttons_visible")
+        if self.hero_nameplate_blinking:
+            parts.append("hero_nameplate_blinking")
+        if self.stack_changed_seats:
+            parts.append("stack_changed=" + ",".join(self.stack_changed_seats))
+        if self.hero_cards_visible:
+            parts.append("hero_cards_visible")
+        return " ".join(parts) if parts else "no_change"
+
 
 class LocalEventDetector:
     def __init__(self):

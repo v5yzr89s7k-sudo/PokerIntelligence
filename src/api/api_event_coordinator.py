@@ -21,6 +21,7 @@ SNAPSHOT_READER = ROOT / "src/api/table_snapshot_api_reader.py"
 
 EVENT_LOG = ROOT / "runtime/live/api_events.jsonl"
 COORD_STATE = ROOT / "runtime/live/api_event_coordinator_state.json"
+OBS_LOG = ROOT / "runtime/live/local_observations.jsonl"
 EVENT_LOG.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -63,6 +64,14 @@ def emit(event):
     event["ts"] = time.time()
     EVENT_LOG.open("a").write(json.dumps(event) + "\n")
     print("[EVENT]", event)
+
+
+def log_observation(changes):
+    payload = changes.to_dict()
+    payload["ts"] = time.time()
+    OBS_LOG.open("a").write(json.dumps(payload) + "\n")
+    if payload.get("has_changes"):
+        print("[OBS]", changes.summary())
 
 
 def capture():
@@ -384,6 +393,7 @@ def main():
 
         img = cv2.resize(img, (934, 696))
         changes = local_detector.detect(img)
+        log_observation(changes)
 
         hero_visible = changes.hero_cards_visible
         count = changes.board_count
