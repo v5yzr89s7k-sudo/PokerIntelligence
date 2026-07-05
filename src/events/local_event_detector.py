@@ -14,7 +14,7 @@ CAPTURE = ROOT / "src/vision/window_capture.py"
 from src.events.detectors.hero_detector import hero_changed
 from src.events.detectors.board_detector import board_changed
 from src.events.detectors.pot_detector import pot_changed
-from src.events.detectors.stack_detector import stack_changed
+from src.events.detectors.stack_detector import stack_changed, stack_change_details
 from src.events.detectors.action_buttons_detector import action_buttons_changed, action_buttons_visible
 from src.events.detectors.dealer_detector import dealer_changed
 from src.events.detectors.card_presence import count_board_cards, hero_cards_visible
@@ -48,6 +48,7 @@ class ChangeSet:
     action_buttons_visible: bool = False
     hero_nameplate_blinking: bool = False
     stack_changed_seats: list = field(default_factory=list)
+    stack_change_details: dict = field(default_factory=dict)
     board_count: int = 0
     hero_cards_visible: bool = False
 
@@ -73,6 +74,7 @@ class ChangeSet:
             "action_buttons_visible": self.action_buttons_visible,
             "hero_nameplate_blinking": self.hero_nameplate_blinking,
             "stack_changed_seats": list(self.stack_changed_seats),
+            "stack_change_details": self.stack_change_details,
             "board_count": self.board_count,
             "hero_cards_visible": self.hero_cards_visible,
             "has_changes": self.has_changes(),
@@ -118,7 +120,11 @@ class LocalEventDetector:
         changes.dealer_changed = dealer_changed(self.previous_frame, frame, GEOM)
         changes.action_buttons_changed = action_buttons_changed(self.previous_frame, frame, GEOM)
         changes.action_buttons_visible = action_buttons_visible(frame, GEOM)
-        changes.stack_changed_seats = stack_changed(self.previous_frame, frame, GEOM)
+        changes.stack_change_details = stack_change_details(self.previous_frame, frame, GEOM)
+        changes.stack_changed_seats = [
+            seat for seat, info in changes.stack_change_details.items()
+            if info.get("changed")
+        ]
         changes.board_count = count_board_cards(frame, GEOM)
         changes.hero_cards_visible = hero_cards_visible(frame, GEOM)
         changes.hero_nameplate_blinking = hero_nameplate_blinking(self.previous_frame, frame, GEOM)
