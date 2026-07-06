@@ -100,23 +100,11 @@
     }
   },
   "action_buttons": {
-    "fold": {
-      "x": 610,
-      "y": 610,
-      "width": 90,
-      "height": 45
-    },
-    "call_check": {
-      "x": 710,
-      "y": 610,
-      "width": 90,
-      "height": 45
-    },
-    "raise_bet": {
-      "x": 810,
-      "y": 610,
-      "width": 90,
-      "height": 45
+    "primary": {
+      "x": 405,
+      "y": 510,
+      "width": 165,
+      "height": 70
     }
   },
   "pot_region": {

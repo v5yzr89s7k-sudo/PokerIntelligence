@@ -445,6 +445,14 @@ def main():
             blink_visible = local_hero_blink_visible()
 
         hero_turn_visible = blink_visible or buttons_visible
+
+        if state.get("phase") != "WAITING":
+            print(
+                f"[HERO_CHECK] phase={state.get('phase')} "
+                f"hero_visible={hero_visible} buttons={buttons_visible} "
+                f"blink={blink_visible} active={state.get('hero_decision_active')}"
+            )
+
         state = maybe_emit_hero_decision(state, hero_turn_visible, hero_visible)
         state = maybe_complete_early(state, count, hero_visible)
         state = maybe_complete_hand(state, count)

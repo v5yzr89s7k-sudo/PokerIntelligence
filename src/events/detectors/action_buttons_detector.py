@@ -29,4 +29,4 @@ def action_buttons_visible(frame, geometry):
         if (gray > 90).mean() > 0.25:
             visible += 1
 
-    return visible >= 2
+    return visible >= 1
