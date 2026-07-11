@@ -51,6 +51,7 @@ signal.signal(signal.SIGTERM, stop_all)
 
 reset_runtime()
 start("state_machine", ["src/api/api_event_state_machine.py"])
+start("snapshot_worker", ["src/api/api_snapshot_worker.py"])
 time.sleep(0.5)
 start("coordinator", ["src/api/api_event_coordinator.py"])
 

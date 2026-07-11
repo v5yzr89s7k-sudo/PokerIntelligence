@@ -21,7 +21,6 @@ GEOM = json.load(open(ROOT / "config/geometry.json"))
 
 HERO_READER = ROOT / "src/api/hero_cards_api_reader.py"
 BOARD_READER = ROOT / "src/api/board_api_reader.py"
-SNAPSHOT_READER = ROOT / "src/api/table_snapshot_api_reader.py"
 
 EVENT_LOG = ROOT / "runtime/live/api_events.jsonl"
 COORD_STATE = ROOT / "runtime/live/api_event_coordinator_state.json"
