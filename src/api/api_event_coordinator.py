@@ -21,7 +21,6 @@ CAPTURE = ROOT / "src/vision/window_capture.py"
 CAPTURE_DIR = ROOT / "runtime/window_captures"
 GEOM = json.load(open(ROOT / "config/geometry.json"))
 
-HERO_READER = ROOT / "src/api/hero_cards_api_reader.py"
 
 EVENT_LOG = ROOT / "runtime/live/api_events.jsonl"
 COORD_STATE = ROOT / "runtime/live/api_event_coordinator_state.json"
@@ -31,6 +30,8 @@ CORRELATOR_JSON = ROOT / "runtime/live/current_observation_correlator.json"
 EPISODES_JSON = ROOT / "runtime/live/current_action_episodes.json"
 BOARD_REQUESTS = ROOT / "runtime/live/board_requests.jsonl"
 BOARD_RESULTS = ROOT / "runtime/live/board_results.jsonl"
+HERO_REQUESTS = ROOT / "runtime/live/hero_requests.jsonl"
+HERO_RESULTS = ROOT / "runtime/live/hero_results.jsonl"
 EVENT_LOG.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -50,6 +51,8 @@ def fresh_state():
         "hand_token": None,
         "board_request_id": None,
         "board_request_expected_len": None,
+        "hero_request_id": None,
+        "hero_request_token": None,
     }
 
 
@@ -252,11 +255,102 @@ def maybe_emit_hero_decision(state, visible, hero_visible):
     return state
 
 
+def queue_hero_request(state, frame):
+    request_id = uuid.uuid4().hex
+    hand_token = uuid.uuid4().hex
+
+    append_jsonl(HERO_REQUESTS, {
+        "type": "hero_request",
+        "request_id": request_id,
+        "hand_token": hand_token,
+        "frame": str(frame),
+        "ts": time.time(),
+    })
+
+    state["hero_request_id"] = request_id
+    state["hero_request_token"] = hand_token
+
+    print(f"[HERO] queued request={request_id[:8]}")
+    return state
+
+
+def find_hero_result(request_id):
+    if not request_id or not HERO_RESULTS.exists():
+        return None
+
+    try:
+        lines = HERO_RESULTS.read_text().splitlines()
+    except Exception:
+        return None
+
+    for line in reversed(lines):
+        try:
+            result = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        if result.get("request_id") == request_id:
+            return result
+
+    return None
+
+
 def maybe_read_hero(state, hero_visible, board_count, frame):
     if state.get("phase") != "WAITING":
         return state
 
+    pending_id = state.get("hero_request_id")
+
+    if pending_id:
+        result = find_hero_result(pending_id)
+
+        if result is None:
+            if not hero_visible or board_count != 0:
+                state["hero_request_id"] = None
+                state["hero_request_token"] = None
+                state["hero_visible_seen"] = 0
+            return state
+
+        request_token = state.get("hero_request_token")
+        state["hero_request_id"] = None
+        state["hero_request_token"] = None
+
+        if result.get("hand_token") != request_token:
+            print("[HERO] ignored stale worker result")
+            return state
+
+        if not hero_visible or board_count != 0:
+            print("[HERO] ignored result because clean preflop frame is gone")
+            state["hero_visible_seen"] = 0
+            return state
+
+        if not result.get("ok"):
+            print(
+                f"[HERO] worker result failed "
+                f"error={result.get('error') or 'unknown'}"
+            )
+            state["hero_visible_seen"] = 0
+            return state
+
+        cards = result.get("hero_cards") or []
+
+        if len(cards) != 2 or not all(cards):
+            print(f"[HERO] invalid worker cards={cards}")
+            state["hero_visible_seen"] = 0
+            return state
+
+        state["hero_read"] = True
+        state["phase"] = "PREFLOP"
+        state["hero_clear_seen"] = 0
+        state["hand_token"] = request_token
+        state["board_request_id"] = None
+        state["board_request_expected_len"] = None
+
+        emit({"type": "hero_cards", "hero_cards": cards})
+        return state
+
     if not hero_visible:
+        state["hero_visible_seen"] = 0
         return state
 
     if board_count != 0:
@@ -265,28 +359,11 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
         return state
 
     state["hero_visible_seen"] = state.get("hero_visible_seen", 0) + 1
+
     if state["hero_visible_seen"] < 2:
         return state
 
-    if state["hero_read"]:
-        return state
-
-    data = run_json(HERO_READER, frame)
-    if not data:
-        return state
-
-    cards = data.get("hero_cards") or []
-    if len(cards) == 2:
-        state["hero_read"] = True
-        state["phase"] = "PREFLOP"
-        state["hero_clear_seen"] = 0
-        state["hand_token"] = uuid.uuid4().hex
-        state["board_request_id"] = None
-        state["board_request_expected_len"] = None
-        emit({"type": "hero_cards", "hero_cards": cards})
-
-
-    return state
+    return queue_hero_request(state, frame)
 
 
 def append_jsonl(path, payload):

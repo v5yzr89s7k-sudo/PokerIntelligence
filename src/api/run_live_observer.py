@@ -15,6 +15,8 @@ def reset_runtime():
     (live / "api_events.jsonl").write_text("")
     (live / "board_requests.jsonl").write_text("")
     (live / "board_results.jsonl").write_text("")
+    (live / "hero_requests.jsonl").write_text("")
+    (live / "hero_results.jsonl").write_text("")
 
     for name in [
         "api_event_state_machine_cursor.txt",
@@ -55,6 +57,7 @@ reset_runtime()
 start("state_machine", ["src/api/api_event_state_machine.py"])
 start("snapshot_worker", ["src/api/api_snapshot_worker.py"])
 start("board_worker", ["src/api/api_board_worker.py"])
+start("hero_worker", ["src/api/api_hero_worker.py"])
 time.sleep(0.5)
 start("coordinator", ["src/api/api_event_coordinator.py"])
 
