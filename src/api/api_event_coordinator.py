@@ -4,6 +4,7 @@ import time
 import subprocess
 import cv2
 import sys
+import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -14,13 +15,13 @@ from src.observer.continuous_observer import ContinuousObserver
 from src.observer.observation_timeline import ObservationTimeline
 from src.observer.observation_correlator import ObservationCorrelator
 from src.observer.action_episode_manager import ActionEpisodeManager
+from src.vision.window_capture import find_acr_table_window, capture_window_crop
 
 CAPTURE = ROOT / "src/vision/window_capture.py"
 CAPTURE_DIR = ROOT / "runtime/window_captures"
 GEOM = json.load(open(ROOT / "config/geometry.json"))
 
 HERO_READER = ROOT / "src/api/hero_cards_api_reader.py"
-BOARD_READER = ROOT / "src/api/board_api_reader.py"
 
 EVENT_LOG = ROOT / "runtime/live/api_events.jsonl"
 COORD_STATE = ROOT / "runtime/live/api_event_coordinator_state.json"
@@ -28,6 +29,8 @@ OBS_LOG = ROOT / "runtime/live/local_observations.jsonl"
 TIMELINE_JSON = ROOT / "runtime/live/current_observation_timeline.json"
 CORRELATOR_JSON = ROOT / "runtime/live/current_observation_correlator.json"
 EPISODES_JSON = ROOT / "runtime/live/current_action_episodes.json"
+BOARD_REQUESTS = ROOT / "runtime/live/board_requests.jsonl"
+BOARD_RESULTS = ROOT / "runtime/live/board_results.jsonl"
 EVENT_LOG.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -44,6 +47,9 @@ def fresh_state():
         "hero_visible_seen": 0,
         "last_event": None,
         "hero_decision_active": False,
+        "hand_token": None,
+        "board_request_id": None,
+        "board_request_expected_len": None,
     }
 
 
@@ -97,15 +103,24 @@ def log_observation(changes):
     # Keep terminal output focused on hand/action/board events.
 
 
+_CACHED_WINDOW = None
+
+
 def capture():
-    subprocess.run(
-        ["python3", str(CAPTURE)],
-        cwd=str(ROOT),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=True,
-    )
-    return latest_capture()
+    global _CACHED_WINDOW
+
+    if _CACHED_WINDOW is None:
+        _CACHED_WINDOW = find_acr_table_window()
+        if _CACHED_WINDOW is None:
+            return latest_capture()
+
+    try:
+        return capture_window_crop(_CACHED_WINDOW)
+    except Exception:
+        _CACHED_WINDOW = find_acr_table_window()
+        if _CACHED_WINDOW is None:
+            return latest_capture()
+        return capture_window_crop(_CACHED_WINDOW)
 
 
 def latest_capture():
@@ -265,26 +280,145 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
         state["hero_read"] = True
         state["phase"] = "PREFLOP"
         state["hero_clear_seen"] = 0
+        state["hand_token"] = uuid.uuid4().hex
+        state["board_request_id"] = None
+        state["board_request_expected_len"] = None
         emit({"type": "hero_cards", "hero_cards": cards})
 
-        snapshot = run_json(SNAPSHOT_READER, frame)
-        if snapshot:
-            emit({
-                "type": "table_snapshot",
-                "players": snapshot.get("players") or [],
-                "hero_position": snapshot.get("hero_position") or "unknown",
-                "dealer_button_seat": snapshot.get("dealer_button_seat") or "",
-                "confidence": snapshot.get("confidence"),
-            })
 
     return state
+
+
+def append_jsonl(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        f.write(json.dumps(payload) + "\n")
+        f.flush()
+
+
+def queue_board_request(state, expected_len, frame):
+    request_id = uuid.uuid4().hex
+
+    append_jsonl(BOARD_REQUESTS, {
+        "type": "board_request",
+        "request_id": request_id,
+        "hand_token": state.get("hand_token"),
+        "expected_len": expected_len,
+        "frame": str(frame),
+        "ts": time.time(),
+    })
+
+    state["board_request_id"] = request_id
+    state["board_request_expected_len"] = expected_len
+
+    print(
+        f"[BOARD] queued request={request_id[:8]} "
+        f"expected={expected_len}"
+    )
+
+    return state
+
+
+def find_board_result(request_id):
+    if not request_id or not BOARD_RESULTS.exists():
+        return None
+
+    try:
+        lines = BOARD_RESULTS.read_text().splitlines()
+    except Exception:
+        return None
+
+    for line in reversed(lines):
+        try:
+            result = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        if result.get("request_id") == request_id:
+            return result
+
+    return None
+
+
+def apply_board_result(state, result):
+    request_id = state.get("board_request_id")
+    expected_len = state.get("board_request_expected_len")
+
+    if result.get("request_id") != request_id:
+        return state, False
+
+    # Clear the pending request regardless of success so failure can retry.
+    state["board_request_id"] = None
+    state["board_request_expected_len"] = None
+
+    if result.get("hand_token") != state.get("hand_token"):
+        print("[BOARD] ignored stale result from another hand")
+        return state, False
+
+    if not result.get("ok"):
+        print(
+            f"[BOARD] worker result failed "
+            f"error={result.get('error') or 'unknown'}"
+        )
+        return state, False
+
+    board = result.get("board") or []
+
+    if expected_len not in (3, 4, 5):
+        print(f"[BOARD] invalid expected_len={expected_len}; ignoring")
+        return state, False
+
+    confirmed = state.get("confirmed_board_len", 0)
+    required_next = 3 if confirmed == 0 else confirmed + 1
+
+    if expected_len != required_next:
+        print(
+            f"[BOARD] stale sequence result expected={expected_len} "
+            f"required={required_next}; ignoring"
+        )
+        return state, False
+
+    if len(board) < expected_len:
+        print(
+            f"[BOARD] short worker result len={len(board)} "
+            f"expected={expected_len}"
+        )
+        return state, False
+
+    board_to_emit = board[:expected_len]
+    state["confirmed_board_len"] = expected_len
+
+    if state.get("hero_decision_active"):
+        emit({"type": "hero_action_complete"})
+        state["hero_decision_active"] = False
+
+    if expected_len == 3:
+        state["phase"] = "FLOP"
+    elif expected_len == 4:
+        state["phase"] = "TURN"
+    elif expected_len == 5:
+        state["phase"] = "RIVER"
+
+    emit({"type": "board", "board": board_to_emit})
+    return state, True
 
 
 def maybe_read_board(state, count, frame):
     if state.get("phase") == "WAITING":
         return state
 
-    confirmed = state["confirmed_board_len"]
+    pending_id = state.get("board_request_id")
+
+    if pending_id:
+        result = find_board_result(pending_id)
+
+        if result is None:
+            return state
+
+        state, _ = apply_board_result(state, result)
+        return state
+
+    confirmed = state.get("confirmed_board_len", 0)
 
     if count not in (3, 4, 5):
         return state
@@ -292,53 +426,19 @@ def maybe_read_board(state, count, frame):
     if count <= confirmed:
         return state
 
+    expected_next = 3 if confirmed == 0 else confirmed + 1
+
+    if expected_next not in (3, 4, 5):
+        return state
+
     now = time.time()
     last_attempt = state.get("last_api_attempt_ts", 0)
 
-    # Do not spam API while waiting for the visual/API state to catch up.
     if now - last_attempt < 1.25:
         return state
 
     state["last_api_attempt_ts"] = now
-
-    data = run_json(BOARD_READER, frame)
-    if not data:
-        return state
-
-    board = data.get("board") or []
-
-    if len(board) > confirmed:
-        expected_next = 3 if confirmed == 0 else confirmed + 1
-
-        if expected_next not in (3, 4, 5):
-            print(f"[BOARD] invalid expected_next={expected_next}; ignoring")
-            return state
-
-        if len(board) < expected_next:
-            print(f"[BOARD] API returned len={len(board)} expected_next={expected_next}; will retry")
-            return state
-
-        # Enforce sequential street transitions even if API sees ahead.
-        board_to_emit = board[:expected_next]
-        state["confirmed_board_len"] = expected_next
-
-        if state.get("hero_decision_active"):
-            emit({"type": "hero_action_complete"})
-            state["hero_decision_active"] = False
-
-        if expected_next == 3:
-            state["phase"] = "FLOP"
-        elif expected_next == 4:
-            state["phase"] = "TURN"
-        elif expected_next == 5:
-            state["phase"] = "RIVER"
-
-        emit({"type": "board", "board": board_to_emit})
-    else:
-        print(f"[BOARD] API returned len={len(board)} confirmed={confirmed}; will retry")
-
-    return state
-
+    return queue_board_request(state, expected_next, frame)
 
 
 def maybe_complete_early(state, count, hero_visible):
@@ -439,11 +539,9 @@ def main():
             time.sleep(0.5)
             continue
 
+        # Blink sampling performs repeated captures and must stay off the hot path.
         blink_visible = False
-        if state.get("phase") != "WAITING" and hero_visible:
-            blink_visible = local_hero_blink_visible()
-
-        hero_turn_visible = blink_visible or buttons_visible
+        hero_turn_visible = buttons_visible
 
         if state.get("phase") != "WAITING":
             print(
@@ -457,7 +555,13 @@ def main():
         state = maybe_complete_hand(state, count)
 
         save_state(state)
-        time.sleep(0.5)
+
+        if state.get("phase") == "WAITING":
+            time.sleep(0.5)
+        elif state.get("hero_decision_active"):
+            time.sleep(0.05)
+        else:
+            time.sleep(0.10)
 
 
 if __name__ == "__main__":
