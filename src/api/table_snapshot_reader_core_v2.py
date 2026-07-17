@@ -15,6 +15,15 @@ from src.events.detectors.seat_occupancy_detector import (
     SEAT_ORDER,
 )
 from src.vision.dealer_detector import detect_dealer_button
+from src.vision.stack_reader import read_stack
+from src.api.snapshot_cache import (
+    load_cache,
+    save_cache,
+    lookup as cache_lookup,
+    update as cache_update,
+    stack_lookup,
+    stack_update,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -344,6 +353,31 @@ def _normalize_result(data, cards, dealer):
     }
 
 
+def _cache_fingerprint_image(card):
+    seat = card["seat"]
+    seat_rect = GEOMETRY["seat_regions"][seat]
+    bounds = card["bounds"]
+
+    x1 = int(seat_rect["x"]) - bounds["x1"]
+    y1 = int(seat_rect["y"]) - bounds["y1"]
+    x2 = x1 + int(seat_rect["width"])
+    y2 = y1 + int(seat_rect["height"])
+
+    return card["image"][y1:y2, x1:x2]
+
+
+def _cache_player(entry, card):
+    return {
+        "seat": card["seat"],
+        "name": _normalize_name(entry.get("name")),
+        "stack_text": str(entry.get("stack_text") or "").strip(),
+        "stack_bb": _normalize_stack_bb(entry.get("stack_bb")),
+        "is_hero": card["seat"] == "hero",
+        "is_active": True,
+        "occupancy_confidence": float(card["occupancy_confidence"]),
+    }
+
+
 def read_table_snapshot_v2(frame):
     total_t0 = perf_counter()
 
@@ -377,38 +411,197 @@ def read_table_snapshot_v2(frame):
         perf_counter() - dealer_t0
     ) * 1000.0
 
+    cache = load_cache()
+    cached_players = {}
+    changed_cards = []
+
+    for card in cards:
+        entry = cache_lookup(
+            cache,
+            card["seat"],
+            _cache_fingerprint_image(card),
+        )
+
+        if entry is None:
+            changed_cards.append(card)
+        else:
+            cached_players[card["seat"]] = (
+                _cache_player(entry, card)
+            )
+
     payload_t0 = perf_counter()
-    content, image_bytes = _build_content(
-        cards,
-    )
+
+    if changed_cards:
+        content, image_bytes = _build_content(
+            changed_cards,
+        )
+    else:
+        content = None
+        image_bytes = 0
+
     payload_ms = (
         perf_counter() - payload_t0
     ) * 1000.0
 
-    api_t0 = perf_counter()
-    response = CLIENT.responses.create(
-        model="gpt-4.1-mini",
-        input=[{
-            "role": "user",
-            "content": content,
-        }],
-    )
-    api_ms = (
-        perf_counter() - api_t0
+    api_ms = 0.0
+    parse_ms = 0.0
+    confidence = None
+    fresh_players = {}
+
+    if changed_cards:
+        api_t0 = perf_counter()
+        response = CLIENT.responses.create(
+            model="gpt-4.1-mini",
+            input=[{
+                "role": "user",
+                "content": content,
+            }],
+        )
+        api_ms = (
+            perf_counter() - api_t0
+        ) * 1000.0
+
+        parse_t0 = perf_counter()
+        data = _extract_json(
+            response.output_text
+        )
+        partial = _normalize_result(
+            data,
+            changed_cards,
+            dealer,
+        )
+        confidence = partial.get(
+            "confidence"
+        )
+        fresh_players = {
+            player["seat"]: player
+            for player in partial["players"]
+        }
+
+        for card in changed_cards:
+            player = fresh_players[
+                card["seat"]
+            ]
+            cache_update(
+                cache,
+                card["seat"],
+                _cache_fingerprint_image(card),
+                {
+                    "name": player["name"],
+                    "stack_text": player["stack_text"],
+                    "stack_bb": player["stack_bb"],
+                },
+            )
+
+        save_cache(cache)
+        parse_ms = (
+            perf_counter() - parse_t0
+        ) * 1000.0
+
+    players = []
+
+    stack_t0 = perf_counter()
+    stack_readings = {}
+
+    for card in cards:
+        seat = card["seat"]
+        region = GEOMETRY["stack_regions"][seat]
+
+        x1 = int(region["x"]) - card["bounds"]["x1"]
+        y1 = int(region["y"]) - card["bounds"]["y1"]
+        x2 = x1 + int(region["width"])
+        y2 = y1 + int(region["height"])
+
+        stack_crop = card["image"][y1:y2, x1:x2]
+
+        cached_stack = stack_lookup(
+            cache,
+            seat,
+            stack_crop,
+        )
+
+        if (
+            cached_stack
+            and cached_stack.get("stack_bb") is not None
+        ):
+            stack_readings[seat] = {
+                "stack_bb": cached_stack["stack_bb"],
+                "stack_text": cached_stack["stack_text"],
+                "confidence": 1.0,
+                "mode": "cache",
+            }
+            continue
+
+        result = read_stack(stack_crop)
+
+        stack_readings[seat] = result
+
+        if result["stack_bb"] is not None:
+            stack_update(
+                cache,
+                seat,
+                stack_crop,
+                {
+                    "stack_bb": result["stack_bb"],
+                    "stack_text": result["stack_text"],
+                },
+            )
+
+    save_cache(cache)
+
+    stack_ms = (
+        perf_counter() - stack_t0
     ) * 1000.0
 
-    parse_t0 = perf_counter()
-    data = _extract_json(
-        response.output_text
-    )
-    result = _normalize_result(
-        data,
-        cards,
-        dealer,
-    )
-    parse_ms = (
-        perf_counter() - parse_t0
-    ) * 1000.0
+    for card in cards:
+        seat = card["seat"]
+        player = (
+            fresh_players.get(seat)
+            or cached_players.get(seat)
+        )
+
+        if player is None:
+            player = {
+                "seat": seat,
+                "name": "",
+                "stack_text": "",
+                "stack_bb": None,
+                "is_hero": seat == "hero",
+                "is_active": True,
+                "occupancy_confidence": float(
+                    card["occupancy_confidence"]
+                ),
+            }
+
+        local_stack = stack_readings[seat]
+
+        if local_stack["stack_bb"] is not None:
+            player["stack_bb"] = local_stack[
+                "stack_bb"
+            ]
+            player["stack_text"] = local_stack[
+                "stack_text"
+            ]
+
+        player["stack_confidence"] = local_stack[
+            "confidence"
+        ]
+        player["stack_read_mode"] = local_stack[
+            "mode"
+        ]
+
+        players.append(player)
+
+    result = {
+        "dealer_button_seat": dealer,
+        "players": players,
+        "occupied_seats": [
+            card["seat"]
+            for card in cards
+        ],
+        "confidence": confidence,
+        "source": "snapshot_v2",
+    }
 
     timings = {
         "prepare_ms": prepare_ms,
@@ -416,12 +609,15 @@ def read_table_snapshot_v2(frame):
         "payload_ms": payload_ms,
         "api_ms": api_ms,
         "parse_ms": parse_ms,
+        "stack_ms": stack_ms,
         "total_ms": (
             perf_counter() - total_t0
         ) * 1000.0,
-        "image_count": len(cards),
+        "image_count": len(changed_cards),
         "seat_card_count": len(cards),
         "image_bytes": image_bytes,
+        "cache_hits": len(cards) - len(changed_cards),
+        "cache_misses": len(changed_cards),
     }
 
     return result, timings

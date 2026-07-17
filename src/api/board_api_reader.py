@@ -23,7 +23,11 @@ ROOT = Path(__file__).resolve().parents[2]
 CAPTURE = ROOT / "src/vision/window_capture.py"
 CAPTURE_DIR = ROOT / "runtime/window_captures"
 OUT = ROOT / "runtime/api/latest_board.json"
+GEOMETRY = ROOT / "config/geometry.json"
 OUT.parent.mkdir(parents=True, exist_ok=True)
+
+geometry = json.loads(GEOMETRY.read_text())
+board_api_crop = geometry["board_api_crop"]
 
 client_t0 = perf_counter()
 client = OpenAI(timeout=45.0)
@@ -32,7 +36,7 @@ profile("client_init", client_t0)
 PROMPT = """
 Read ONLY the board/community cards from this ACR screenshot.
 
-The second image is an enlarged crop of the board area.
+The image is an enlarged crop of the board area.
 Return RAW JSON ONLY:
 {"board":[],"street":"","confidence":0.0}
 
@@ -59,20 +63,13 @@ def prepare_images(path):
     img = cv2.resize(img, (934, 696))
     profile("table_resize", t0)
 
-    table = ROOT / "runtime/api/table_frame.jpg"
+    x = int(board_api_crop["x"])
+    y = int(board_api_crop["y"])
+    width = int(board_api_crop["width"])
+    height = int(board_api_crop["height"])
 
     t0 = perf_counter()
-    ok = cv2.imwrite(
-        str(table),
-        img,
-        [int(cv2.IMWRITE_JPEG_QUALITY), 65],
-    )
-    if not ok:
-        raise RuntimeError(f"could not write image: {table}")
-    profile("table_jpeg_write", t0, bytes=table.stat().st_size)
-
-    t0 = perf_counter()
-    board = img[245:360, 300:640]
+    board = img[y:y + height, x:x + width]
     board = cv2.resize(
         board,
         None,
@@ -100,7 +97,7 @@ def prepare_images(path):
     profile("board_jpeg_write", t0, bytes=board_path.stat().st_size)
 
     profile("prepare_images_total", prepare_t0)
-    return table, board_path
+    return board_path
 
 if len(sys.argv) > 1:
     latest = Path(sys.argv[1]).expanduser().resolve()
@@ -108,35 +105,19 @@ else:
     subprocess.run(["python3", str(CAPTURE)], cwd=str(ROOT), check=True)
     latest = sorted(CAPTURE_DIR.glob("acr_table_*.png"))[-1]
 prepare_t0 = perf_counter()
-table, board_crop = prepare_images(latest)
+board_crop = prepare_images(latest)
 profile("prepare_call_total", prepare_t0)
-
-table_url_t0 = perf_counter()
-table_url = data_url(table)
-profile("table_data_url_total", table_url_t0)
 
 crop_url_t0 = perf_counter()
 board_crop_url = data_url(board_crop)
 profile("crop_data_url_total", crop_url_t0)
 
-image_mode = os.environ.get("BOARD_IMAGE_MODE", "both").strip().lower()
+image_mode = "expanded_crop"
 
-if image_mode == "crop":
-    request_content = [
-        {"type": "input_text", "text": PROMPT},
-        {"type": "input_image", "image_url": board_crop_url},
-    ]
-elif image_mode == "both":
-    request_content = [
-        {"type": "input_text", "text": PROMPT},
-        {"type": "input_image", "image_url": table_url},
-        {"type": "input_image", "image_url": board_crop_url},
-    ]
-else:
-    raise ValueError(
-        f"unsupported BOARD_IMAGE_MODE={image_mode!r}; "
-        "expected 'both' or 'crop'"
-    )
+request_content = [
+    {"type": "input_text", "text": PROMPT},
+    {"type": "input_image", "image_url": board_crop_url},
+]
 
 print(
     f"[BOARD_READER_PROFILE] image_mode={image_mode} "
