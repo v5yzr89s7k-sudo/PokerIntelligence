@@ -186,8 +186,19 @@ print(
 )
 
 api_t0 = perf_counter()
+hero_model = os.environ.get(
+    "HERO_MODEL",
+    "gpt-4.1-mini",
+).strip()
+
+print(
+    f"[HERO_READER_PROFILE] model={hero_model}",
+    file=sys.stderr,
+    flush=True,
+)
+
 response = client.responses.create(
-    model="gpt-4.1-mini",
+    model=hero_model,
     input=[{
         "role": "user",
         "content": request_content,
