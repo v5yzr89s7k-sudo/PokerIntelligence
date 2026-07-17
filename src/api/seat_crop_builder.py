@@ -5,6 +5,9 @@ import json
 import cv2
 import numpy as np
 
+from src.api.canonical_frame import (
+    to_canonical_frame,
+)
 from src.events.detectors.seat_occupancy_detector import (
     SEAT_ORDER,
     seat_occupancy,
@@ -114,33 +117,10 @@ def build_seat_cards(
 
     geometry = geometry or load_geometry()
 
-    canonical_width = int(
-        geometry.get("table_size", {}).get(
-            "width",
-            geometry.get("width", 934),
-        )
+    frame = to_canonical_frame(
+        frame,
+        geometry,
     )
-    canonical_height = int(
-        geometry.get("table_size", {}).get(
-            "height",
-            geometry.get("height", 696),
-        )
-    )
-
-    height, width = frame.shape[:2]
-
-    if (
-        width != canonical_width
-        or height != canonical_height
-    ):
-        frame = cv2.resize(
-            frame,
-            (
-                canonical_width,
-                canonical_height,
-            ),
-            interpolation=cv2.INTER_AREA,
-        )
 
     occupancy = seat_occupancy(
         frame,
