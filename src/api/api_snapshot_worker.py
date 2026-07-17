@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT))
 
 from src.api.perception_latency import log as log_latency
 from src.api.position_engine import assign_positions
-from src.api.table_snapshot_reader_core import read_table_snapshot
+from src.api.table_snapshot_reader_core_v2 import read_table_snapshot_v2
 
 EVENT_LOG = ROOT / "runtime/live/api_events.jsonl"
 CAPTURE_DIR = ROOT / "runtime/window_captures"
@@ -33,9 +33,8 @@ def run_snapshot(frame):
     t0 = perf_counter()
 
     try:
-        snapshot, timings = read_table_snapshot(
+        snapshot, timings = read_table_snapshot_v2(
             frame,
-            image_mode="current",
         )
     except Exception as exc:
         elapsed_ms = (perf_counter() - t0) * 1000.0
@@ -63,9 +62,9 @@ def run_snapshot(frame):
         f"api={timings['api_ms']:.1f}ms "
         f"parse={timings['parse_ms']:.1f}ms "
         f"images={timings['image_count']} "
-        f"full_kb={timings['full_bytes'] / 1024:.1f} "
-        f"crop_kb={timings['crop_bytes'] / 1024:.1f} "
-        f"mode={timings['image_mode']}",
+        f"dealer={timings['dealer_ms']:.1f}ms "
+        f"seat_cards={timings['seat_card_count']} "
+        f"image_kb={timings['image_bytes'] / 1024:.1f}",
         flush=True,
     )
 
