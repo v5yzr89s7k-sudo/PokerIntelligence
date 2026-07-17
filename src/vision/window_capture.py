@@ -2,6 +2,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from datetime import datetime
 from typing import Optional
 
@@ -86,6 +87,8 @@ def parse_window_line(process: str, line: str) -> Optional[WindowInfo]:
 
 
 def find_acr_table_window() -> Optional[WindowInfo]:
+    started_at = perf_counter()
+
     table_keywords = ["hold'em", "holdem", "no limit", "table", "ante", "gtd"]
     exclude_keywords = ["lobby"]
 
@@ -100,8 +103,18 @@ def find_acr_table_window() -> Optional[WindowInfo]:
 
             lower = info.title.lower()
             if any(k in lower for k in table_keywords) and not any(x in lower for x in exclude_keywords):
+                print(
+                    f"[CAPTURE_PROFILE] window_discovery="
+                    f"{(perf_counter() - started_at) * 1000.0:.1f}ms",
+                    flush=True,
+                )
                 return info
 
+    print(
+        f"[CAPTURE_PROFILE] window_discovery="
+        f"{(perf_counter() - started_at) * 1000.0:.1f}ms found=false",
+        flush=True,
+    )
     return None
 
 
@@ -111,13 +124,29 @@ def capture_fullscreen(path: Path) -> Path:
 
 
 def capture_window_crop(window: WindowInfo) -> Path:
+    started_at = perf_counter()
+
     ensure_dirs()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     out = WINDOW_CAPTURES_DIR / f"acr_table_{ts}.png"
 
-    # macOS screencapture region format: -R x,y,w,h
     region = f"{window.x},{window.y},{window.w},{window.h}"
-    subprocess.run(["screencapture", "-x", "-R", region, str(out)], check=True)
+
+    capture_t0 = perf_counter()
+    subprocess.run(
+        ["screencapture", "-x", "-R", region, str(out)],
+        check=True,
+    )
+    capture_ms = (perf_counter() - capture_t0) * 1000.0
+    total_ms = (perf_counter() - started_at) * 1000.0
+
+    print(
+        f"[CAPTURE_PROFILE] screencapture={capture_ms:.1f}ms "
+        f"total={total_ms:.1f}ms "
+        f"bytes={out.stat().st_size}",
+        flush=True,
+    )
+
     return out
 
 
