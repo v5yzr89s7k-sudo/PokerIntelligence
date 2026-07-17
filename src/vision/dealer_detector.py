@@ -1,124 +1,155 @@
 from pathlib import Path
+import json
+import sys
+
 import cv2
 import numpy as np
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-RUNTIME_DIR = PROJECT_ROOT / "runtime"
-DEBUG_DIR = RUNTIME_DIR / "debug_crops"
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.api.canonical_frame import to_canonical_frame
+
+GEOMETRY_PATH = PROJECT_ROOT / "config/geometry.json"
+TEMPLATE_PATH = PROJECT_ROOT / "assets/templates/dealer_button_calibrated.png"
+DEBUG_DIR = PROJECT_ROOT / "runtime/debug_crops/dealer"
 
 
-# Seat search zones as percentages of the cropped ACR table image.
-# These are rough first-pass zones. We will tune them after seeing debug output.
-DEALER_SEARCH_ZONES = {
-    "seat_top":        (0.42, 0.12, 0.16, 0.18),
-    "seat_upper_left": (0.16, 0.22, 0.18, 0.20),
-    "seat_upper_right":(0.66, 0.22, 0.18, 0.20),
-    "seat_mid_left":   (0.10, 0.42, 0.20, 0.20),
-    "seat_mid_right":  (0.70, 0.42, 0.20, 0.20),
-    "seat_lower_left": (0.20, 0.62, 0.20, 0.20),
-    "seat_lower_right":(0.60, 0.62, 0.20, 0.20),
-    "hero":            (0.42, 0.70, 0.18, 0.20),
-}
+def load_geometry():
+    return json.loads(GEOMETRY_PATH.read_text())
 
 
-def crop_pct(img, box):
-    h, w = img.shape[:2]
-    x, y, bw, bh = box
-    x1 = int(x * w)
-    y1 = int(y * h)
-    x2 = int((x + bw) * w)
-    y2 = int((y + bh) * h)
-    return img[y1:y2, x1:x2], (x1, y1, x2, y2)
+def normalize_patch(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    return cv2.equalizeHist(gray)
 
 
-def detect_dealer_button(image_path: Path):
-    img = cv2.imread(str(image_path))
-    if img is None:
-        raise FileNotFoundError(f"Could not read image: {image_path}")
+def detect_dealer_button(image_or_path):
+    if isinstance(image_or_path, (str, Path)):
+        image = cv2.imread(str(image_or_path))
+        if image is None:
+            raise FileNotFoundError(f"Could not read image: {image_or_path}")
+    else:
+        image = image_or_path
+
+    geometry = load_geometry()
+    image = to_canonical_frame(image, geometry)
+
+    template = cv2.imread(str(TEMPLATE_PATH))
+    if template is None:
+        raise FileNotFoundError(
+            f"Missing calibrated dealer template: {TEMPLATE_PATH}"
+        )
+
+    template_gray = normalize_patch(template)
+    th, tw = template_gray.shape[:2]
 
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
     results = []
 
-    for seat_name, zone in DEALER_SEARCH_ZONES.items():
-        crop, coords = crop_pct(img, zone)
+    for seat, zone in geometry["dealer_button_zones"].items():
+        x = int(zone["x"])
+        y = int(zone["y"])
+        w = int(zone["width"])
+        h = int(zone["height"])
 
-        # ACR dealer button is usually a bright white/gray circular marker.
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        crop = image[y:y + h, x:x + w].copy()
 
-        # Low saturation + high value = white/gray objects.
-        mask = cv2.inRange(hsv, np.array([0, 0, 150]), np.array([180, 80, 255]))
+        if crop.shape[0] < th or crop.shape[1] < tw:
+            raise ValueError(
+                f"Dealer zone for {seat} is smaller than template: "
+                f"zone={crop.shape[1]}x{crop.shape[0]} "
+                f"template={tw}x{th}"
+            )
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        crop_gray = normalize_patch(crop)
 
-        best_area = 0
-        best_circle_score = 0.0
+        response = cv2.matchTemplate(
+            crop_gray,
+            template_gray,
+            cv2.TM_CCOEFF_NORMED,
+        )
 
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area < 20:
-                continue
+        _, confidence, _, location = cv2.minMaxLoc(response)
 
-            perimeter = cv2.arcLength(c, True)
-            if perimeter <= 0:
-                continue
+        match_center_x = location[0] + tw / 2.0
+        match_center_y = location[1] + th / 2.0
+        zone_center_x = w / 2.0
+        zone_center_y = h / 2.0
 
-            circularity = 4 * np.pi * area / (perimeter * perimeter)
-            x, y, w, h = cv2.boundingRect(c)
-            aspect = w / h if h else 0
+        center_distance = np.hypot(
+            match_center_x - zone_center_x,
+            match_center_y - zone_center_y,
+        )
 
-            # Dealer button should be a SMALL compact circular marker.
-            # Reject huge white/gray UI regions like nameplates, buttons, panels.
-            if not (80 <= area <= 3500):
-                continue
+        max_distance = np.hypot(zone_center_x, zone_center_y)
+        center_score = max(0.0, 1.0 - center_distance / max_distance)
 
-            if not (0.70 <= circularity <= 1.25):
-                continue
+        # Template similarity is primary; expected-center proximity breaks ties.
+        score = float(confidence * 0.85 + center_score * 0.15)
 
-            if not (0.70 <= aspect <= 1.30):
-                continue
+        annotated = crop.copy()
+        mx, my = location
 
-            score = float(area * circularity)
-            if score > best_circle_score:
-                best_circle_score = score
-                best_area = area
+        cv2.rectangle(
+            annotated,
+            (mx, my),
+            (mx + tw, my + th),
+            (0, 255, 255),
+            1,
+        )
 
-        confidence = min(best_circle_score / 1200.0, 1.0)
-
-        cv2.imwrite(str(DEBUG_DIR / f"dealer_zone_{seat_name}.png"), crop)
+        cv2.imwrite(
+            str(DEBUG_DIR / f"{seat}.png"),
+            annotated,
+        )
 
         results.append({
-            "seat": seat_name,
-            "confidence": round(confidence, 3),
-            "best_area": round(float(best_area), 2),
-            "coords": coords,
+            "seat": seat,
+            "confidence": round(float(confidence), 4),
+            "center_score": round(float(center_score), 4),
+            "score": round(score, 4),
+            "match_x": int(x + mx),
+            "match_y": int(y + my),
         })
 
-    results = sorted(results, key=lambda r: r["confidence"], reverse=True)
+    results.sort(key=lambda item: item["score"], reverse=True)
+
+    best = results[0]
 
     return {
-        "found": results[0]["confidence"] >= 0.25,
-        "best": results[0],
+        "found": best["confidence"] >= 0.35,
+        "dealer_button_seat": best["seat"],
+        "best": best,
         "all": results,
     }
 
 
-def latest_acr_capture() -> Path:
-    files = sorted((RUNTIME_DIR / "window_captures").glob("acr_table_*.png"))
-    if not files:
-        raise FileNotFoundError("No acr_table_*.png files found in runtime/window_captures")
-    return files[-1]
+def latest_capture():
+    captures = sorted(
+        (PROJECT_ROOT / "runtime/window_captures").glob("acr_table_*.png")
+    )
+
+    if not captures:
+        raise FileNotFoundError("No ACR captures found")
+
+    return captures[-1]
 
 
 if __name__ == "__main__":
-    image = latest_acr_capture()
-    result = detect_dealer_button(image)
+    image_path = latest_capture()
+    result = detect_dealer_button(image_path)
 
-    print(f"Image: {image}")
-    print(f"Found: {result['found']}")
-    print(f"Best: {result['best']}")
-    print("All zones:")
-    for r in result["all"]:
-        print(f"  {r['seat']}: confidence={r['confidence']} area={r['best_area']}")
-    print(f"Debug crops written to: {DEBUG_DIR}")
+    print("Image:", image_path)
+    print("Found:", result["found"])
+    print("Dealer:", result["dealer_button_seat"])
+
+    for item in result["all"]:
+        print(
+            f"{item['seat']:18} "
+            f"score={item['score']:.4f} "
+            f"template={item['confidence']:.4f} "
+            f"center={item['center_score']:.4f}"
+        )

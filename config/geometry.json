@@ -4,53 +4,53 @@
     "height": 696
   },
   "dealer_button_zones": {
-    "seat_top": {
-      "x": 315,
-      "y": 120,
-      "width": 95,
-      "height": 70
-    },
-    "seat_upper_right": {
-      "x": 705,
-      "y": 230,
-      "width": 95,
-      "height": 70
-    },
-    "seat_mid_right": {
-      "x": 725,
-      "y": 380,
-      "width": 95,
-      "height": 70
-    },
-    "seat_lower_right": {
-      "x": 615,
-      "y": 500,
-      "width": 95,
-      "height": 70
-    },
-    "hero": {
-      "x": 395,
-      "y": 515,
-      "width": 95,
-      "height": 70
-    },
     "seat_lower_left": {
-      "x": 260,
-      "y": 505,
-      "width": 95,
-      "height": 70
+      "x": 283,
+      "y": 467,
+      "width": 64,
+      "height": 52
     },
     "seat_mid_left": {
-      "x": 164,
-      "y": 237,
-      "width": 40,
-      "height": 40
+      "x": 174,
+      "y": 363,
+      "width": 64,
+      "height": 52
     },
     "seat_upper_left": {
-      "x": 110,
-      "y": 230,
-      "width": 95,
-      "height": 70
+      "x": 169,
+      "y": 228,
+      "width": 64,
+      "height": 52
+    },
+    "seat_top": {
+      "x": 513,
+      "y": 178,
+      "width": 64,
+      "height": 52
+    },
+    "seat_upper_right": {
+      "x": 718,
+      "y": 228,
+      "width": 64,
+      "height": 52
+    },
+    "seat_mid_right": {
+      "x": 694,
+      "y": 362,
+      "width": 64,
+      "height": 52
+    },
+    "seat_lower_right": {
+      "x": 587,
+      "y": 467,
+      "width": 64,
+      "height": 52
+    },
+    "hero": {
+      "x": 512,
+      "y": 471,
+      "width": 64,
+      "height": 52
     }
   },
   "hero_cards": {
@@ -379,5 +379,39 @@
       }
     }
   },
-  "geometry_version": "v0.9-live-hole-cards-all-seats"
+  "geometry_version": "v0.11.2-click-calibrated-dealer",
+  "dealer_button_centers": {
+    "seat_lower_left": {
+      "x": 315,
+      "y": 493
+    },
+    "seat_mid_left": {
+      "x": 206,
+      "y": 389
+    },
+    "seat_upper_left": {
+      "x": 201,
+      "y": 254
+    },
+    "seat_top": {
+      "x": 545,
+      "y": 204
+    },
+    "seat_upper_right": {
+      "x": 750,
+      "y": 254
+    },
+    "seat_mid_right": {
+      "x": 726,
+      "y": 388
+    },
+    "seat_lower_right": {
+      "x": 619,
+      "y": 493
+    },
+    "hero": {
+      "x": 544,
+      "y": 497
+    }
+  }
 }
