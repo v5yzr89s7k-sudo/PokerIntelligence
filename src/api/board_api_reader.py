@@ -1,6 +1,23 @@
 from pathlib import Path
-import base64, json, subprocess, cv2, sys
+from time import perf_counter
+import base64, json, os, subprocess, cv2, sys
 from openai import OpenAI
+
+PROCESS_T0 = perf_counter()
+
+
+def profile(stage, started_at, **extra):
+    elapsed_ms = (perf_counter() - started_at) * 1000.0
+    fields = " ".join(f"{key}={value}" for key, value in extra.items())
+    suffix = f" {fields}" if fields else ""
+
+    print(
+        f"[BOARD_READER_PROFILE] {stage}={elapsed_ms:.1f}ms{suffix}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    return elapsed_ms
 
 ROOT = Path(__file__).resolve().parents[2]
 CAPTURE = ROOT / "src/vision/window_capture.py"
@@ -8,7 +25,9 @@ CAPTURE_DIR = ROOT / "runtime/window_captures"
 OUT = ROOT / "runtime/api/latest_board.json"
 OUT.parent.mkdir(parents=True, exist_ok=True)
 
+client_t0 = perf_counter()
 client = OpenAI(timeout=45.0)
+profile("client_init", client_t0)
 
 PROMPT = """
 Read ONLY the board/community cards from this ACR screenshot.
@@ -28,17 +47,59 @@ def data_url(path):
     return f"data:image/jpeg;base64,{b64}"
 
 def prepare_images(path):
+    prepare_t0 = perf_counter()
+
+    t0 = perf_counter()
     img = cv2.imread(str(path))
+    if img is None:
+        raise RuntimeError(f"could not read image: {path}")
+    profile("image_read", t0, file=path.name)
+
+    t0 = perf_counter()
     img = cv2.resize(img, (934, 696))
+    profile("table_resize", t0)
 
     table = ROOT / "runtime/api/table_frame.jpg"
-    cv2.imwrite(str(table), img, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
 
+    t0 = perf_counter()
+    ok = cv2.imwrite(
+        str(table),
+        img,
+        [int(cv2.IMWRITE_JPEG_QUALITY), 65],
+    )
+    if not ok:
+        raise RuntimeError(f"could not write image: {table}")
+    profile("table_jpeg_write", t0, bytes=table.stat().st_size)
+
+    t0 = perf_counter()
     board = img[245:360, 300:640]
-    board = cv2.resize(board, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
-    board_path = ROOT / "runtime/api/board_crop_enlarged.jpg"
-    cv2.imwrite(str(board_path), board, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    board = cv2.resize(
+        board,
+        None,
+        fx=4,
+        fy=4,
+        interpolation=cv2.INTER_CUBIC,
+    )
+    profile(
+        "board_crop_resize",
+        t0,
+        width=board.shape[1],
+        height=board.shape[0],
+    )
 
+    board_path = ROOT / "runtime/api/board_crop_enlarged.jpg"
+
+    t0 = perf_counter()
+    ok = cv2.imwrite(
+        str(board_path),
+        board,
+        [int(cv2.IMWRITE_JPEG_QUALITY), 90],
+    )
+    if not ok:
+        raise RuntimeError(f"could not write image: {board_path}")
+    profile("board_jpeg_write", t0, bytes=board_path.stat().st_size)
+
+    profile("prepare_images_total", prepare_t0)
     return table, board_path
 
 if len(sys.argv) > 1:
@@ -46,19 +107,53 @@ if len(sys.argv) > 1:
 else:
     subprocess.run(["python3", str(CAPTURE)], cwd=str(ROOT), check=True)
     latest = sorted(CAPTURE_DIR.glob("acr_table_*.png"))[-1]
+prepare_t0 = perf_counter()
 table, board_crop = prepare_images(latest)
+profile("prepare_call_total", prepare_t0)
 
+table_url_t0 = perf_counter()
+table_url = data_url(table)
+profile("table_data_url_total", table_url_t0)
+
+crop_url_t0 = perf_counter()
+board_crop_url = data_url(board_crop)
+profile("crop_data_url_total", crop_url_t0)
+
+image_mode = os.environ.get("BOARD_IMAGE_MODE", "both").strip().lower()
+
+if image_mode == "crop":
+    request_content = [
+        {"type": "input_text", "text": PROMPT},
+        {"type": "input_image", "image_url": board_crop_url},
+    ]
+elif image_mode == "both":
+    request_content = [
+        {"type": "input_text", "text": PROMPT},
+        {"type": "input_image", "image_url": table_url},
+        {"type": "input_image", "image_url": board_crop_url},
+    ]
+else:
+    raise ValueError(
+        f"unsupported BOARD_IMAGE_MODE={image_mode!r}; "
+        "expected 'both' or 'crop'"
+    )
+
+print(
+    f"[BOARD_READER_PROFILE] image_mode={image_mode} "
+    f"image_count={sum(1 for item in request_content if item['type'] == 'input_image')}",
+    file=sys.stderr,
+    flush=True,
+)
+
+api_t0 = perf_counter()
 response = client.responses.create(
     model="gpt-4.1-mini",
     input=[{
         "role": "user",
-        "content": [
-            {"type": "input_text", "text": PROMPT},
-            {"type": "input_image", "image_url": data_url(table)},
-            {"type": "input_image", "image_url": data_url(board_crop)}
-        ]
+        "content": request_content,
     }],
 )
+profile("api_request", api_t0)
 
 text = response.output_text.strip()
 print(text)
@@ -66,6 +161,13 @@ print(text)
 if text.startswith("```"):
     text = text.split("```json")[-1].split("```")[0].strip()
 
+parse_t0 = perf_counter()
 data = json.loads(text)
+profile("json_parse", parse_t0)
+
+write_t0 = perf_counter()
 OUT.write_text(json.dumps(data, indent=2))
+profile("result_write", write_t0)
+
+profile("process_total", PROCESS_T0)
 print(f"Saved {OUT}")

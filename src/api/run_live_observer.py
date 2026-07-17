@@ -17,6 +17,7 @@ def reset_runtime():
     (live / "board_results.jsonl").write_text("")
     (live / "hero_requests.jsonl").write_text("")
     (live / "hero_results.jsonl").write_text("")
+    (live / "perception_latency.jsonl").write_text("")
 
     for name in [
         "api_event_state_machine_cursor.txt",
@@ -24,6 +25,13 @@ def reset_runtime():
         "current_hand_state.json",
         "current_hand.txt",
         "api_event_coordinator_state.json",
+        "current_action_episodes.json",
+        "current_inferred_actions.json",
+        "current_observation_timeline.json",
+        "current_observation_correlator.json",
+        "local_observations.jsonl",
+        "canonical_hand.json",
+        "current_hand_canonical.txt",
     ]:
         path = live / name
         if path.exists():

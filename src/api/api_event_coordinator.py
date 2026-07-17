@@ -15,7 +15,13 @@ from src.observer.continuous_observer import ContinuousObserver
 from src.observer.observation_timeline import ObservationTimeline
 from src.observer.observation_correlator import ObservationCorrelator
 from src.observer.action_episode_manager import ActionEpisodeManager
+from src.api.perception_latency import log as log_latency
+from src.observer.action_inference_engine import ActionInferenceEngine
+from src.state.street_commitment_tracker import (
+    StreetCommitmentTracker,
+)
 from src.vision.window_capture import find_acr_table_window, capture_window_crop
+from src.vision.action_sequence_recorder import ActionSequenceRecorder
 
 CAPTURE = ROOT / "src/vision/window_capture.py"
 CAPTURE_DIR = ROOT / "runtime/window_captures"
@@ -24,10 +30,14 @@ GEOM = json.load(open(ROOT / "config/geometry.json"))
 
 EVENT_LOG = ROOT / "runtime/live/api_events.jsonl"
 COORD_STATE = ROOT / "runtime/live/api_event_coordinator_state.json"
+STATE_MACHINE_STATE = (
+    ROOT / "runtime/live/api_event_state_machine_state.json"
+)
 OBS_LOG = ROOT / "runtime/live/local_observations.jsonl"
 TIMELINE_JSON = ROOT / "runtime/live/current_observation_timeline.json"
 CORRELATOR_JSON = ROOT / "runtime/live/current_observation_correlator.json"
 EPISODES_JSON = ROOT / "runtime/live/current_action_episodes.json"
+INFERRED_ACTIONS_JSON = ROOT / "runtime/live/current_inferred_actions.json"
 BOARD_REQUESTS = ROOT / "runtime/live/board_requests.jsonl"
 BOARD_RESULTS = ROOT / "runtime/live/board_results.jsonl"
 HERO_REQUESTS = ROOT / "runtime/live/hero_requests.jsonl"
@@ -53,6 +63,9 @@ def fresh_state():
         "board_request_expected_len": None,
         "hero_request_id": None,
         "hero_request_token": None,
+        "hero_request_ts": None,
+        "last_local_board_count": 0,
+        "last_local_hero_visible": False,
     }
 
 
@@ -73,6 +86,53 @@ def load_state():
 
 def save_state(state):
     COORD_STATE.write_text(json.dumps(state, indent=2))
+
+
+def load_table_context():
+    context = {
+        "phase": "WAITING",
+        "hero_position": "unknown",
+        "dealer_button_seat": "",
+        "positions": {},
+        "players": [],
+        "hand_started_at": None,
+    }
+
+    if not STATE_MACHINE_STATE.exists():
+        return context
+
+    try:
+        state = json.loads(
+            STATE_MACHINE_STATE.read_text()
+        )
+    except Exception:
+        return context
+
+    context["phase"] = (
+        state.get("phase")
+        or "WAITING"
+    )
+    context["hero_position"] = (
+        state.get("hero_position")
+        or "unknown"
+    )
+    context["dealer_button_seat"] = (
+        state.get("dealer_button_seat")
+        or ""
+    )
+    context["positions"] = dict(
+        state.get("positions")
+        or {}
+    )
+    context["players"] = list(
+        state.get("players")
+        or []
+    )
+    context["hand_started_at"] = (
+        state.get("hand_started_at")
+    )
+
+    return context
 
 
 def emit(event):
@@ -259,16 +319,27 @@ def queue_hero_request(state, frame):
     request_id = uuid.uuid4().hex
     hand_token = uuid.uuid4().hex
 
+    queued_ts = time.time()
+
     append_jsonl(HERO_REQUESTS, {
         "type": "hero_request",
         "request_id": request_id,
         "hand_token": hand_token,
         "frame": str(frame),
-        "ts": time.time(),
+        "ts": queued_ts,
     })
+
+    log_latency(
+        "queued",
+        request_id=request_id,
+        worker="hero",
+        hand_token=hand_token,
+        frame=str(frame),
+    )
 
     state["hero_request_id"] = request_id
     state["hero_request_token"] = hand_token
+    state["hero_request_ts"] = time.time()
 
     print(f"[HERO] queued request={request_id[:8]}")
     return state
@@ -305,22 +376,59 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
         result = find_hero_result(pending_id)
 
         if result is None:
-            if not hero_visible or board_count != 0:
+            request_ts = state.get("hero_request_ts") or time.time()
+            pending_seconds = time.time() - request_ts
+
+            # A queued request owns a captured frame. Temporary local
+            # hero-visibility flicker must not cancel valid in-flight work.
+            # Valid Hold'em board counts are 0, 3, 4, and 5.
+            # Transient local counts of 1 or 2 are detector noise and must
+            # not cancel a valid in-flight Hero-card request.
+            if board_count in {3, 4, 5}:
+                print(
+                    f"[HERO] cancel pending request because "
+                    f"valid board_count={board_count}"
+                )
                 state["hero_request_id"] = None
                 state["hero_request_token"] = None
+                state["hero_request_ts"] = None
                 state["hero_visible_seen"] = 0
+
+            elif pending_seconds >= 20.0:
+                print(
+                    f"[HERO] pending request timed out after "
+                    f"{pending_seconds:.1f}s"
+                )
+                state["hero_request_id"] = None
+                state["hero_request_token"] = None
+                state["hero_request_ts"] = None
+                state["hero_visible_seen"] = 0
+
             return state
 
         request_token = state.get("hero_request_token")
+        request_ts = state.get("hero_request_ts")
+
+        log_latency(
+            "coordinator_consumed",
+            request_id=pending_id,
+            worker="hero",
+            ok=result.get("ok"),
+            elapsed_ms=result.get("elapsed_ms"),
+        )
+
         state["hero_request_id"] = None
         state["hero_request_token"] = None
+        state["hero_request_ts"] = None
 
         if result.get("hand_token") != request_token:
             print("[HERO] ignored stale worker result")
             return state
 
-        if not hero_visible or board_count != 0:
-            print("[HERO] ignored result because clean preflop frame is gone")
+        if board_count != 0:
+            print(
+                "[HERO] ignored result because board has already advanced"
+            )
             state["hero_visible_seen"] = 0
             return state
 
@@ -339,6 +447,14 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
             state["hero_visible_seen"] = 0
             return state
 
+        if request_ts is not None:
+            total_ms = (time.time() - request_ts) * 1000.0
+            worker_ms = result.get("elapsed_ms")
+            print(
+                f"[LATENCY] HERO total={total_ms:.1f}ms "
+                f"worker={worker_ms}ms"
+            )
+
         state["hero_read"] = True
         state["phase"] = "PREFLOP"
         state["hero_clear_seen"] = 0
@@ -346,7 +462,21 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
         state["board_request_id"] = None
         state["board_request_expected_len"] = None
 
-        emit({"type": "hero_cards", "hero_cards": cards})
+        emit({
+            "type": "hero_cards",
+            "hero_cards": cards,
+            "source_request_id": pending_id,
+            "hand_token": request_token,
+        })
+
+        log_latency(
+            "event_emitted",
+            request_id=pending_id,
+            worker="hero",
+            event_type="hero_cards",
+            hero_cards=cards,
+        )
+
         return state
 
     if not hero_visible:
@@ -376,14 +506,25 @@ def append_jsonl(path, payload):
 def queue_board_request(state, expected_len, frame):
     request_id = uuid.uuid4().hex
 
+    queued_ts = time.time()
+
     append_jsonl(BOARD_REQUESTS, {
         "type": "board_request",
         "request_id": request_id,
         "hand_token": state.get("hand_token"),
         "expected_len": expected_len,
         "frame": str(frame),
-        "ts": time.time(),
+        "ts": queued_ts,
     })
+
+    log_latency(
+        "queued",
+        request_id=request_id,
+        worker="board",
+        hand_token=state.get("hand_token"),
+        expected_len=expected_len,
+        frame=str(frame),
+    )
 
     state["board_request_id"] = request_id
     state["board_request_expected_len"] = expected_len
@@ -477,6 +618,16 @@ def apply_board_result(state, result):
         state["phase"] = "RIVER"
 
     emit({"type": "board", "board": board_to_emit})
+
+    log_latency(
+        "event_emitted",
+        request_id=request_id,
+        worker="board",
+        event_type="board",
+        expected_len=expected_len,
+        board=board_to_emit,
+    )
+
     return state, True
 
 
@@ -491,6 +642,15 @@ def maybe_read_board(state, count, frame):
 
         if result is None:
             return state
+
+        log_latency(
+            "coordinator_consumed",
+            request_id=pending_id,
+            worker="board",
+            ok=result.get("ok"),
+            elapsed_ms=result.get("elapsed_ms"),
+            expected_len=result.get("expected_len"),
+        )
 
         state, _ = apply_board_result(state, result)
         return state
@@ -516,6 +676,66 @@ def maybe_read_board(state, count, frame):
 
     state["last_api_attempt_ts"] = now
     return queue_board_request(state, expected_next, frame)
+
+
+def consume_ready_worker_results(state):
+    """
+    Consume completed worker results before performing another expensive
+    capture/perception cycle.
+
+    Returns:
+        (state, consumed_result, emitted_board)
+    """
+    consumed = False
+    board_emitted = False
+
+    hero_request_id = state.get("hero_request_id")
+
+    if hero_request_id:
+        hero_result = find_hero_result(hero_request_id)
+
+        if hero_result is not None:
+            before_phase = state.get("phase")
+
+            state = maybe_read_hero(
+                state,
+                bool(state.get("last_local_hero_visible")),
+                int(state.get("last_local_board_count") or 0),
+                None,
+            )
+
+            consumed = True
+
+            if before_phase == "WAITING" and state.get("phase") != "WAITING":
+                save_state(state)
+                return state, True, False
+
+    board_request_id = state.get("board_request_id")
+
+    if board_request_id:
+        board_result = find_board_result(board_request_id)
+
+        if board_result is not None:
+            log_latency(
+                "coordinator_consumed",
+                request_id=board_request_id,
+                worker="board",
+                ok=board_result.get("ok"),
+                elapsed_ms=board_result.get("elapsed_ms"),
+                expected_len=board_result.get("expected_len"),
+                fast_path=True,
+            )
+
+            state, board_emitted = apply_board_result(
+                state,
+                board_result,
+            )
+            consumed = True
+
+    if consumed:
+        save_state(state)
+
+    return state, consumed, board_emitted
 
 
 def maybe_complete_early(state, count, hero_visible):
@@ -564,17 +784,79 @@ def maybe_complete_hand(state, count):
     return state
 
 
+def episode_ready_for_inference(episode):
+    """
+    Preflop action interpretation requires a position map. Postflop
+    episodes may still be inferred without position context.
+    """
+    item = (
+        episode.to_dict()
+        if hasattr(episode, "to_dict")
+        else episode
+    )
+
+    street = str(
+        item.get("street")
+        or "unknown"
+    ).upper()
+
+    if street != "PREFLOP":
+        return True
+
+    context = item.get("table_context") or {}
+    positions = context.get("positions") or {}
+    seat = item.get("seat") or "unknown"
+
+    position = positions.get(seat)
+
+    if not position and seat == "hero":
+        position = context.get("hero_position")
+
+    return bool(
+        position
+        and str(position).lower() != "unknown"
+    )
+
+
 def main():
     print("api_event_coordinator running event-only mode. Ctrl+C to stop.")
     print(f"Events: {EVENT_LOG}")
     state = load_state()
     local_detector = LocalEventDetector()
+    sequence_recorder = ActionSequenceRecorder(
+        max_frames=240
+    )
+    sequence_dir = sequence_recorder.start_session()
+    print(
+        f"[DEBUG_SEQUENCE] recording to {sequence_dir}",
+        flush=True,
+    )
+
     observer = ContinuousObserver()
     timeline = ObservationTimeline()
     correlator = ObservationCorrelator()
     episode_manager = ActionEpisodeManager()
+    inference_engine = ActionInferenceEngine()
+    commitment_tracker = StreetCommitmentTracker()
+    commitment_street = "WAITING"
+    last_deferred_count = None
+    previous_occupied_bet_regions = set()
+
+    INFERRED_ACTIONS_JSON.write_text(
+        json.dumps(inference_engine.to_dict(), indent=2)
+    )
 
     while True:
+        state, consumed_result, board_emitted_fast = (
+            consume_ready_worker_results(state)
+        )
+
+        if consumed_result:
+            # Let downstream consumers observe emitted worker events before
+            # performing another full screen-perception cycle.
+            time.sleep(0.01 if not board_emitted_fast else 0.05)
+            continue
+
         frame = capture()
 
         img = cv2.imread(str(frame)) if frame else None
@@ -586,6 +868,13 @@ def main():
         changes = local_detector.detect(img)
         log_observation(changes)
 
+        sequence_recorder.record(
+            frame=img,
+            changes=changes,
+            state=state,
+            source_frame=frame,
+        )
+
         observations = observer.ingest_changes(
             changes,
             street=state.get("phase", "WAITING")
@@ -596,12 +885,119 @@ def main():
         CORRELATOR_JSON.write_text(json.dumps(correlator.summary(), indent=2))
 
         if state.get("phase") != "WAITING":
+            table_context = load_table_context()
+
+            current_commitment_street = str(
+                state.get("phase")
+                or "WAITING"
+            ).upper()
+
+            if current_commitment_street != commitment_street:
+                commitment_tracker.reset_street(
+                    current_commitment_street
+                )
+                commitment_street = current_commitment_street
+
+            table_context["prior_voluntary_commitment_seats"] = (
+                commitment_tracker.committed_players(
+                    current_commitment_street
+                )
+            )
+
+            # Capture occupancy from the preceding perception frame.
+            # This reveals whether a newly committing seat was already
+            # facing chips from another player.
+            table_context["prior_occupied_bet_regions"] = sorted(
+                previous_occupied_bet_regions
+            )
+
+            episode_manager.set_table_context(
+                table_context
+            )
             episode_manager.ingest(observations)
-            EPISODES_JSON.write_text(json.dumps(episode_manager.summary(), indent=2))
+
+            backfilled = episode_manager.backfill_table_context(
+                table_context
+            )
+
+            if backfilled:
+                print(
+                    f"[CONTEXT] backfilled episodes={backfilled} "
+                    f"hero_position={table_context.get('hero_position')} "
+                    f"positions={len(table_context.get('positions') or {})}",
+                    flush=True,
+                )
+
+            EPISODES_JSON.write_text(
+                json.dumps(episode_manager.summary(), indent=2)
+            )
+
+            ready_closed = [
+                episode
+                for episode in episode_manager.closed
+                if episode_ready_for_inference(episode)
+            ]
+
+            deferred_count = (
+                len(episode_manager.closed)
+                - len(ready_closed)
+            )
+
+            if deferred_count != last_deferred_count:
+                if deferred_count:
+                    print(
+                        f"[INFERENCE] deferred preflop episodes="
+                        f"{deferred_count} waiting_for_positions",
+                        flush=True,
+                    )
+                elif last_deferred_count:
+                    print(
+                        "[INFERENCE] deferred preflop "
+                        "episodes resolved",
+                        flush=True,
+                    )
+
+                last_deferred_count = deferred_count
+
+            new_actions = inference_engine.ingest_closed(
+                ready_closed
+            )
+
+            if new_actions:
+                for action in new_actions:
+                    print(
+                        f"[INFERRED] {action.street} {action.seat} "
+                        f"{action.action} confidence={action.confidence:.2f}"
+                    )
+
+                    if (
+                        action.action in {
+                            "BET_OR_RAISE",
+                            "CALL_OR_RAISE",
+                            "CALL",
+                        }
+                        and action.confidence >= 0.70
+                    ):
+                        commitment_tracker.record_commitment(
+                            action.street,
+                            action.seat,
+                        )
+
+                    emit({
+                        "type": "inferred_action",
+                        **action.to_dict(),
+                    })
+
+                INFERRED_ACTIONS_JSON.write_text(
+                    json.dumps(inference_engine.to_dict(), indent=2)
+                )
 
         hero_visible = changes.hero_cards_visible
         count = changes.board_count
         buttons_visible = changes.action_buttons_visible
+
+        state["last_local_hero_visible"] = bool(hero_visible)
+        state["last_local_board_count"] = int(count or 0)
 
         state = maybe_read_hero(state, hero_visible, count, frame)
 
@@ -633,7 +1029,13 @@ def main():
 
         save_state(state)
 
-        if state.get("phase") == "WAITING":
+        # Poll worker result files aggressively only while requests are pending.
+        # This removes avoidable coordinator delay without increasing API calls.
+        if state.get("hero_request_id") is not None:
+            time.sleep(0.02)
+        elif state.get("board_request_id") is not None:
+            time.sleep(0.02)
+        elif state.get("phase") == "WAITING":
             time.sleep(0.5)
         elif state.get("hero_decision_active"):
             time.sleep(0.05)

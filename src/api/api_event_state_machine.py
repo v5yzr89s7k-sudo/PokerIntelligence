@@ -12,6 +12,20 @@ STATE_PATH = ROOT / "runtime/live/api_event_state_machine_state.json"
 
 from src.api.live_hand_event_writer import new_hand, set_board, close_hand, set_table_snapshot, set_live_status, add_timeline_event
 from src.api.position_engine import assign_positions
+from src.state.canonical_hand import CanonicalHand
+from src.state.canonical_hand_store import CanonicalHandStore
+from src.state.betting_round_tracker import BettingRoundTracker
+
+
+CANONICAL_STORE = CanonicalHandStore()
+
+
+def canonical_load():
+    return CANONICAL_STORE.load()
+
+
+def canonical_save(hand):
+    CANONICAL_STORE.save(hand)
 
 
 def read_cursor():
@@ -102,7 +116,7 @@ def handle_table_snapshot(state, event):
     players = event.get("players") or []
     dealer_button_seat = event.get("dealer_button_seat") or ""
     positions = assign_positions(players, dealer_button_seat)
-    hero_position = positions.get("hero") or event.get("hero_position") or "unknown"
+    hero_position = positions.get("hero") or "unknown"
 
     state["players"] = players
     state["dealer_button_seat"] = dealer_button_seat
@@ -111,6 +125,14 @@ def handle_table_snapshot(state, event):
 
     if state.get("phase") != "WAITING":
         set_table_snapshot(players, hero_position, dealer_button_seat, positions)
+
+        canonical = canonical_load()
+        canonical.update_table_snapshot(
+            players=players,
+            hero_position=hero_position,
+            positions=positions,
+        )
+        canonical_save(canonical)
 
     print("[STATE] table_snapshot", hero_position, f"players={len(players)}")
     return state
@@ -141,6 +163,17 @@ def handle_hero_cards(state, event):
         dealer_button_seat=state.get("dealer_button_seat", ""),
         positions=state.get("positions", {})
     )
+
+    canonical = CanonicalHand().start_hand(
+        hand_id=f"live-{int(state['hand_started_at'] * 1000)}",
+        players=state.get("players", []),
+        hero_cards=cards,
+        hero_position=state.get("hero_position", "unknown"),
+        positions=state.get("positions", {}),
+        started_ts=state["hand_started_at"],
+    )
+    canonical_save(canonical)
+
     state = record_timeline(state, f"hero_cards {' '.join(cards)}")
     print("[STATE] WAITING -> PREFLOP", cards)
 
@@ -168,6 +201,11 @@ def handle_board(state, event):
     state["board"] = board
 
     set_board(board)
+
+    canonical = canonical_load()
+    canonical.set_board(board)
+    canonical_save(canonical)
+
     state = record_timeline(state, f"board {next_phase} {' '.join(board)}")
     print(f"[STATE] board -> {next_phase}", board)
 
@@ -202,6 +240,42 @@ def handle_hero_action_complete(state, event):
     print("[STATE] hero_action_complete", state.get("phase"))
     return state
 
+def handle_inferred_action(state, event):
+    if state.get("phase") == "WAITING":
+        print("[SKIP] inferred_action while waiting", event)
+        return state
+
+    canonical = canonical_load()
+    tracker = BettingRoundTracker(canonical)
+    added = tracker.ingest(event)
+
+    decision = tracker.decisions[-1] if tracker.decisions else None
+
+    if added is None:
+        if decision is not None:
+            print(
+                f"[CANONICAL_SKIP] {event.get('street')} "
+                f"{event.get('seat')} {event.get('action')} "
+                f"reason={decision.reason}"
+            )
+        return state
+
+    canonical_save(canonical)
+
+    print(
+        f"[CANONICAL_ACTION] {added.street} {added.seat} "
+        f"{added.action} confidence={added.confidence}"
+    )
+
+    state = record_timeline(
+        state,
+        f"canonical_action {added.street} "
+        f"{added.seat} {added.action}",
+    )
+
+    return state
+
+
 def handle_hand_complete(state, event):
     if state["phase"] == "WAITING":
         return state
@@ -213,6 +287,14 @@ def handle_hand_complete(state, event):
 
     state = record_timeline(state, f"hand_complete {result}")
     close_hand(result)
+
+    canonical = canonical_load()
+    canonical.finish(
+        result=result,
+        ended_ts=event.get("ts") or time.time(),
+    )
+    canonical_save(canonical)
+
     print("[STATE] -> COMPLETE", result)
 
     return default_state()
@@ -235,6 +317,9 @@ def handle_event(state, event):
 
     if t == "hero_action_complete":
         return handle_hero_action_complete(state, event)
+
+    if t == "inferred_action":
+        return handle_inferred_action(state, event)
 
     if t == "hand_complete":
         return handle_hand_complete(state, event)

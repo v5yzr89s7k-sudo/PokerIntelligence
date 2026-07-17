@@ -15,7 +15,6 @@ Read ONLY the current table snapshot from this ACR poker screenshot.
 
 Return RAW JSON ONLY:
 {
-  "hero_position":"",
   "dealer_button_seat":"",
   "players":[
     {
@@ -44,7 +43,6 @@ Rules:
   seat_lower_left,
   seat_mid_left,
   seat_upper_left
-- hero_position should be BTN, SB, BB, UTG, HJ, CO, or unknown if uncertain.
 - dealer_button_seat should use the same seat labels or "" if uncertain.
 - stack_text should preserve what is visible, for example "42.5 BB" or "12,340".
 - stack_bb should be a number only if clear, otherwise null.

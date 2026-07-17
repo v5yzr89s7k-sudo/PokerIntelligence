@@ -21,6 +21,7 @@ from src.events.detectors.card_presence import count_board_cards, hero_cards_vis
 from src.events.detectors.hero_turn_detector import hero_nameplate_blinking
 from src.events.detectors.bet_region_detector import bet_region_occupancy
 from src.events.detectors.bet_region_state_tracker import BetRegionStateTracker
+from src.events.detectors.frame_baseline import FrameBaseline
 from src.events.transition_engine import TransitionEngine
 
 
@@ -138,11 +139,30 @@ class LocalEventDetector:
     def __init__(self):
         self.previous_frame = None
         self.bet_region_tracker = BetRegionStateTracker()
+        self.bet_region_baseline = FrameBaseline(
+            pixel_threshold=18,
+            blur_size=3,
+        )
         self.transition_engine = TransitionEngine()
+
+    def reset_bet_region_baseline(self, frame):
+        self.bet_region_baseline.reset()
+        self.bet_region_tracker.reset()
+
+        for seat, rect in GEOM.get(
+            "bet_regions",
+            {},
+        ).items():
+            self.bet_region_baseline.capture(
+                f"bet_region:{seat}",
+                frame,
+                rect,
+            )
 
     def detect(self, frame):
         if self.previous_frame is None:
             self.previous_frame = frame
+            self.reset_bet_region_baseline(frame)
             return ChangeSet()
 
         changes = ChangeSet()
@@ -158,7 +178,11 @@ class LocalEventDetector:
             seat for seat, info in changes.stack_change_details.items()
             if info.get("changed")
         ]
-        changes.bet_region_occupancy = bet_region_occupancy(frame, GEOM)
+        changes.bet_region_occupancy = bet_region_occupancy(
+            frame,
+            GEOM,
+            baseline=self.bet_region_baseline,
+        )
         changes.occupied_bet_regions = [
             seat for seat, info in changes.bet_region_occupancy.items()
             if info.get("occupied")
@@ -177,6 +201,19 @@ class LocalEventDetector:
         changes.hero_nameplate_blinking = hero_nameplate_blinking(self.previous_frame, frame, GEOM)
 
         changes = self.transition_engine.apply(changes)
+
+        if changes.hero_cards_appeared:
+            # New hand boundary. The previous hand's chips, cleared regions,
+            # and debounce state must not carry into this hand.
+            self.reset_bet_region_baseline(frame)
+
+            # The current frame becomes the new baseline. Do not emit bet
+            # transitions from the same frame used to establish it.
+            changes.bet_region_occupancy = {}
+            changes.occupied_bet_regions = []
+            changes.bet_region_transitions = {}
+            changes.bet_region_appeared = []
+            changes.bet_region_cleared = []
 
         self.previous_frame = frame
         return changes

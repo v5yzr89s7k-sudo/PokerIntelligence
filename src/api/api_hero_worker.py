@@ -8,6 +8,9 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from src.api.perception_latency import log as log_latency
+from src.api.hero_cards_reader_core import read_hero_cards
+
 HERO_READER = ROOT / "src/api/hero_cards_api_reader.py"
 REQUEST_LOG = ROOT / "runtime/live/hero_requests.jsonl"
 RESULT_LOG = ROOT / "runtime/live/hero_results.jsonl"
@@ -23,33 +26,35 @@ def append_jsonl(path, payload):
 def run_hero_reader(frame):
     t0 = perf_counter()
 
-    p = subprocess.run(
-        [sys.executable, str(HERO_READER), str(frame)],
-        cwd=str(ROOT),
-        capture_output=True,
-        text=True,
-    )
+    try:
+        data, timings = read_hero_cards(frame)
+    except Exception as exc:
+        elapsed_ms = (perf_counter() - t0) * 1000.0
+        print(
+            f"[HERO_WORKER] in-process reader failed: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        print(
+            f"[PROFILE] HERO_WORKER total={elapsed_ms:.1f}ms failed=true",
+            flush=True,
+        )
+        return None, elapsed_ms
 
     elapsed_ms = (perf_counter() - t0) * 1000.0
-    print(f"[PROFILE] HERO_WORKER {elapsed_ms:.1f} ms", flush=True)
 
-    if p.returncode != 0:
-        print("[HERO_WORKER] reader failed", flush=True)
-        if p.stderr.strip():
-            print(p.stderr.strip(), flush=True)
-        return None, elapsed_ms
+    print(
+        f"[PROFILE] HERO_WORKER "
+        f"total={elapsed_ms:.1f}ms "
+        f"prepare={timings['prepare_ms']:.1f}ms "
+        f"encode={timings['encode_ms']:.1f}ms "
+        f"api={timings['api_ms']:.1f}ms "
+        f"parse={timings['parse_ms']:.1f}ms "
+        f"mode={timings['image_mode']}",
+        flush=True,
+    )
 
-    text = p.stdout.strip()
-
-    try:
-        start = text.index("{")
-        end = text.rindex("}") + 1
-        return json.loads(text[start:end]), elapsed_ms
-    except Exception:
-        print("[HERO_WORKER] could not parse reader JSON", flush=True)
-        if text:
-            print(text, flush=True)
-        return None, elapsed_ms
+    return data, elapsed_ms
 
 
 def process_request(request):
@@ -89,6 +94,14 @@ def process_request(request):
     print(
         f"[HERO_WORKER] request={request_id} frame={frame.name}",
         flush=True,
+    )
+
+    log_latency(
+        "worker_started",
+        request_id=request_id,
+        worker="hero",
+        hand_token=hand_token,
+        frame=str(frame),
     )
 
     data, elapsed_ms = run_hero_reader(frame)
@@ -131,6 +144,16 @@ def process_request(request):
         "elapsed_ms": elapsed_ms,
         "ts": time.time(),
     })
+
+    log_latency(
+        "worker_finished",
+        request_id=request_id,
+        worker="hero",
+        hand_token=hand_token,
+        ok=True,
+        elapsed_ms=elapsed_ms,
+        hero_cards=cards,
+    )
 
     print(
         f"[HERO_WORKER] completed request={request_id} "
