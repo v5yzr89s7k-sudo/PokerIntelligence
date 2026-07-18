@@ -47,6 +47,7 @@ def inferred(
         confidence=confidence,
         evidence=["test_evidence"],
         reason="test",
+        measurements={},
     )
 
 
