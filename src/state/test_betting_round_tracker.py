@@ -90,7 +90,7 @@ def test_second_postflop_commitment_preserves_unresolved_semantic():
     )
 
     assert first is not None
-    assert first.action == "BET"
+    assert first.action == BET_OR_RAISE
     assert result is not None
     assert result.action == BET_OR_RAISE
     assert len(hand.actions) == 2
