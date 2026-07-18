@@ -12,6 +12,8 @@ from src.state.canonical_hand_renderer import render_canonical_hand
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_JSON = ROOT / "runtime/live/canonical_hand.json"
 DEFAULT_TEXT = ROOT / "runtime/live/current_hand.txt"
+DEFAULT_LAST_JSON = ROOT / "runtime/live/last_completed_canonical_hand.json"
+DEFAULT_LAST_TEXT = ROOT / "runtime/live/last_completed_hand.txt"
 DEFAULT_HISTORY = ROOT / "runtime/history"
 
 
@@ -68,14 +70,32 @@ class CanonicalHandStore:
         self._atomic_write(self.json_path, json_text)
         self._atomic_write(self.text_path, rendered)
 
-    def archive(self, history_dir: Path = DEFAULT_HISTORY) -> Path:
+    def archive(
+        self,
+        history_dir: Path = DEFAULT_HISTORY,
+        last_json_path: Path = DEFAULT_LAST_JSON,
+        last_text_path: Path = DEFAULT_LAST_TEXT,
+    ) -> Path:
         if not self.text_path.exists():
             raise FileNotFoundError(
                 f"canonical hand text does not exist: {self.text_path}"
             )
 
+        if not self.json_path.exists():
+            raise FileNotFoundError(
+                f"canonical hand JSON does not exist: {self.json_path}"
+            )
+
         history_dir = Path(history_dir)
         history_dir.mkdir(parents=True, exist_ok=True)
+
+        last_json_path = Path(last_json_path)
+        last_text_path = Path(last_text_path)
+        last_json_path.parent.mkdir(parents=True, exist_ok=True)
+        last_text_path.parent.mkdir(parents=True, exist_ok=True)
+
+        shutil.copy2(self.json_path, last_json_path)
+        shutil.copy2(self.text_path, last_text_path)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         destination = history_dir / f"hand_{timestamp}.txt"

@@ -81,4 +81,20 @@ with TemporaryDirectory() as tmp:
 
     print(rendered)
 
+    last_json = root / "last_completed_canonical_hand.json"
+    last_text = root / "last_completed_hand.txt"
+
+    archived = store.archive(
+        history_dir=root / "history",
+        last_json_path=last_json,
+        last_text_path=last_text,
+    )
+
+    assert archived.exists()
+    assert last_json.exists()
+    assert last_text.exists()
+
+    assert last_json.read_text() == store.json_path.read_text()
+    assert last_text.read_text() == store.text_path.read_text()
+
 print("CanonicalHandStore smoke test passed.")
