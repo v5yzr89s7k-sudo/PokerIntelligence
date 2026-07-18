@@ -76,6 +76,25 @@ def run_board_reader(frame):
     return data, elapsed_ms
 
 
+import re
+
+CARD_RE = re.compile(r"^(?:[2-9TJQKA][cdhs])$")
+
+def board_is_valid(board, expected_len):
+    if len(board) != expected_len:
+        return False, "wrong_length"
+
+    if len(set(board)) != len(board):
+        return False, "duplicate_cards"
+
+    for card in board:
+        if not CARD_RE.match(card):
+            return False, "invalid_card"
+
+    return True, None
+
+
+
 def process_request(request):
     request_id = request.get("request_id")
     hand_token = request.get("hand_token")
@@ -171,13 +190,36 @@ def process_request(request):
         })
         return
 
+    accepted = board[:expected_len]
+
+    ok, reason = board_is_valid(accepted, expected_len)
+
+    if not ok:
+        print(
+            f"[BOARD_WORKER] rejected invalid board: {accepted} reason={reason}",
+            flush=True,
+        )
+
+        write_result({
+            "type": "board_result",
+            "request_id": request_id,
+            "hand_token": hand_token,
+            "expected_len": expected_len,
+            "ok": False,
+            "error": reason,
+            "board": accepted,
+            "elapsed_ms": elapsed_ms,
+            "ts": time.time(),
+        })
+        return
+
     write_result({
         "type": "board_result",
         "request_id": request_id,
         "hand_token": hand_token,
         "expected_len": expected_len,
         "ok": True,
-        "board": board[:expected_len],
+        "board": accepted,
         "observed_board_len": len(board),
         "confidence": data.get("confidence"),
         "elapsed_ms": elapsed_ms,
