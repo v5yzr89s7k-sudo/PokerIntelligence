@@ -26,11 +26,16 @@ def observations_from_changes(changes, street="unknown") -> List[Observation]:
 
     for seat in getattr(changes, "stack_changed_seats", []) or []:
         details = getattr(changes, "stack_change_details", {}) or {}
+        payload = details.get(seat) or {}
+
         observations.append(Observation(
             type=STACK_CHANGED,
-            street=street,
+            street=payload.get(
+                "origin_street",
+                street,
+            ),
             seat=seat,
-            payload=details.get(seat) or {},
+            payload=payload,
         ))
 
     transitions = getattr(changes, "bet_region_transitions", {}) or {}

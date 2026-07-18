@@ -95,9 +95,25 @@ def process_event(event, processed_hero_events):
         trigger_ts=event_ts,
     )
 
-    frame = latest_capture()
+    frame = None
+
+    frame_text = event.get("canonical_frame")
+
+    if frame_text:
+        candidate = Path(frame_text)
+        if candidate.exists():
+            frame = candidate
+        else:
+            print(
+                f"[SNAPSHOT] canonical frame missing: {candidate}",
+                flush=True,
+            )
+
     if frame is None:
-        print("[SNAPSHOT] no captured frame available", flush=True)
+        print(
+            "[SNAPSHOT] hero_cards event has no usable canonical frame",
+            flush=True,
+        )
         return
 
     print(f"[SNAPSHOT] reading from {frame.name}", flush=True)

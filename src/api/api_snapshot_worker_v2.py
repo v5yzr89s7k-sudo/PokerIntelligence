@@ -118,7 +118,17 @@ def process_event(
         trigger_ts=event_ts,
     )
 
-    frame = latest_capture()
+    frame = None
+
+    frame_text = event.get("canonical_frame")
+
+    if frame_text:
+        candidate = Path(frame_text)
+        if candidate.exists():
+            frame = candidate
+
+    if frame is None:
+        frame = latest_capture()
 
     if frame is None:
         print(

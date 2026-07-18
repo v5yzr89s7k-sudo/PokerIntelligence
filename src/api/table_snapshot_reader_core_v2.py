@@ -527,16 +527,34 @@ def read_table_snapshot_v2(frame):
             stack_readings[seat] = {
                 "stack_bb": cached_stack["stack_bb"],
                 "stack_text": cached_stack["stack_text"],
-                "confidence": 1.0,
-                "mode": "cache",
+                "confidence": float(
+                    cached_stack.get("confidence")
+                    or 0.0
+                ),
+                "votes": int(
+                    cached_stack.get("votes")
+                    or 0
+                ),
+                "mode": cached_stack.get(
+                    "mode",
+                    "cache",
+                ),
+                "source": "cache",
             }
             continue
 
         result = read_stack(stack_crop)
 
-        stack_readings[seat] = result
+        trusted_stack = (
+            result.get("stack_bb") is not None
+            and float(result.get("stack_bb")) > 0.0
+            and float(result.get("confidence") or 0.0) >= 0.95
+            and int(result.get("votes") or 0) >= 2
+        )
 
-        if result["stack_bb"] is not None:
+        if trusted_stack:
+            stack_readings[seat] = result
+
             stack_update(
                 cache,
                 seat,
@@ -544,8 +562,17 @@ def read_table_snapshot_v2(frame):
                 {
                     "stack_bb": result["stack_bb"],
                     "stack_text": result["stack_text"],
+                    "confidence": result["confidence"],
+                    "votes": result["votes"],
+                    "mode": result["mode"],
                 },
             )
+        else:
+            stack_readings[seat] = {
+                **result,
+                "stack_bb": None,
+                "stack_text": "",
+            }
 
     save_cache(cache)
 

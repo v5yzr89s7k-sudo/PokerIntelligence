@@ -195,6 +195,7 @@ def read_hero_cards(frame, image_mode=None):
         "confidence": data.get("confidence"),
     }
 
+
     timings = {
         "image_mode": mode,
         "prepare_ms": prepare_ms,

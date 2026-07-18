@@ -94,6 +94,32 @@ def stack_lookup(cache, seat, crop):
     if not entry:
         return None
 
+    # Legacy cache records stored only the parsed value and image hash.
+    # They must not be promoted to trusted stack readings because their
+    # original OCR confidence, vote count, and resolution mode are unknown.
+    required_trust_fields = {
+        "confidence",
+        "votes",
+        "mode",
+    }
+
+    if not required_trust_fields.issubset(entry):
+        return None
+
+    try:
+        stack_bb = float(entry.get("stack_bb"))
+        confidence = float(entry.get("confidence") or 0.0)
+        votes = int(entry.get("votes") or 0)
+    except (TypeError, ValueError):
+        return None
+
+    if (
+        stack_bb <= 0.0
+        or confidence < 0.95
+        or votes < 2
+    ):
+        return None
+
     if entry.get("stack_hash") == stack_image_hash(crop):
         return entry
 

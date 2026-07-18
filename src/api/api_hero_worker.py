@@ -140,6 +140,7 @@ def process_request(request):
         "hand_token": hand_token,
         "ok": True,
         "hero_cards": cards,
+        "canonical_frame": str(frame),
         "confidence": data.get("confidence"),
         "elapsed_ms": elapsed_ms,
         "ts": time.time(),

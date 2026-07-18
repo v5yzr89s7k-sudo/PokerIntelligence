@@ -21,14 +21,40 @@ def stack_region_diff(previous, current, rect):
     return float(np.mean(cv2.absdiff(ag, bg)))
 
 
-def stack_change_details(previous, current, geometry, threshold=8.0):
+DEFAULT_STACK_CHANGE_THRESHOLD = 8.0
+HERO_STACK_CHANGE_THRESHOLD = 4.0
+
+
+def stack_change_details(
+    previous,
+    current,
+    geometry,
+    threshold=DEFAULT_STACK_CHANGE_THRESHOLD,
+):
+    """
+    Return raw visual stack-region movement.
+
+    Hero uses a lower trigger because normal stack-text changes produce a
+    smaller whole-region mean difference in the bottom-center stack ROI.
+    This is only a candidate trigger. The coordinator still requires the
+    region to settle, a trusted prior stack, confident OCR, and a positive
+    quantitative chip delta before publishing STACK_CHANGED.
+    """
     details = {}
 
     for seat, rect in geometry["stack_regions"].items():
         diff = stack_region_diff(previous, current, rect)
+
+        seat_threshold = (
+            HERO_STACK_CHANGE_THRESHOLD
+            if seat == "hero"
+            else threshold
+        )
+
         details[seat] = {
             "mean_diff": diff,
-            "changed": diff > threshold,
+            "threshold": seat_threshold,
+            "changed": diff > seat_threshold,
         }
 
     return details

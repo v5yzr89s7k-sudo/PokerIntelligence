@@ -131,7 +131,17 @@ def enrich_stack_change_measurements(changes, img, state):
     now = time.time()
     settle_seconds = 0.45
     minimum_delta_bb = 0.05
-    minimum_confidence = 0.75
+
+    # Quantitative stack transitions must be supported by at least two
+    # agreeing OCR variants. Single-variant reads are too unstable to
+    # mutate the live stack baseline.
+    minimum_confidence = 0.95
+    minimum_votes = 2
+
+    # A single ambiguous OCR frame must not permanently discard a real
+    # stack transition. Retry briefly while the stack display stabilizes.
+    maximum_ocr_attempts = 5
+    maximum_pending_seconds = 2.5
 
     raw_changed_seats = list(
         getattr(changes, "stack_changed_seats", [])
@@ -166,6 +176,7 @@ def enrich_stack_change_measurements(changes, img, state):
                 "first_change_ts": now,
                 "last_change_ts": now,
                 "max_mean_diff": 0.0,
+                "origin_street": state.get("phase", "WAITING"),
             },
         )
 
@@ -218,12 +229,49 @@ def enrich_stack_change_measurements(changes, img, state):
             reading.get("confidence")
             or 0.0
         )
+        votes = int(reading.get("votes") or 0)
 
-        if current is None or confidence < minimum_confidence:
+        if (
+            current is None
+            or confidence < minimum_confidence
+            or votes < minimum_votes
+        ):
+            attempts = int(entry.get("ocr_attempts") or 0) + 1
+            entry["ocr_attempts"] = attempts
+
+            pending_age = (
+                now - float(entry.get("first_change_ts") or now)
+            )
+
+            retrying = (
+                attempts < maximum_ocr_attempts
+                and pending_age < maximum_pending_seconds
+            )
+
+            if not retrying:
+                pending.pop(seat, None)
+
+            print(
+                f"[STACK_SETTLE_SKIP] seat={seat} "
+                f"reason=untrusted_read "
+                f"confidence={confidence:.2f} "
+                f"votes={votes} "
+                f"attempt={attempts} "
+                f"retrying={retrying}",
+                flush=True,
+            )
+            continue
+
+        # Zero is frequently produced when chips, cards, animations, or
+        # table transitions obscure the stack text. Until an independent
+        # all-in signal is available, zero must never mutate the baseline.
+        if float(current) <= 0.0:
             pending.pop(seat, None)
             print(
                 f"[STACK_SETTLE_SKIP] seat={seat} "
-                f"reason=untrusted_read confidence={confidence:.2f}",
+                f"reason=zero_without_all_in_confirmation "
+                f"confidence={confidence:.2f} "
+                f"votes={votes}",
                 flush=True,
             )
             continue
@@ -246,6 +294,10 @@ def enrich_stack_change_measurements(changes, img, state):
             continue
 
         measurement = {
+            "origin_street": entry.get(
+                "origin_street",
+                state.get("phase", "WAITING"),
+            ),
             "mean_diff": float(
                 entry.get("max_mean_diff")
                 or 0.0
@@ -670,6 +722,7 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
             "hero_cards": cards,
             "source_request_id": pending_id,
             "hand_token": request_token,
+            "canonical_frame": result.get("canonical_frame"),
         })
 
         log_latency(
