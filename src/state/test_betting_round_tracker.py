@@ -94,7 +94,7 @@ def test_second_postflop_commitment_preserves_unresolved_semantic():
     assert result is not None
     assert result.action == BET_OR_RAISE
     assert len(hand.actions) == 2
-    assert hand.last_aggressor_seat == "seat_top"
+    assert hand.last_aggressor_seat is None
     assert tracker.decisions[-1].accepted is False
 
 
