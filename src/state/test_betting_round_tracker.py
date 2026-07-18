@@ -51,7 +51,7 @@ def inferred(
     )
 
 
-def test_preflop_commitment_stays_unresolved():
+def test_preflop_commitment_preserves_unresolved_semantic():
     hand = make_hand()
     tracker = BettingRoundTracker(hand)
 
@@ -59,13 +59,15 @@ def test_preflop_commitment_stays_unresolved():
         inferred(1, "seat_top", BET_OR_RAISE)
     )
 
-    assert result is None
-    assert len(hand.actions) == 0
+    assert result is not None
+    assert result.action == BET_OR_RAISE
+    assert len(hand.actions) == 1
     assert hand.last_aggressor_seat is None
-    assert tracker.decisions[-1].accepted is False
+    assert tracker.decisions[-1].accepted is True
+    assert tracker.decisions[-1].canonical_action == BET_OR_RAISE
 
 
-def test_second_postflop_commitment_stays_unresolved():
+def test_second_postflop_commitment_preserves_unresolved_semantic():
     hand = make_hand()
     hand.set_board(["Ah", "7c", "2d"])
     tracker = BettingRoundTracker(hand)
@@ -89,8 +91,9 @@ def test_second_postflop_commitment_stays_unresolved():
 
     assert first is not None
     assert first.action == "BET"
-    assert result is None
-    assert len(hand.actions) == 1
+    assert result is not None
+    assert result.action == BET_OR_RAISE
+    assert len(hand.actions) == 2
     assert hand.last_aggressor_seat == "seat_top"
     assert tracker.decisions[-1].accepted is False
 
@@ -267,8 +270,8 @@ def test_order_is_preserved():
 
 if __name__ == "__main__":
     tests = [
-        test_preflop_commitment_stays_unresolved,
-        test_second_postflop_commitment_stays_unresolved,
+        test_preflop_commitment_preserves_unresolved_semantic,
+        test_second_postflop_commitment_preserves_unresolved_semantic,
         test_call_is_preserved,
         test_ambiguous_fold_stays_diagnostics_only,
         test_unknown_stays_diagnostics_only,

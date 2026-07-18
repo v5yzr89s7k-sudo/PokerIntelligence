@@ -218,27 +218,19 @@ class BettingRoundTracker:
             BET_OR_RAISE,
             CALL_OR_RAISE,
         }:
-            canonical_action = VOLUNTARY_COMMIT
+            # Preserve the richest honest semantic available instead of
+            # collapsing both candidates into VOLUNTARY_COMMIT.
+            canonical_action = action
 
             if action == CALL_OR_RAISE:
                 reason = (
-                    "voluntary chip commitment preserved while "
-                    "call versus raise remains unresolved"
-                )
-            elif action_street == "PREFLOP":
-                reason = (
-                    "preflop voluntary chip commitment preserved while "
-                    "limp, call, and raise remain unresolved"
-                )
-            elif self.has_open_bet:
-                reason = (
-                    "postflop voluntary chip commitment preserved while "
-                    "call versus raise remains unresolved"
+                    "call versus raise remains unresolved; "
+                    "preserving inferred semantic"
                 )
             else:
                 reason = (
-                    "postflop voluntary chip commitment preserved while "
-                    "bet versus raise remains unresolved"
+                    "bet versus raise remains unresolved; "
+                    "preserving inferred semantic"
                 )
 
         elif action == CALL:
