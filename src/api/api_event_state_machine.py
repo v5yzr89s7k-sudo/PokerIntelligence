@@ -10,7 +10,6 @@ EVENT_LOG = ROOT / "runtime/live/api_events.jsonl"
 CURSOR = ROOT / "runtime/live/api_event_state_machine_cursor.txt"
 STATE_PATH = ROOT / "runtime/live/api_event_state_machine_state.json"
 
-from src.api.live_hand_event_writer import new_hand, set_board, close_hand, set_table_snapshot, set_live_status, add_timeline_event
 from src.api.position_engine import assign_positions
 from src.state.canonical_hand import CanonicalHand
 from src.state.canonical_hand_store import CanonicalHandStore
@@ -51,6 +50,7 @@ def default_state():
         "hand_complete": False,
         "result": None,
         "hero_to_act": False,
+        "forced_blinds_seeded": False,
         "timeline": [],
     }
 
@@ -80,10 +80,6 @@ def record_timeline(state, label):
         "phase": state.get("phase", "unknown"),
         "event": label,
     })
-    try:
-        add_timeline_event(label)
-    except Exception as e:
-        print("[WARN] timeline writer failed", e)
     return state
 
 
@@ -112,6 +108,70 @@ def transition_for_board_len(n):
 
 
 
+def seed_forced_blinds(state, canonical):
+    """
+    Add mandatory SB and BB posts once per hand after authoritative
+    positions become available.
+
+    These are hand-initialization events, not inferred visual actions.
+    """
+    if state.get("phase") == "WAITING":
+        return False
+
+    if state.get("forced_blinds_seeded"):
+        return False
+
+    positions = state.get("positions") or {}
+
+    sb_seat = next(
+        (
+            seat
+            for seat, position in positions.items()
+            if str(position).upper() == "SB"
+        ),
+        None,
+    )
+    bb_seat = next(
+        (
+            seat
+            for seat, position in positions.items()
+            if str(position).upper() == "BB"
+        ),
+        None,
+    )
+
+    if not sb_seat or not bb_seat:
+        return False
+
+    canonical.add_action(
+        seat=sb_seat,
+        action="POST_SMALL_BLIND",
+        amount_bb=0.5,
+        confidence=1.0,
+        source="hand_initialization",
+        evidence=["mandatory_blind_from_position"],
+        ts=state.get("hand_started_at"),
+    )
+    canonical.add_action(
+        seat=bb_seat,
+        action="POST_BIG_BLIND",
+        amount_bb=1.0,
+        confidence=1.0,
+        source="hand_initialization",
+        evidence=["mandatory_blind_from_position"],
+        ts=state.get("hand_started_at"),
+    )
+
+    state["forced_blinds_seeded"] = True
+
+    print(
+        f"[CANONICAL_INIT] SB={sb_seat} 0.5 BB "
+        f"BB={bb_seat} 1.0 BB",
+        flush=True,
+    )
+    return True
+
+
 def handle_table_snapshot(state, event):
     players = event.get("players") or []
     dealer_button_seat = event.get("dealer_button_seat") or ""
@@ -124,14 +184,13 @@ def handle_table_snapshot(state, event):
     state["hero_position"] = hero_position
 
     if state.get("phase") != "WAITING":
-        set_table_snapshot(players, hero_position, dealer_button_seat, positions)
-
         canonical = canonical_load()
         canonical.update_table_snapshot(
             players=players,
             hero_position=hero_position,
             positions=positions,
         )
+        seed_forced_blinds(state, canonical)
         canonical_save(canonical)
 
     print("[STATE] table_snapshot", hero_position, f"players={len(players)}")
@@ -155,14 +214,7 @@ def handle_hero_cards(state, event):
     state["hand_started_at"] = event.get("ts") or time.time()
     state["hand_complete"] = False
     state["result"] = None
-
-    new_hand(
-        players=state.get("players", []),
-        hero_cards=cards,
-        hero_position=state.get("hero_position", "unknown"),
-        dealer_button_seat=state.get("dealer_button_seat", ""),
-        positions=state.get("positions", {})
-    )
+    state["forced_blinds_seeded"] = False
 
     canonical = CanonicalHand().start_hand(
         hand_id=f"live-{int(state['hand_started_at'] * 1000)}",
@@ -200,8 +252,6 @@ def handle_board(state, event):
     state["phase"] = next_phase
     state["board"] = board
 
-    set_board(board)
-
     canonical = canonical_load()
     canonical.set_board(board)
     canonical_save(canonical)
@@ -218,10 +268,6 @@ def handle_hero_decision(state, event):
         return state
 
     state["hero_to_act"] = True
-    set_live_status(
-        current_street=state.get("phase", "unknown"),
-        hero_to_act=True
-    )
     state = record_timeline(state, f"hero_decision {state.get('phase')}")
     print("[STATE] hero_decision", state.get("phase"))
     return state
@@ -232,10 +278,6 @@ def handle_hero_action_complete(state, event):
         return state
 
     state["hero_to_act"] = False
-    set_live_status(
-        current_street=state.get("phase", "unknown"),
-        hero_to_act=False
-    )
     state = record_timeline(state, f"hero_action_complete {state.get('phase')}")
     print("[STATE] hero_action_complete", state.get("phase"))
     return state
@@ -286,8 +328,6 @@ def handle_hand_complete(state, event):
     state["result"] = result
 
     state = record_timeline(state, f"hand_complete {result}")
-    close_hand(result)
-
     canonical = canonical_load()
     canonical.finish(
         result=result,
@@ -295,6 +335,8 @@ def handle_hand_complete(state, event):
     )
     canonical_save(canonical)
 
+    archived = CANONICAL_STORE.archive()
+    print(f"[ARCHIVE] {archived}")
     print("[STATE] -> COMPLETE", result)
 
     return default_state()
