@@ -59,6 +59,7 @@ def fresh_state():
         "hero_visible_seen": 0,
         "last_event": None,
         "hero_decision_active": False,
+        "last_hero_action_complete_phase": None,
         "hand_token": None,
         "board_request_id": None,
         "board_request_expected_len": None,
@@ -502,11 +503,13 @@ def maybe_emit_hero_decision(state, visible, hero_visible):
     if visible and hero_visible and not state.get("hero_decision_active"):
         emit({"type": "hero_decision"})
         state["hero_decision_active"] = True
+        state["last_hero_action_complete_phase"] = None
         return state
 
     if not visible and state.get("hero_decision_active"):
         emit({"type": "hero_action_complete"})
         state["hero_decision_active"] = False
+        state["last_hero_action_complete_phase"] = state.get("phase")
         return state
 
     if not visible:
@@ -809,6 +812,7 @@ def apply_board_result(state, result):
     if state.get("hero_decision_active"):
         emit({"type": "hero_action_complete"})
         state["hero_decision_active"] = False
+        state["last_hero_action_complete_phase"] = state.get("phase")
 
     if expected_len == 3:
         state["phase"] = "FLOP"
@@ -952,7 +956,21 @@ def maybe_complete_early(state, count, hero_visible):
         state["hero_clear_seen"] = 0
 
     if state["hero_clear_seen"] >= 4:
-        emit({"type": "hand_complete", "result": "Hero cards cleared / hero folded or hand ended"})
+        completed_phase = state.get("last_hero_action_complete_phase")
+
+        if completed_phase == phase:
+            emit({
+                "type": "hero_fold",
+                "street": phase,
+            })
+            result = f"Hero folded on {str(phase).lower()}"
+        else:
+            result = "Hero cards cleared / hand ended"
+
+        emit({
+            "type": "hand_complete",
+            "result": result,
+        })
         return fresh_state()
 
     # If board clears after any street, the hand ended before showdown/river completion.

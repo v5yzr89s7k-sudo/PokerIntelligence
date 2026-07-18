@@ -282,6 +282,46 @@ def handle_hero_action_complete(state, event):
     print("[STATE] hero_action_complete", state.get("phase"))
     return state
 
+def handle_hero_fold(state, event):
+    if state.get("phase") == "WAITING":
+        return state
+
+    canonical = canonical_load()
+
+    already_recorded = any(
+        action.seat == canonical.hero_seat
+        and action.street == canonical.current_street
+        and action.action == "FOLD"
+        for action in canonical.actions
+    )
+
+    if not already_recorded:
+        added = canonical.add_action(
+            seat=canonical.hero_seat,
+            action="FOLD",
+            confidence=1.0,
+            source="hero_card_disappearance",
+            evidence=[
+                "hero_action_complete",
+                "hero_cards_cleared",
+            ],
+            ts=event.get("ts") or time.time(),
+        )
+        canonical_save(canonical)
+
+        print(
+            f"[CANONICAL_ACTION] {added.street} "
+            f"{added.seat} FOLD confidence=1.0"
+        )
+
+    state["hero_to_act"] = False
+    state = record_timeline(
+        state,
+        f"hero_fold {event.get('street') or state.get('phase')}",
+    )
+    return state
+
+
 def handle_inferred_action(state, event):
     if state.get("phase") == "WAITING":
         print("[SKIP] inferred_action while waiting", event)
@@ -359,6 +399,9 @@ def handle_event(state, event):
 
     if t == "hero_action_complete":
         return handle_hero_action_complete(state, event)
+
+    if t == "hero_fold":
+        return handle_hero_fold(state, event)
 
     if t == "inferred_action":
         return handle_inferred_action(state, event)
