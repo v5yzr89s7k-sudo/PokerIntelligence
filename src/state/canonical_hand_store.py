@@ -1,6 +1,8 @@
 from pathlib import Path
+from datetime import datetime
 import json
 import os
+import shutil
 import tempfile
 
 from src.state.canonical_hand import CanonicalHand
@@ -9,7 +11,8 @@ from src.state.canonical_hand_renderer import render_canonical_hand
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_JSON = ROOT / "runtime/live/canonical_hand.json"
-DEFAULT_TEXT = ROOT / "runtime/live/current_hand_canonical.txt"
+DEFAULT_TEXT = ROOT / "runtime/live/current_hand.txt"
+DEFAULT_HISTORY = ROOT / "runtime/history"
 
 
 class CanonicalHandStore:
@@ -64,6 +67,20 @@ class CanonicalHandStore:
 
         self._atomic_write(self.json_path, json_text)
         self._atomic_write(self.text_path, rendered)
+
+    def archive(self, history_dir: Path = DEFAULT_HISTORY) -> Path:
+        if not self.text_path.exists():
+            raise FileNotFoundError(
+                f"canonical hand text does not exist: {self.text_path}"
+            )
+
+        history_dir = Path(history_dir)
+        history_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        destination = history_dir / f"hand_{timestamp}.txt"
+        shutil.copy2(self.text_path, destination)
+        return destination
 
     def reset(self):
         for path in (self.json_path, self.text_path):

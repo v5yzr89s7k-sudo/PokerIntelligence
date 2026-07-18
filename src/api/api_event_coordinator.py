@@ -22,6 +22,7 @@ from src.state.street_commitment_tracker import (
 )
 from src.vision.window_capture import find_acr_table_window, capture_window_crop
 from src.vision.action_sequence_recorder import ActionSequenceRecorder
+from src.vision.stack_reader import read_stack
 
 CAPTURE = ROOT / "src/vision/window_capture.py"
 CAPTURE_DIR = ROOT / "runtime/window_captures"
@@ -66,6 +67,8 @@ def fresh_state():
         "hero_request_ts": None,
         "last_local_board_count": 0,
         "last_local_hero_visible": False,
+        "live_stack_bb_by_seat": {},
+        "pending_stack_reads": {},
     }
 
 
@@ -86,6 +89,203 @@ def load_state():
 
 def save_state(state):
     COORD_STATE.write_text(json.dumps(state, indent=2))
+
+
+def _crop_geometry_region(img, region):
+    x = int(region["x"])
+    y = int(region["y"])
+    width = int(region["width"])
+    height = int(region["height"])
+    return img[y:y + height, x:x + width]
+
+
+def _snapshot_stack_values():
+    context = load_table_context()
+    values = {}
+
+    for player in context.get("players") or []:
+        seat = player.get("seat")
+        value = player.get("stack_bb")
+
+        if not seat or value is None:
+            continue
+
+        try:
+            values[seat] = float(value)
+        except (TypeError, ValueError):
+            continue
+
+    return values
+
+
+def enrich_stack_change_measurements(changes, img, state):
+    """
+    Convert noisy stack-region movement into one settled quantitative
+    transition.
+
+    Raw stack changes are held until the region has remained quiet for
+    STACK_SETTLE_SECONDS. Only then is that seat OCR-read and published as
+    a STACK_CHANGED observation.
+    """
+    now = time.time()
+    settle_seconds = 0.45
+    minimum_delta_bb = 0.05
+    minimum_confidence = 0.75
+
+    raw_changed_seats = list(
+        getattr(changes, "stack_changed_seats", [])
+        or []
+    )
+    raw_details = dict(
+        getattr(changes, "stack_change_details", {})
+        or {}
+    )
+
+    pending = state.setdefault(
+        "pending_stack_reads",
+        {},
+    )
+    live_values = state.setdefault(
+        "live_stack_bb_by_seat",
+        {},
+    )
+
+    # Continuously merge trusted hand-start snapshot values. This is
+    # important because stack movement may be detected before the
+    # asynchronous table snapshot arrives.
+    snapshot_values = _snapshot_stack_values()
+    for seat, value in snapshot_values.items():
+        live_values.setdefault(seat, float(value))
+
+    # Record movement, but do not publish it yet.
+    for seat in raw_changed_seats:
+        entry = pending.setdefault(
+            seat,
+            {
+                "first_change_ts": now,
+                "last_change_ts": now,
+                "max_mean_diff": 0.0,
+            },
+        )
+
+        entry["last_change_ts"] = now
+
+        mean_diff = float(
+            (raw_details.get(seat) or {}).get("mean_diff")
+            or 0.0
+        )
+        entry["max_mean_diff"] = max(
+            float(entry.get("max_mean_diff") or 0.0),
+            mean_diff,
+        )
+
+    settled_details = {}
+    settled_seats = []
+
+    for seat, entry in list(pending.items()):
+        if now - float(entry["last_change_ts"]) < settle_seconds:
+            continue
+
+        # A quantitative transition requires a trusted prior value.
+        previous = live_values.get(seat)
+        if previous is None:
+            pending.pop(seat, None)
+            print(
+                f"[STACK_SETTLE_SKIP] seat={seat} "
+                "reason=no_trusted_previous_stack",
+                flush=True,
+            )
+            continue
+
+        region = (
+            GEOM.get("stack_regions", {})
+            .get(seat)
+        )
+
+        if not region:
+            pending.pop(seat, None)
+            continue
+
+        crop = _crop_geometry_region(img, region)
+        if crop.size == 0:
+            pending.pop(seat, None)
+            continue
+
+        reading = read_stack(crop)
+        current = reading.get("stack_bb")
+        confidence = float(
+            reading.get("confidence")
+            or 0.0
+        )
+
+        if current is None or confidence < minimum_confidence:
+            pending.pop(seat, None)
+            print(
+                f"[STACK_SETTLE_SKIP] seat={seat} "
+                f"reason=untrusted_read confidence={confidence:.2f}",
+                flush=True,
+            )
+            continue
+
+        previous = float(previous)
+        current = float(current)
+        delta = round(previous - current, 2)
+
+        # Zero deltas are visual noise. Negative deltas represent chips
+        # returning to the stack or an OCR disagreement, not a wager.
+        if delta < minimum_delta_bb:
+            pending.pop(seat, None)
+
+            print(
+                f"[STACK_SETTLE_SKIP] seat={seat} "
+                f"previous={previous:.2f} current={current:.2f} "
+                f"delta={delta:.2f} reason=non_commitment",
+                flush=True,
+            )
+            continue
+
+        measurement = {
+            "mean_diff": float(
+                entry.get("max_mean_diff")
+                or 0.0
+            ),
+            "changed": True,
+            "settled_ms": round(
+                (now - float(entry["last_change_ts"])) * 1000.0,
+                1,
+            ),
+            "stack_read_confidence": confidence,
+            "stack_read_mode": reading.get(
+                "mode",
+                "unknown",
+            ),
+            "stack_text": reading.get(
+                "stack_text",
+                "",
+            ),
+            "previous_stack_bb": round(previous, 2),
+            "current_stack_bb": round(current, 2),
+            "delta_bb": delta,
+        }
+
+        settled_details[seat] = measurement
+        settled_seats.append(seat)
+        live_values[seat] = current
+        pending.pop(seat, None)
+
+        print(
+            f"[STACK_TRANSITION] seat={seat} "
+            f"previous={previous:.2f} "
+            f"current={current:.2f} "
+            f"delta={delta:.2f} "
+            f"confidence={confidence:.2f}",
+            flush=True,
+        )
+
+    # Suppress noisy instantaneous detector events. Downstream receives
+    # only settled, quantitative stack transitions.
+    changes.stack_changed_seats = settled_seats
+    changes.stack_change_details = settled_details
 
 
 def load_table_context():
@@ -842,6 +1042,7 @@ def main():
     last_deferred_count = None
     previous_occupied_bet_regions = set()
 
+
     INFERRED_ACTIONS_JSON.write_text(
         json.dumps(inference_engine.to_dict(), indent=2)
     )
@@ -866,6 +1067,13 @@ def main():
 
         img = cv2.resize(img, (934, 696))
         changes = local_detector.detect(img)
+
+        enrich_stack_change_measurements(
+            changes,
+            img,
+            state,
+        )
+
         log_observation(changes)
 
         sequence_recorder.record(
@@ -873,6 +1081,14 @@ def main():
             changes=changes,
             state=state,
             source_frame=frame,
+        )
+
+        print(
+            "[CHANGES]",
+            "stack_changed_seats=", getattr(changes, "stack_changed_seats", None),
+            "bet_region_appeared=", getattr(changes, "bet_region_appeared", None),
+            "bet_region_cleared=", getattr(changes, "bet_region_cleared", None),
+            flush=True,
         )
 
         observations = observer.ingest_changes(
@@ -905,10 +1121,24 @@ def main():
             )
 
             # Capture occupancy from the preceding perception frame.
-            # This reveals whether a newly committing seat was already
-            # facing chips from another player.
+            # Temporary compatibility input until a real semantic betting
+            # state model is implemented and validated.
             table_context["prior_occupied_bet_regions"] = sorted(
                 previous_occupied_bet_regions
+            )
+
+            print(
+                "[TABLE_CONTEXT]",
+                "street=", current_commitment_street,
+                "prior_commitments=",
+                table_context.get(
+                    "prior_voluntary_commitment_seats"
+                ),
+                "prior_occupied=",
+                table_context.get(
+                    "prior_occupied_bet_regions"
+                ),
+                flush=True,
             )
 
             episode_manager.set_table_context(
@@ -991,6 +1221,12 @@ def main():
                 INFERRED_ACTIONS_JSON.write_text(
                     json.dumps(inference_engine.to_dict(), indent=2)
                 )
+
+        # Preserve this frame's confirmed bet occupancy as context for the
+        # next perception frame.
+        previous_occupied_bet_regions = set(
+            changes.occupied_bet_regions
+        )
 
         hero_visible = changes.hero_cards_visible
         count = changes.board_count

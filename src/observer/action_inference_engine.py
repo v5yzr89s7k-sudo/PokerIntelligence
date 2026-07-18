@@ -28,6 +28,7 @@ class InferredAction:
     confidence: float
     evidence: List[str]
     reason: str
+    measurements: Dict[str, Any]
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -79,6 +80,28 @@ class ActionInferenceEngine:
         # Preserve first-seen order while removing duplicates.
         return list(dict.fromkeys(evidence))
 
+    @staticmethod
+    def _measurements(episode: Dict) -> Dict[str, Any]:
+        measurements: Dict[str, Any] = {}
+
+        for observation in episode.get("observations", []) or []:
+            observation_type = observation.get("type")
+            payload = observation.get("payload") or {}
+
+            if observation_type == STACK_CHANGED:
+                measurements["stack_change"] = dict(payload)
+
+            elif observation_type == BET_REGION_OCCUPIED:
+                measurements["bet_region_occupied"] = dict(payload)
+
+            elif observation_type == BET_REGION_CLEARED:
+                measurements["bet_region_cleared"] = dict(payload)
+
+            elif observation_type == POT_CHANGED:
+                measurements["pot_changed"] = dict(payload)
+
+        return measurements
+
     def infer_episode(self, episode: Any) -> InferredAction:
         item = self._episode_dict(episode)
 
@@ -86,6 +109,7 @@ class ActionInferenceEngine:
         seat = item.get("seat") or "unknown"
         street = item.get("street") or "unknown"
         evidence = self._evidence(item)
+        measurements = self._measurements(item)
         kinds = set(evidence)
         episode_confidence = float(item.get("confidence") or 0.0)
 
@@ -124,6 +148,17 @@ class ActionInferenceEngine:
             and occupied_seat != seat
         }
 
+        print(
+            "[INFERENCE_CONTEXT]",
+            "seat=", seat,
+            "position=", position,
+            "positions=", positions,
+            "prior_occupied=", sorted(prior_occupied),
+            "voluntary_prior_occupied=",
+            sorted(voluntary_prior_occupied),
+            flush=True,
+        )
+
         action = UNKNOWN
         confidence = min(episode_confidence, 0.45)
         reason = "insufficient evidence"
@@ -134,12 +169,35 @@ class ActionInferenceEngine:
             reason = "table-level pot transition without seat attribution"
 
         elif (
+            street.upper() == "PREFLOP"
+            and position == "SB"
+            and BET_REGION_OCCUPIED in kinds
+            and not prior_committed
+        ):
+            action = POST_SMALL_BLIND
+            confidence = min(max(episode_confidence, 0.70), 0.90)
+            reason = (
+                "initial preflop SB commitment before any "
+                "confirmed voluntary action"
+            )
+
+        elif (
+            street.upper() == "PREFLOP"
+            and position == "BB"
+            and BET_REGION_OCCUPIED in kinds
+            and not prior_committed
+        ):
+            action = POST_BIG_BLIND
+            confidence = min(max(episode_confidence, 0.75), 0.92)
+            reason = (
+                "initial preflop BB commitment before any "
+                "confirmed voluntary action"
+            )
+
+        elif (
             STACK_CHANGED in kinds
             and BET_REGION_OCCUPIED in kinds
-            and (
-                prior_committed
-                or voluntary_prior_occupied
-            )
+            and prior_committed
         ):
             action = CALL_OR_RAISE
             confidence = min(
@@ -147,8 +205,8 @@ class ActionInferenceEngine:
                 0.98,
             )
             reason = (
-                "seat committed chips while facing prior "
-                "non-blind opponent commitment"
+                "seat committed chips while facing a confirmed "
+                "prior voluntary commitment"
             )
 
         elif STACK_CHANGED in kinds and BET_REGION_OCCUPIED in kinds:
@@ -157,32 +215,6 @@ class ActionInferenceEngine:
             reason = (
                 "seat stack changed and a bet region appeared "
                 "without confirmed prior voluntary commitment"
-            )
-
-        elif (
-            street.upper() == "PREFLOP"
-            and position == "SB"
-            and BET_REGION_OCCUPIED in kinds
-            and STACK_CHANGED not in kinds
-        ):
-            action = POST_SMALL_BLIND
-            confidence = min(max(episode_confidence, 0.60), 0.82)
-            reason = (
-                "preflop SB chip region appeared without "
-                "voluntary stack-change evidence"
-            )
-
-        elif (
-            street.upper() == "PREFLOP"
-            and position == "BB"
-            and BET_REGION_OCCUPIED in kinds
-            and STACK_CHANGED not in kinds
-        ):
-            action = POST_BIG_BLIND
-            confidence = min(max(episode_confidence, 0.65), 0.85)
-            reason = (
-                "preflop BB chip region appeared without "
-                "voluntary stack-change evidence"
             )
 
         elif (
@@ -211,6 +243,7 @@ class ActionInferenceEngine:
             confidence=round(confidence, 2),
             evidence=evidence,
             reason=reason,
+            measurements=measurements,
         )
 
     def ingest_closed(self, episodes: Iterable[Any]) -> List[InferredAction]:

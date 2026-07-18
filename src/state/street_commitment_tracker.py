@@ -4,6 +4,8 @@ from typing import Dict, Set
 
 VOLUNTARY_ACTIONS = {
     "VOLUNTARY_COMMIT",
+    "BET_OR_RAISE",
+    "CALL_OR_RAISE",
     "CALL",
     "BET",
     "RAISE",

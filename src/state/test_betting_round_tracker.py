@@ -95,7 +95,11 @@ def test_second_postflop_commitment_preserves_unresolved_semantic():
     assert result.action == BET_OR_RAISE
     assert len(hand.actions) == 2
     assert hand.last_aggressor_seat is None
-    assert tracker.decisions[-1].accepted is False
+    assert tracker.decisions[-1].accepted is True
+    assert (
+        tracker.decisions[-1].canonical_action
+        == BET_OR_RAISE
+    )
 
 
 def test_call_is_preserved():
@@ -121,7 +125,7 @@ def test_call_is_preserved():
     )
 
     assert opening_bet is not None
-    assert opening_bet.action == "BET"
+    assert opening_bet.action == BET_OR_RAISE
     assert result is not None
     assert result.action == "CALL"
     assert result.sequence == 2
@@ -187,7 +191,7 @@ def test_duplicate_episode_is_ignored():
     duplicate = tracker.ingest(action)
 
     assert first is not None
-    assert first.action == "BET"
+    assert first.action == BET_OR_RAISE
     assert duplicate is None
     assert len(hand.actions) == 1
 
@@ -213,7 +217,7 @@ def test_street_change_resets_aggression():
 
     assert result is not None
     assert result.street == "FLOP"
-    assert result.action == "BET"
+    assert result.action == BET_OR_RAISE
 
 
 def test_stale_street_action_is_rejected():
@@ -262,7 +266,7 @@ def test_order_is_preserved():
 
     assert [a.sequence for a in hand.actions] == [1, 2, 3]
     assert [a.action for a in hand.actions] == [
-        "BET",
+        BET_OR_RAISE,
         "CALL",
         "CALL",
     ]
