@@ -51,6 +51,13 @@ def format_action(action: CanonicalAction) -> str:
         amount = _format_bb(action.amount_bb)
         return f"{player} calls{suffix}" + (f" {amount}" if amount else "")
 
+    if kind == "CALL_OR_RAISE":
+        suffix = " all-in" if action.all_in else ""
+        amount = _format_bb(action.amount_bb)
+        return f"{player} calls or raises{suffix}" + (
+            f" {amount}" if amount else ""
+        )
+
     if kind == "BET":
         suffix = " all-in" if action.all_in else ""
         amount = _format_bb(action.amount_bb)

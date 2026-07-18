@@ -285,9 +285,50 @@ class BettingRoundTracker:
             )
             return None
 
+        measurements = item.get("measurements") or {}
+        stack_change = measurements.get("stack_change") or {}
+
+        delta_bb = stack_change.get("delta_bb")
+        amount_bb = None
+        raise_to_bb = None
+
+        if delta_bb is not None:
+            try:
+                delta_bb = round(float(delta_bb), 2)
+            except (TypeError, ValueError):
+                delta_bb = None
+
+        if delta_bb is not None and delta_bb > 0:
+            player = self.hand.players.get(seat)
+            prior_committed = 0.0
+
+            if player is not None:
+                prior_committed = float(
+                    player.committed_by_street.get(
+                        self.hand.current_street,
+                        0.0,
+                    )
+                    or 0.0
+                )
+
+            if canonical_action in {
+                BET_OR_RAISE,
+                RAISE,
+            }:
+                raise_to_bb = round(prior_committed + delta_bb, 2)
+
+            elif canonical_action in {
+                CALL_OR_RAISE,
+                CALL,
+                BET,
+            }:
+                amount_bb = delta_bb
+
         canonical = self.hand.add_action(
             seat=seat,
             action=canonical_action,
+            amount_bb=amount_bb,
+            raise_to_bb=raise_to_bb,
             confidence=item.get("confidence"),
             source="betting_round_tracker",
             evidence=list(item.get("evidence") or []),
