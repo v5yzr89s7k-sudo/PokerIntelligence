@@ -3,6 +3,8 @@ from src.observer.action_inference_engine import (
     BET_OR_RAISE,
     CALL,
     FOLD_OR_RESOLVED,
+    POST_SMALL_BLIND,
+    POST_BIG_BLIND,
 )
 from src.state.betting_round_tracker import BettingRoundTracker
 from src.state.canonical_hand import CanonicalHand
@@ -272,6 +274,98 @@ def test_order_is_preserved():
     ]
 
 
+def test_action_consumes_queue_through_actor():
+    hand = make_hand()
+
+    assert hand.players_to_act == [
+        "seat_top",
+        "seat_upper_right",
+        "hero",
+    ]
+
+    tracker = BettingRoundTracker(hand)
+
+    result = tracker.ingest(
+        inferred(
+            1,
+            "seat_upper_right",
+            BET_OR_RAISE,
+        )
+    )
+
+    assert result is not None
+
+    # seat_top was skipped and seat_upper_right acted. No fold action is
+    # created yet, but both leave the pending queue.
+    assert hand.players_to_act == [
+        "hero",
+    ]
+
+    assert [action.seat for action in hand.actions] == [
+        "seat_upper_right",
+    ]
+
+
+def test_first_actor_consumes_only_itself():
+    hand = make_hand()
+    tracker = BettingRoundTracker(hand)
+
+    result = tracker.ingest(
+        inferred(
+            1,
+            "seat_top",
+            BET_OR_RAISE,
+        )
+    )
+
+    assert result is not None
+    assert hand.players_to_act == [
+        "seat_upper_right",
+        "hero",
+    ]
+
+
+def test_actor_outside_queue_does_not_corrupt_queue():
+    hand = make_hand()
+    tracker = BettingRoundTracker(hand)
+
+    original_queue = list(hand.players_to_act)
+
+    result = tracker.ingest(
+        inferred(
+            1,
+            "seat_lower_left",
+            BET_OR_RAISE,
+        )
+    )
+
+    assert result is not None
+    assert hand.players_to_act == original_queue
+
+
+def test_forced_blinds_do_not_consume_preflop_queue():
+    hand = make_hand()
+    tracker = BettingRoundTracker(hand)
+
+    original_queue = list(hand.players_to_act)
+
+    small_blind = inferred(
+        1,
+        "seat_upper_right",
+        POST_SMALL_BLIND,
+    )
+    big_blind = inferred(
+        2,
+        "hero",
+        POST_BIG_BLIND,
+    )
+
+    assert tracker.ingest(small_blind) is not None
+    assert tracker.ingest(big_blind) is not None
+
+    assert hand.players_to_act == original_queue
+
+
 if __name__ == "__main__":
     tests = [
         test_preflop_commitment_preserves_unresolved_semantic,
@@ -284,6 +378,10 @@ if __name__ == "__main__":
         test_street_change_resets_aggression,
         test_stale_street_action_is_rejected,
         test_order_is_preserved,
+        test_action_consumes_queue_through_actor,
+        test_first_actor_consumes_only_itself,
+        test_actor_outside_queue_does_not_corrupt_queue,
+        test_forced_blinds_do_not_consume_preflop_queue,
     ]
 
     for test in tests:

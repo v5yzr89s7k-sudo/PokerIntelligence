@@ -106,6 +106,26 @@ class BettingRoundTracker:
             self.street
         )
 
+    def _consume_action_queue(self, seat: str) -> List[str]:
+        """
+        Advance the canonical live-action queue through the acting seat.
+
+        Seats preceding the observed actor are returned as skipped seats.
+        This phase does not assign poker semantics to those skipped seats;
+        passive fold inference is intentionally implemented separately.
+        """
+        queue = list(self.hand.players_to_act or [])
+
+        if seat not in queue:
+            return []
+
+        actor_index = queue.index(seat)
+        skipped = queue[:actor_index]
+
+        self.hand.players_to_act = queue[actor_index + 1:]
+
+        return skipped
+
     def _record_decision(
         self,
         episode_id: int,
@@ -372,6 +392,14 @@ class BettingRoundTracker:
         self.commitment_tracker.ingest(
             canonical
         )
+
+        # Forced blind posts occur before the voluntary preflop action
+        # queue and therefore must not consume it.
+        if canonical_action not in {
+            CANONICAL_POST_SMALL_BLIND,
+            CANONICAL_POST_BIG_BLIND,
+        }:
+            self._consume_action_queue(seat)
 
         # Forced blinds and unresolved voluntary commitments are not
         # sufficient evidence of aggression. Only resolved BET or RAISE
