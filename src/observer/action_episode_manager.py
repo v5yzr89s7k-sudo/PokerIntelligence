@@ -11,6 +11,10 @@ from src.observer.observation_types import (
 )
 
 
+# Keep late stack attachment and inference delay synchronized.
+LATE_STACK_ATTACH_SECONDS = 2.75
+
+
 @dataclass
 class ActionEpisode:
     episode_id: int
@@ -82,11 +86,15 @@ class ActionEpisodeManager:
         self,
         idle_timeout=1.25,
         settle_timeout=0.80,
-        pending_stack_ttl=0.40,
+        pending_stack_ttl=0.75,
+        late_stack_attach_seconds=LATE_STACK_ATTACH_SECONDS,
     ):
         self.idle_timeout = idle_timeout
         self.settle_timeout = settle_timeout
         self.pending_stack_ttl = float(pending_stack_ttl)
+        self.late_stack_attach_seconds = float(
+            late_stack_attach_seconds
+        )
         self.next_episode_id = 1
         self.active_by_seat: Dict[str, ActionEpisode] = {}
         self.closed: List[ActionEpisode] = []
@@ -160,6 +168,41 @@ class ActionEpisodeManager:
         self.pending_stack_by_seat[
             observation.seat or "table"
         ] = observation
+
+    def _attach_late_stack(self, observation):
+        seat = observation.seat or "table"
+        street = observation.street or "unknown"
+
+        for episode in reversed(self.closed):
+            if episode.seat != seat or episode.street != street:
+                continue
+
+            if episode.ended_ts is None:
+                continue
+
+            age = observation.ts - episode.ended_ts
+
+            if age < 0.0:
+                continue
+
+            if age > self.late_stack_attach_seconds:
+                break
+
+            kinds = {
+                item.get("type")
+                for item in episode.observations
+            }
+
+            if STACK_CHANGED in kinds:
+                return False
+
+            if BET_REGION_OCCUPIED not in kinds:
+                continue
+
+            episode.add(observation)
+            return True
+
+        return False
 
     def _consume_pending_stack(self, seat, street, opened_ts):
         observation = self.pending_stack_by_seat.get(seat)
@@ -269,6 +312,9 @@ class ActionEpisodeManager:
             # strengthen an episode already opened by direct chip evidence.
             if obs.type == STACK_CHANGED:
                 if ep is None or ep.closed or ep.street != street:
+                    if self._attach_late_stack(obs):
+                        continue
+
                     self._cache_pending_stack(obs)
                     continue
 

@@ -3,6 +3,7 @@ from src.state.betting_round_tracker import BettingRoundTracker
 
 hand = CanonicalHand()
 hand.current_street = "PREFLOP"
+hand.current_bet_bb = 1.0
 
 # Minimal generic player objects
 class Player:

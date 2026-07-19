@@ -14,7 +14,10 @@ from src.events.local_event_detector import LocalEventDetector
 from src.observer.continuous_observer import ContinuousObserver
 from src.observer.observation_timeline import ObservationTimeline
 from src.observer.observation_correlator import ObservationCorrelator
-from src.observer.action_episode_manager import ActionEpisodeManager
+from src.observer.action_episode_manager import (
+    ActionEpisodeManager,
+    LATE_STACK_ATTACH_SECONDS,
+)
 from src.api.perception_latency import log as log_latency
 from src.observer.action_inference_engine import ActionInferenceEngine
 from src.state.street_commitment_tracker import (
@@ -1100,8 +1103,8 @@ def maybe_complete_hand(state, count):
 
 def episode_ready_for_inference(episode):
     """
-    Preflop action interpretation requires a position map. Postflop
-    episodes may still be inferred without position context.
+    Require position context preflop and allow settled stack OCR evidence
+    to attach before a voluntary chip episode is inferred permanently.
     """
     item = (
         episode.to_dict()
@@ -1114,9 +1117,6 @@ def episode_ready_for_inference(episode):
         or "unknown"
     ).upper()
 
-    if street != "PREFLOP":
-        return True
-
     context = item.get("table_context") or {}
     positions = context.get("positions") or {}
     seat = item.get("seat") or "unknown"
@@ -1126,10 +1126,46 @@ def episode_ready_for_inference(episode):
     if not position and seat == "hero":
         position = context.get("hero_position")
 
-    return bool(
-        position
-        and str(position).lower() != "unknown"
+    position = str(position or "unknown").upper()
+
+    if (
+        street == "PREFLOP"
+        and position == "UNKNOWN"
+    ):
+        return False
+
+    evidence = set(
+        item.get("observation_types")
+        or []
     )
+
+    # Forced blind posts are objective from position and do not require
+    # a late quantitative stack read before inference.
+    if (
+        street == "PREFLOP"
+        and position in {"SB", "BB"}
+        and "bet_region_occupied" in evidence
+    ):
+        return True
+
+    # Quantitative stack OCR may arrive after the visual episode closes.
+    # Do not permanently process a voluntary bet-only episode until the
+    # coordinator's 2.5-second stack retry window has elapsed.
+    if (
+        "bet_region_occupied" in evidence
+        and "stack_changed" not in evidence
+    ):
+        ended_ts = item.get("ended_ts")
+
+        if ended_ts is None:
+            return False
+
+        return (
+            time.time() - float(ended_ts)
+            >= LATE_STACK_ATTACH_SECONDS
+        )
+
+    return True
 
 
 def main():
