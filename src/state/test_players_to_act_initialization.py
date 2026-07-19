@@ -127,14 +127,6 @@ def test_heads_up_order():
     ]
 
 
-if __name__ == "__main__":
-    test_eight_handed_preflop_order()
-    test_eight_handed_postflop_order()
-    test_folded_and_all_in_players_are_excluded()
-    test_heads_up_order()
-    test_showdown_and_completion_clear_queue()
-
-    print("players_to_act initialization regression tests passed.")
 
 
 def test_showdown_and_completion_clear_queue():
@@ -150,3 +142,13 @@ def test_showdown_and_completion_clear_queue():
     hand.close_hand(result="test complete")
     assert hand.current_street == "COMPLETE"
     assert hand.players_to_act == []
+
+
+if __name__ == "__main__":
+    test_eight_handed_preflop_order()
+    test_eight_handed_postflop_order()
+    test_folded_and_all_in_players_are_excluded()
+    test_heads_up_order()
+    test_showdown_and_completion_clear_queue()
+
+    print("players_to_act initialization regression tests passed.")
