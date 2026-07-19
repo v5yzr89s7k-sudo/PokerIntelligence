@@ -12,6 +12,8 @@ class CanonicalPlayer:
     position: str
     name: str
     starting_stack_bb: Optional[float] = None
+    current_stack_bb: Optional[float] = None
+    last_confirmed_stack_bb: Optional[float] = None
     is_hero: bool = False
     folded: bool = False
     all_in: bool = False
@@ -101,6 +103,8 @@ class CanonicalHand:
                 position=positions.get(seat, "unknown"),
                 name=item.get("name") or seat,
                 starting_stack_bb=float(stack_bb) if stack_bb is not None else None,
+                current_stack_bb=float(stack_bb) if stack_bb is not None else None,
+                last_confirmed_stack_bb=float(stack_bb) if stack_bb is not None else None,
                 is_hero=bool(item.get("is_hero")) or seat == self.hero_seat,
                 active=bool(item.get("is_active", True)),
             )
@@ -144,6 +148,24 @@ class CanonicalHand:
                         else None
                     )
                 ),
+                current_stack_bb=(
+                    existing.current_stack_bb
+                    if existing
+                    else (
+                        float(stack_bb)
+                        if stack_bb is not None
+                        else None
+                    )
+                ),
+                last_confirmed_stack_bb=(
+                    existing.last_confirmed_stack_bb
+                    if existing
+                    else (
+                        float(stack_bb)
+                        if stack_bb is not None
+                        else None
+                    )
+                ),
                 is_hero=(
                     bool(item.get("is_hero"))
                     or seat == self.hero_seat
@@ -176,6 +198,44 @@ class CanonicalHand:
             action.player_name = player.name
 
         return self
+
+    def update_player_stack(
+        self,
+        seat: str,
+        new_stack_bb: float,
+    ) -> Optional[dict]:
+        player = self.players.get(seat)
+
+        if player is None:
+            return None
+
+        new_stack_bb = float(new_stack_bb)
+        previous_stack_bb = player.last_confirmed_stack_bb
+
+        if previous_stack_bb is None:
+            player.current_stack_bb = new_stack_bb
+            player.last_confirmed_stack_bb = new_stack_bb
+
+            return {
+                "seat": seat,
+                "previous_stack_bb": None,
+                "current_stack_bb": new_stack_bb,
+                "delta_bb": None,
+                "initialized": True,
+            }
+
+        delta_bb = round(previous_stack_bb - new_stack_bb, 4)
+
+        player.current_stack_bb = new_stack_bb
+        player.last_confirmed_stack_bb = new_stack_bb
+
+        return {
+            "seat": seat,
+            "previous_stack_bb": previous_stack_bb,
+            "current_stack_bb": new_stack_bb,
+            "delta_bb": delta_bb,
+            "initialized": False,
+        }
 
     def set_board(self, cards: List[str]):
         cards = list(cards)
@@ -321,6 +381,14 @@ class CanonicalHand:
                 position=item.get("position") or "unknown",
                 name=item.get("name") or seat,
                 starting_stack_bb=item.get("starting_stack_bb"),
+                current_stack_bb=item.get(
+                    "current_stack_bb",
+                    item.get("starting_stack_bb"),
+                ),
+                last_confirmed_stack_bb=item.get(
+                    "last_confirmed_stack_bb",
+                    item.get("starting_stack_bb"),
+                ),
                 is_hero=bool(item.get("is_hero")),
                 folded=bool(item.get("folded")),
                 all_in=bool(item.get("all_in")),
