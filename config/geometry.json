@@ -117,52 +117,52 @@
   },
   "bet_regions": {
     "seat_top": {
-      "x": 402,
-      "y": 201,
-      "width": 90,
-      "height": 43
+      "x": 381,
+      "y": 193,
+      "width": 91,
+      "height": 41
     },
     "seat_upper_right": {
-      "x": 612,
-      "y": 201,
-      "width": 90,
-      "height": 49
+      "x": 605,
+      "y": 195,
+      "width": 102,
+      "height": 60
     },
     "seat_mid_right": {
-      "x": 645,
-      "y": 309,
-      "width": 90,
-      "height": 45
+      "x": 649,
+      "y": 328,
+      "width": 101,
+      "height": 57
     },
     "seat_lower_right": {
-      "x": 553,
-      "y": 451,
+      "x": 566,
+      "y": 424,
       "width": 90,
-      "height": 53
+      "height": 69
     },
     "hero": {
-      "x": 439,
-      "y": 432,
-      "width": 90,
-      "height": 45
+      "x": 427,
+      "y": 427,
+      "width": 93,
+      "height": 66
     },
     "seat_lower_left": {
-      "x": 281,
-      "y": 457,
-      "width": 90,
-      "height": 45
-    },
-    "seat_mid_left": {
-      "x": 180,
-      "y": 326,
-      "width": 90,
+      "x": 286,
+      "y": 438,
+      "width": 85,
       "height": 53
     },
+    "seat_mid_left": {
+      "x": 192,
+      "y": 332,
+      "width": 91,
+      "height": 54
+    },
     "seat_upper_left": {
-      "x": 232,
-      "y": 202,
+      "x": 234,
+      "y": 204,
       "width": 90,
-      "height": 59
+      "height": 48
     }
   },
   "seat_regions": {
