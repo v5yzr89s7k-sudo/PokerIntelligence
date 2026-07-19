@@ -5,6 +5,28 @@ import time
 
 VALID_STREETS = ("PREFLOP", "FLOP", "TURN", "RIVER", "SHOWDOWN", "COMPLETE")
 
+PREFLOP_ACTION_ORDER = (
+    "UTG",
+    "UTG+1",
+    "LJ",
+    "HJ",
+    "CO",
+    "BTN",
+    "SB",
+    "BB",
+)
+
+POSTFLOP_ACTION_ORDER = (
+    "SB",
+    "BB",
+    "UTG",
+    "UTG+1",
+    "LJ",
+    "HJ",
+    "CO",
+    "BTN",
+)
+
 
 @dataclass
 class CanonicalPlayer:
@@ -73,6 +95,37 @@ class CanonicalHand:
         self.closed = False
         self._next_sequence = 1
 
+    def _initialize_players_to_act(self):
+        """
+        Build the live action queue from authoritative player positions.
+
+        Preflop action begins left of the big blind. Postflop action begins
+        with the earliest active position left of the button. Folded and
+        all-in players are never included.
+        """
+        position_order = (
+            PREFLOP_ACTION_ORDER
+            if self.current_street == "PREFLOP"
+            else POSTFLOP_ACTION_ORDER
+        )
+
+        seat_by_position = {
+            player.position: seat
+            for seat, player in self.players.items()
+            if player.position not in ("", "unknown")
+            and player.active
+            and not player.folded
+            and not player.all_in
+        }
+
+        self.players_to_act = [
+            seat_by_position[position]
+            for position in position_order
+            if position in seat_by_position
+        ]
+
+        return list(self.players_to_act)
+
     def start_hand(
         self,
         hand_id: str,
@@ -108,6 +161,8 @@ class CanonicalHand:
                 is_hero=bool(item.get("is_hero")) or seat == self.hero_seat,
                 active=bool(item.get("is_active", True)),
             )
+
+        self._initialize_players_to_act()
 
         return self
 
@@ -258,6 +313,11 @@ class CanonicalHand:
         self.current_bet_bb = 0.0
         self.last_aggressor_seat = None
 
+        if self.current_street in ("FLOP", "TURN", "RIVER"):
+            self._initialize_players_to_act()
+        else:
+            self.players_to_act = []
+
     def add_action(
         self,
         seat: str,
@@ -324,7 +384,30 @@ class CanonicalHand:
 
             player.committed_by_street[self.current_street] = committed
 
+            self._recompute_pot_bb()
+
         return item
+
+    def _recompute_pot_bb(self):
+        """
+        Canonical pot reconstruction.
+
+        The pot is defined as the total chips committed by every player
+        across every completed and current betting street.
+
+        This is the authoritative live pot. OCR pot detection is used
+        only as validation, never as the source of truth.
+        """
+        total = 0.0
+
+        for player in self.players.values():
+            total += sum(
+                float(v or 0.0)
+                for v in player.committed_by_street.values()
+            )
+
+        self.pot_bb = round(total, 2)
+
 
     def add_showdown(
         self,
@@ -343,6 +426,7 @@ class CanonicalHand:
         })
 
         self.current_street = "SHOWDOWN"
+        self.players_to_act = []
 
     def add_pot_result(
         self,
@@ -360,6 +444,7 @@ class CanonicalHand:
         self.result = result
         self.ended_ts = ended_ts or time.time()
         self.current_street = "COMPLETE"
+        self.players_to_act = []
         self.closed = True
 
     @classmethod
