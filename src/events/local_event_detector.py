@@ -196,6 +196,21 @@ class LocalEventDetector:
             seat for seat, info in changes.bet_region_transitions.items()
             if info.get("cleared")
         ]
+
+        # A confirmed clear is the safest point to refresh that seat's
+        # empty-region baseline. This prevents blinds, antes, and chips from
+        # previous actions from remaining permanently different from the
+        # original hand-start frame.
+        for seat in changes.bet_region_cleared:
+            rect = GEOM.get("bet_regions", {}).get(seat)
+
+            if rect:
+                self.bet_region_baseline.capture(
+                    f"bet_region:{seat}",
+                    frame,
+                    rect,
+                )
+
         changes.board_count = count_board_cards(frame, GEOM)
         changes.hero_cards_visible = hero_cards_visible(frame, GEOM)
         changes.hero_nameplate_blinking = hero_nameplate_blinking(self.previous_frame, frame, GEOM)

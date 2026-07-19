@@ -210,11 +210,12 @@ def bet_region_occupancy(
 
         if baseline_ready:
             signal["occupied"] = bool(
+                baseline_changed
+                and visual_present
+            )
+        else:
+            signal["occupied"] = bool(
                 signal.get("legacy_occupied", False)
-                or (
-                    baseline_changed
-                    and visual_present
-                )
             )
 
         signal["baseline_changed"] = baseline_changed
