@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, Set
+from typing import Dict, Set, List, Optional
 
 
 VOLUNTARY_ACTIONS = {
@@ -15,8 +15,26 @@ VOLUNTARY_ACTIONS = {
 
 @dataclass
 class StreetCommitmentState:
+    """
+    Canonical betting state for a single street.
+
+    This is intentionally infrastructure only. Runtime behavior will be
+    introduced incrementally in later commits.
+    """
+
     street: str
+
     committed: Set[str] = field(default_factory=set)
+
+    pending_to_act: List[str] = field(default_factory=list)
+
+    acted: Set[str] = field(default_factory=set)
+
+    last_aggressor: Optional[str] = None
+
+    current_price: float = 0.0
+
+    betting_open: bool = False
 
 
 class StreetCommitmentTracker:
@@ -108,6 +126,13 @@ class StreetCommitmentTracker:
 
     def to_dict(self):
         return {
-            street: sorted(state.committed)
+            street: {
+                "committed": sorted(state.committed),
+                "pending_to_act": list(state.pending_to_act),
+                "acted": sorted(state.acted),
+                "last_aggressor": state.last_aggressor,
+                "current_price": state.current_price,
+                "betting_open": state.betting_open,
+            }
             for street, state in self._states.items()
         }
