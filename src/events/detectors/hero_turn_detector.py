@@ -1,76 +1,129 @@
-import time
+from collections import deque
+
 import cv2
 import numpy as np
 
 
 def _hero_nameplate_rect(geometry):
-    # Prefer stack/nameplate region because ACR blink affects the hero nameplate area.
     rect = (geometry.get("stack_regions") or {}).get("hero")
     if rect:
         return rect
 
-    # Fallback: derive from hero seat region if stack_regions is missing.
-    rect = (geometry.get("seat_regions") or {}).get("hero")
-    if rect:
-        return rect
-
-    return None
+    return (geometry.get("seat_regions") or {}).get("hero")
 
 
 def _crop(img, rect):
-    x, y, w, h = map(int, [rect["x"], rect["y"], rect["width"], rect["height"]])
-    return img[y:y+h, x:x+w]
+    x, y, w, h = map(
+        int,
+        [
+            rect["x"],
+            rect["y"],
+            rect["width"],
+            rect["height"],
+        ],
+    )
+    return img[y:y + h, x:x + w]
+
+
+def _gray_hero_crop(frame, geometry):
+    rect = _hero_nameplate_rect(geometry)
+    if not rect or frame is None:
+        return None
+
+    crop = _crop(frame, rect)
+    if crop.size == 0:
+        return None
+
+    return cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
 
 def hero_nameplate_diff(previous, current, geometry):
-    rect = _hero_nameplate_rect(geometry)
-    if not rect:
+    a = _gray_hero_crop(previous, geometry)
+    b = _gray_hero_crop(current, geometry)
+
+    if a is None or b is None or a.shape != b.shape:
         return 0.0
 
-    a = _crop(previous, rect)
-    b = _crop(current, rect)
-
-    if a.shape != b.shape or a.size == 0:
-        return 0.0
-
-    ag = cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
-    bg = cv2.cvtColor(b, cv2.COLOR_BGR2GRAY)
-
-    return float(np.mean(cv2.absdiff(ag, bg)))
+    return float(np.mean(cv2.absdiff(a, b)))
 
 
 def hero_nameplate_blinking(previous, current, geometry, threshold=5.0):
     return hero_nameplate_diff(previous, current, geometry) >= threshold
 
 
-def hero_nameplate_blinking_rolling(capture_fn, latest_capture_fn, geometry, samples=6, delay=0.18, threshold=5.0):
+class HeroBlinkBuffer:
     """
-    Samples multiple frames over roughly one second.
+    Non-blocking temporal Hero nameplate detector.
 
-    Returns:
-      (blink_detected: bool, max_diff: float, diffs: list[float])
+    The coordinator feeds one already-captured frame per loop. The detector
+    stores only the cropped grayscale Hero nameplate region.
     """
-    frames = []
 
-    for _ in range(samples):
-        capture_fn()
-        path = latest_capture_fn()
-        if not path:
-            time.sleep(delay)
-            continue
+    def __init__(
+        self,
+        max_samples=6,
+        diff_threshold=5.0,
+        mean_range_threshold=5.0,
+        required_transitions=2,
+    ):
+        self.frames = deque(maxlen=int(max_samples))
+        self.diff_threshold = float(diff_threshold)
+        self.mean_range_threshold = float(mean_range_threshold)
+        self.required_transitions = int(required_transitions)
 
-        img = cv2.imread(str(path))
-        if img is None:
-            time.sleep(delay)
-            continue
+        self.detected = False
+        self.max_diff = 0.0
+        self.mean_range = 0.0
+        self.diffs = []
 
-        img = cv2.resize(img, (934, 696))
-        frames.append(img)
-        time.sleep(delay)
+    def reset(self):
+        self.frames.clear()
+        self.detected = False
+        self.max_diff = 0.0
+        self.mean_range = 0.0
+        self.diffs = []
 
-    diffs = []
-    for i in range(1, len(frames)):
-        diffs.append(hero_nameplate_diff(frames[i - 1], frames[i], geometry))
+    def update(self, frame, geometry):
+        crop = _gray_hero_crop(frame, geometry)
+        if crop is None:
+            self.reset()
+            return False
 
-    max_diff = max(diffs) if diffs else 0.0
-    return max_diff >= threshold, max_diff, diffs
+        self.frames.append(crop)
+
+        if len(self.frames) < 3:
+            self.detected = False
+            return False
+
+        frames = list(self.frames)
+
+        self.diffs = [
+            float(np.mean(cv2.absdiff(frames[i - 1], frames[i])))
+            for i in range(1, len(frames))
+        ]
+
+        means = [float(np.mean(item)) for item in frames]
+
+        self.max_diff = max(self.diffs) if self.diffs else 0.0
+        self.mean_range = max(means) - min(means) if means else 0.0
+
+        transition_count = sum(
+            value >= self.diff_threshold
+            for value in self.diffs
+        )
+
+        self.detected = (
+            transition_count >= self.required_transitions
+            or self.mean_range >= self.mean_range_threshold
+        )
+
+        return self.detected
+
+    def summary(self):
+        return {
+            "blink_detected": self.detected,
+            "max_diff": round(self.max_diff, 3),
+            "mean_range": round(self.mean_range, 3),
+            "diffs": [round(value, 3) for value in self.diffs],
+            "sample_count": len(self.frames),
+        }

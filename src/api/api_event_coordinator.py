@@ -9,7 +9,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from src.events.detectors.action_buttons_detector import action_buttons_visible
-from src.events.detectors.hero_turn_detector import hero_nameplate_blinking_rolling
+from src.events.detectors.hero_turn_detector import HeroBlinkBuffer
 from src.events.local_event_detector import LocalEventDetector
 from src.observer.continuous_observer import ContinuousObserver
 from src.observer.observation_timeline import ObservationTimeline
@@ -579,18 +579,6 @@ def local_action_buttons_visible(path):
 
     img = cv2.resize(img, (934, 696))
     return action_buttons_visible(img, GEOM)
-
-
-def local_hero_blink_visible():
-    blink, max_diff, diffs = hero_nameplate_blinking_rolling(
-        capture_fn=capture,
-        latest_capture_fn=latest_capture,
-        geometry=GEOM,
-        samples=4,
-        delay=0.10,
-        threshold=5.0,
-    )
-    return blink
 
 
 def maybe_emit_hero_decision(state, visible, hero_visible):
@@ -1173,6 +1161,14 @@ def main():
     print(f"Events: {EVENT_LOG}")
     state = load_state()
     local_detector = LocalEventDetector()
+    hero_blink_buffer = HeroBlinkBuffer(
+        max_samples=6,
+        diff_threshold=5.0,
+        mean_range_threshold=5.0,
+        required_transitions=2,
+    )
+    previous_blink_visible = False
+
     sequence_recorder = ActionSequenceRecorder(
         max_frames=240
     )
@@ -1398,11 +1394,40 @@ def main():
             time.sleep(0.5)
             continue
 
-        # Blink sampling performs repeated captures and must stay off the hot path.
+        # Non-blocking temporal Hero-turn sensor.
+        # Reuses the coordinator's existing captured frame.
         blink_visible = False
-        hero_turn_visible = buttons_visible
 
-        state = maybe_emit_hero_decision(state, hero_turn_visible, hero_visible)
+        if hero_visible and frame:
+            blink_frame = cv2.imread(str(frame))
+
+            if blink_frame is not None:
+                blink_frame = cv2.resize(blink_frame, (934, 696))
+                blink_visible = hero_blink_buffer.update(
+                    blink_frame,
+                    GEOM,
+                )
+        else:
+            hero_blink_buffer.reset()
+
+        if blink_visible != previous_blink_visible:
+            summary = hero_blink_buffer.summary()
+            print(
+                f"[HERO_BLINK] visible={blink_visible} "
+                f"max_diff={summary['max_diff']:.3f} "
+                f"mean_range={summary['mean_range']:.3f} "
+                f"samples={summary['sample_count']}",
+                flush=True,
+            )
+            previous_blink_visible = blink_visible
+
+        hero_turn_visible = blink_visible or buttons_visible
+
+        state = maybe_emit_hero_decision(
+            state,
+            hero_turn_visible,
+            hero_visible,
+        )
         state = maybe_complete_early(state, count, hero_visible)
         state = maybe_complete_hand(state, count)
 
