@@ -162,6 +162,11 @@ def seed_forced_blinds(state, canonical):
         ts=state.get("hand_started_at"),
     )
 
+    # The big blind establishes the live preflop price to call.
+    # Forced posts are not aggression, so last_aggressor_seat remains unset.
+    canonical.current_bet_bb = 1.0
+    canonical.last_aggressor_seat = None
+
     state["forced_blinds_seeded"] = True
 
     print(

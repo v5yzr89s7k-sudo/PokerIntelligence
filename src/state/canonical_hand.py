@@ -307,9 +307,19 @@ class CanonicalHand:
             if amount_bb is not None:
                 committed += float(amount_bb)
 
+                if item.action == "BET":
+                    self.current_bet_bb = max(
+                        self.current_bet_bb,
+                        committed,
+                    )
+                    self.last_aggressor_seat = seat
+
             if raise_to_bb is not None:
                 committed = float(raise_to_bb)
-                self.current_bet_bb = max(self.current_bet_bb, committed)
+                self.current_bet_bb = max(
+                    self.current_bet_bb,
+                    committed,
+                )
                 self.last_aggressor_seat = seat
 
             player.committed_by_street[self.current_street] = committed

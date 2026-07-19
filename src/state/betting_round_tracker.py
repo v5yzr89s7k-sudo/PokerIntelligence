@@ -311,14 +311,48 @@ class BettingRoundTracker:
                     or 0.0
                 )
 
+            current_price = round(
+                float(self.hand.current_bet_bb or 0.0),
+                2,
+            )
+            target_commitment = round(
+                prior_committed + delta_bb,
+                2,
+            )
+            tolerance = 0.05
+
             if canonical_action in {
                 BET_OR_RAISE,
-                RAISE,
+                CALL_OR_RAISE,
             }:
-                raise_to_bb = round(prior_committed + delta_bb, 2)
+                if current_price <= tolerance:
+                    canonical_action = BET
+                    amount_bb = delta_bb
+                    reason = (
+                        "chip commitment opened betting with no live "
+                        "price; resolved as BET"
+                    )
+
+                elif target_commitment <= current_price + tolerance:
+                    canonical_action = CALL
+                    amount_bb = delta_bb
+                    reason = (
+                        "total street commitment matched the live "
+                        "price; resolved as CALL"
+                    )
+
+                else:
+                    canonical_action = RAISE
+                    raise_to_bb = target_commitment
+                    reason = (
+                        "total street commitment exceeded the live "
+                        "price; resolved as RAISE"
+                    )
+
+            elif canonical_action == RAISE:
+                raise_to_bb = target_commitment
 
             elif canonical_action in {
-                CALL_OR_RAISE,
                 CALL,
                 BET,
             }:
