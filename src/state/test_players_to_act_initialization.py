@@ -135,11 +135,14 @@ def test_showdown_and_completion_clear_queue():
     hand.set_board(["Ah", "7c", "2d"])
     assert hand.players_to_act
 
-    hand.set_showdown([])
+    hand.add_showdown(
+        "hero",
+        ["As", "Kd"],
+    )
     assert hand.current_street == "SHOWDOWN"
     assert hand.players_to_act == []
 
-    hand.close_hand(result="test complete")
+    hand.finish(result="test complete")
     assert hand.current_street == "COMPLETE"
     assert hand.players_to_act == []
 
