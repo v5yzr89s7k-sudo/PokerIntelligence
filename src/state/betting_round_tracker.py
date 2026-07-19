@@ -467,6 +467,14 @@ class BettingRoundTracker:
             canonical
         )
 
+        # Forced blinds and unresolved voluntary commitments are not
+        # sufficient evidence of aggression. Only resolved BET or RAISE
+        # events may establish the last aggressor.
+        if canonical_action in (BET, RAISE):
+            self.has_open_bet = True
+            self.last_aggressor_seat = seat
+            self.hand.last_aggressor_seat = seat
+
         self.commitment_tracker.sync_queue(
             self.hand.current_street,
             self.hand.players_to_act,
@@ -479,14 +487,6 @@ class BettingRoundTracker:
             last_aggressor=self.hand.last_aggressor_seat,
             betting_open=self.has_open_bet,
         )
-
-        # Forced blinds and unresolved voluntary commitments are not
-        # sufficient evidence of aggression. Only resolved BET or RAISE
-        # events may establish the last aggressor.
-        if canonical_action in (BET, RAISE):
-            self.has_open_bet = True
-            self.last_aggressor_seat = seat
-            self.hand.last_aggressor_seat = seat
 
         self._record_decision(
             episode_id,
