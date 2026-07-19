@@ -34,6 +34,7 @@ COORD_STATE = ROOT / "runtime/live/api_event_coordinator_state.json"
 STATE_MACHINE_STATE = (
     ROOT / "runtime/live/api_event_state_machine_state.json"
 )
+CANONICAL_HAND_JSON = ROOT / "runtime/live/canonical_hand.json"
 OBS_LOG = ROOT / "runtime/live/local_observations.jsonl"
 TIMELINE_JSON = ROOT / "runtime/live/current_observation_timeline.json"
 CORRELATOR_JSON = ROOT / "runtime/live/current_observation_correlator.json"
@@ -68,7 +69,6 @@ def fresh_state():
         "hero_request_ts": None,
         "last_local_board_count": 0,
         "last_local_hero_visible": False,
-        "live_stack_bb_by_seat": {},
         "pending_stack_reads": {},
     }
 
@@ -100,15 +100,41 @@ def _crop_geometry_region(img, region):
     return img[y:y + height, x:x + width]
 
 
-def _snapshot_stack_values():
-    context = load_table_context()
+def _canonical_stack_values():
+    """
+    Read authoritative live stack values from CanonicalHand.
+
+    The coordinator is read-only. The API event state machine remains the
+    sole writer of canonical hand state.
+    """
+    if not CANONICAL_HAND_JSON.exists():
+        return {}
+
+    try:
+        data = json.loads(CANONICAL_HAND_JSON.read_text())
+    except Exception:
+        return {}
+
+    players = data.get("players") or {}
     values = {}
 
-    for player in context.get("players") or []:
-        seat = player.get("seat")
-        value = player.get("stack_bb")
+    if isinstance(players, list):
+        players = {
+            item.get("seat"): item
+            for item in players
+            if item.get("seat")
+        }
 
-        if not seat or value is None:
+    for seat, player in players.items():
+        value = player.get("last_confirmed_stack_bb")
+
+        if value is None:
+            value = player.get("current_stack_bb")
+
+        if value is None:
+            value = player.get("starting_stack_bb")
+
+        if value is None:
             continue
 
         try:
@@ -156,17 +182,10 @@ def enrich_stack_change_measurements(changes, img, state):
         "pending_stack_reads",
         {},
     )
-    live_values = state.setdefault(
-        "live_stack_bb_by_seat",
-        {},
-    )
 
-    # Continuously merge trusted hand-start snapshot values. This is
-    # important because stack movement may be detected before the
-    # asynchronous table snapshot arrives.
-    snapshot_values = _snapshot_stack_values()
-    for seat, value in snapshot_values.items():
-        live_values.setdefault(seat, float(value))
+    # CanonicalHand owns the authoritative stack baseline. The coordinator
+    # reads it but never maintains a second persistent stack history.
+    canonical_values = _canonical_stack_values()
 
     # Record movement, but do not publish it yet.
     for seat in raw_changed_seats:
@@ -198,15 +217,28 @@ def enrich_stack_change_measurements(changes, img, state):
         if now - float(entry["last_change_ts"]) < settle_seconds:
             continue
 
-        # A quantitative transition requires a trusted prior value.
-        previous = live_values.get(seat)
+        # A quantitative transition requires a trusted prior value from
+        # the canonical hand state.
+        previous = canonical_values.get(seat)
         if previous is None:
-            pending.pop(seat, None)
-            print(
-                f"[STACK_SETTLE_SKIP] seat={seat} "
-                "reason=no_trusted_previous_stack",
-                flush=True,
-            )
+            # The asynchronous table snapshot may still be initializing the
+            # canonical hand. Preserve this pending transition and retry on a
+            # later frame instead of permanently discarding it.
+            wait_attempts = int(
+                entry.get("baseline_wait_attempts")
+                or 0
+            ) + 1
+            entry["baseline_wait_attempts"] = wait_attempts
+
+            # Avoid flooding the terminal while the snapshot worker runs.
+            if wait_attempts == 1 or wait_attempts % 10 == 0:
+                print(
+                    f"[STACK_SETTLE_WAIT] seat={seat} "
+                    f"reason=canonical_baseline_not_ready "
+                    f"attempt={wait_attempts}",
+                    flush=True,
+                )
+
             continue
 
         region = (
@@ -323,7 +355,6 @@ def enrich_stack_change_measurements(changes, img, state):
 
         settled_details[seat] = measurement
         settled_seats.append(seat)
-        live_values[seat] = current
         pending.pop(seat, None)
 
         emit({
