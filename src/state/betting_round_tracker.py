@@ -126,6 +126,67 @@ class BettingRoundTracker:
 
         return skipped
 
+    def _infer_opening_preflop_folds(
+        self,
+        skipped_seats: List[str],
+        ts=None,
+    ) -> List[CanonicalAction]:
+        """
+        Infer folds only for seats skipped before the first voluntary
+        preflop action.
+
+        This intentionally does not infer later preflop gaps or postflop
+        gaps. Postflop skipped players may have checked, and later gaps may
+        require additional betting-state context.
+        """
+        if (
+            self.hand.current_street != "PREFLOP"
+            or not skipped_seats
+        ):
+            return []
+
+        forced_actions = {
+            CANONICAL_POST_SMALL_BLIND,
+            CANONICAL_POST_BIG_BLIND,
+        }
+
+        prior_voluntary_action = any(
+            action.street == "PREFLOP"
+            and action.action not in forced_actions
+            for action in self.hand.actions
+        )
+
+        if prior_voluntary_action:
+            return []
+
+        inferred = []
+
+        for skipped_seat in skipped_seats:
+            player = self.hand.players.get(skipped_seat)
+
+            if (
+                player is None
+                or player.folded
+                or player.all_in
+                or not player.active
+            ):
+                continue
+
+            inferred.append(
+                self.hand.add_action(
+                    seat=skipped_seat,
+                    action="FOLD",
+                    confidence=0.90,
+                    source="passive_inference",
+                    evidence=[
+                        "skipped_before_first_preflop_action",
+                    ],
+                    ts=ts,
+                )
+            )
+
+        return inferred
+
     def _record_decision(
         self,
         episode_id: int,
@@ -378,6 +439,19 @@ class BettingRoundTracker:
             }:
                 amount_bb = delta_bb
 
+        # Advance the queue before recording the observed action so inferred
+        # opening folds preserve correct chronological order.
+        if canonical_action not in {
+            CANONICAL_POST_SMALL_BLIND,
+            CANONICAL_POST_BIG_BLIND,
+        }:
+            skipped_seats = self._consume_action_queue(seat)
+
+            self._infer_opening_preflop_folds(
+                skipped_seats,
+                ts=item.get("ts"),
+            )
+
         canonical = self.hand.add_action(
             seat=seat,
             action=canonical_action,
@@ -392,14 +466,6 @@ class BettingRoundTracker:
         self.commitment_tracker.ingest(
             canonical
         )
-
-        # Forced blind posts occur before the voluntary preflop action
-        # queue and therefore must not consume it.
-        if canonical_action not in {
-            CANONICAL_POST_SMALL_BLIND,
-            CANONICAL_POST_BIG_BLIND,
-        }:
-            self._consume_action_queue(seat)
 
         # Forced blinds and unresolved voluntary commitments are not
         # sufficient evidence of aggression. Only resolved BET or RAISE

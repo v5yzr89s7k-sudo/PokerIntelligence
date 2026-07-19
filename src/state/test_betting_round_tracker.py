@@ -295,14 +295,26 @@ def test_action_consumes_queue_through_actor():
 
     assert result is not None
 
-    # seat_top was skipped and seat_upper_right acted. No fold action is
-    # created yet, but both leave the pending queue.
+    # seat_top was skipped before the first voluntary preflop action and
+    # is therefore recorded as a conservatively inferred fold.
     assert hand.players_to_act == [
         "hero",
     ]
 
-    assert [action.seat for action in hand.actions] == [
-        "seat_upper_right",
+    assert [
+        (action.seat, action.action)
+        for action in hand.actions
+    ] == [
+        ("seat_top", "FOLD"),
+        ("seat_upper_right", BET_OR_RAISE),
+    ]
+
+    inferred_fold = hand.actions[0]
+
+    assert inferred_fold.source == "passive_inference"
+    assert inferred_fold.confidence == 0.90
+    assert inferred_fold.evidence == [
+        "skipped_before_first_preflop_action",
     ]
 
 
@@ -343,6 +355,68 @@ def test_actor_outside_queue_does_not_corrupt_queue():
     assert hand.players_to_act == original_queue
 
 
+def test_postflop_skipped_seat_is_not_inferred_as_fold():
+    hand = make_hand()
+    hand.set_board(["Ah", "7c", "2d"])
+    tracker = BettingRoundTracker(hand)
+
+    result = tracker.ingest(
+        inferred(
+            1,
+            "seat_upper_right",
+            BET_OR_RAISE,
+            street="FLOP",
+        )
+    )
+
+    assert result is not None
+
+    assert [
+        (action.seat, action.action)
+        for action in hand.actions
+    ] == [
+        ("seat_upper_right", BET_OR_RAISE),
+    ]
+
+    assert hand.players["seat_top"].folded is False
+    assert hand.players["seat_top"].active is True
+
+
+def test_later_preflop_gap_is_not_inferred_without_more_context():
+    hand = make_hand()
+    tracker = BettingRoundTracker(hand)
+
+    first = tracker.ingest(
+        inferred(
+            1,
+            "seat_top",
+            BET_OR_RAISE,
+        )
+    )
+
+    second = tracker.ingest(
+        inferred(
+            2,
+            "hero",
+            CALL,
+        )
+    )
+
+    assert first is not None
+    assert second is not None
+
+    assert [
+        (action.seat, action.action)
+        for action in hand.actions
+    ] == [
+        ("seat_top", BET_OR_RAISE),
+        ("hero", "CALL"),
+    ]
+
+    assert hand.players["seat_upper_right"].folded is False
+    assert hand.players["seat_upper_right"].active is True
+
+
 def test_forced_blinds_do_not_consume_preflop_queue():
     hand = make_hand()
     tracker = BettingRoundTracker(hand)
@@ -381,6 +455,8 @@ if __name__ == "__main__":
         test_action_consumes_queue_through_actor,
         test_first_actor_consumes_only_itself,
         test_actor_outside_queue_does_not_corrupt_queue,
+        test_postflop_skipped_seat_is_not_inferred_as_fold,
+        test_later_preflop_gap_is_not_inferred_without_more_context,
         test_forced_blinds_do_not_consume_preflop_queue,
     ]
 
