@@ -232,6 +232,41 @@ def handle_hero_cards(state, event):
     return state
 
 
+def handle_stack_update(state, event):
+    if state.get("phase") == "WAITING":
+        print("[SKIP] stack_update while waiting")
+        return state
+
+    seat = event.get("seat")
+    current_stack_bb = event.get("current_stack_bb")
+
+    if not seat or current_stack_bb is None:
+        print("[SKIP] invalid stack_update", event)
+        return state
+
+    canonical = canonical_load()
+    result = canonical.update_player_stack(
+        seat=seat,
+        new_stack_bb=float(current_stack_bb),
+    )
+
+    if result is None:
+        print(f"[SKIP] stack_update unknown seat={seat}")
+        return state
+
+    canonical_save(canonical)
+
+    print(
+        f"[CANONICAL_STACK] seat={seat} "
+        f"previous={result.get('previous_stack_bb')} "
+        f"current={result.get('current_stack_bb')} "
+        f"delta={result.get('delta_bb')}",
+        flush=True,
+    )
+
+    return state
+
+
 def handle_board(state, event):
     board = normalize_cards(event.get("board") or [])
     n = len(board)
@@ -387,6 +422,9 @@ def handle_event(state, event):
 
     if t == "table_snapshot":
         return handle_table_snapshot(state, event)
+
+    if t == "stack_update":
+        return handle_stack_update(state, event)
 
     if t == "hero_cards":
         return handle_hero_cards(state, event)

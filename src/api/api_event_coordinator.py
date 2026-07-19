@@ -326,6 +326,18 @@ def enrich_stack_change_measurements(changes, img, state):
         live_values[seat] = current
         pending.pop(seat, None)
 
+        emit({
+            "type": "stack_update",
+            "seat": seat,
+            "previous_stack_bb": round(previous, 2),
+            "current_stack_bb": round(current, 2),
+            "delta_bb": delta,
+            "confidence": confidence,
+            "origin_street": measurement.get("origin_street"),
+            "stack_read_mode": measurement.get("stack_read_mode"),
+            "stack_text": measurement.get("stack_text"),
+        })
+
         print(
             f"[STACK_TRANSITION] seat={seat} "
             f"previous={previous:.2f} "
