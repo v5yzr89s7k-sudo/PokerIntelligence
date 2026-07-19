@@ -99,6 +99,34 @@ class StreetCommitmentTracker:
             seat,
         )
 
+
+    def sync_queue(self, street, pending):
+        state = self._state(street)
+        state.pending_to_act = list(pending or [])
+
+    def record_action(
+        self,
+        street,
+        seat,
+        *,
+        current_price=None,
+        last_aggressor=None,
+        betting_open=None,
+    ):
+        state = self._state(street)
+
+        if seat:
+            state.acted.add(seat)
+
+        if current_price is not None:
+            state.current_price = float(current_price)
+
+        if last_aggressor is not None:
+            state.last_aggressor = last_aggressor
+
+        if betting_open is not None:
+            state.betting_open = bool(betting_open)
+
     def has_player_committed(self, street, seat):
         return (
             seat

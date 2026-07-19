@@ -467,6 +467,19 @@ class BettingRoundTracker:
             canonical
         )
 
+        self.commitment_tracker.sync_queue(
+            self.hand.current_street,
+            self.hand.players_to_act,
+        )
+
+        self.commitment_tracker.record_action(
+            self.hand.current_street,
+            seat,
+            current_price=self.hand.current_bet_bb,
+            last_aggressor=self.hand.last_aggressor_seat,
+            betting_open=self.has_open_bet,
+        )
+
         # Forced blinds and unresolved voluntary commitments are not
         # sufficient evidence of aggression. Only resolved BET or RAISE
         # events may establish the last aggressor.
