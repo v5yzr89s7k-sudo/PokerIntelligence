@@ -460,8 +460,17 @@ class CanonicalHand:
         seat: str,
         cards: List[str],
         description: str = "",
+        ts: Optional[float] = None,
     ):
         player = self.players.get(seat)
+        showdown_ts = ts or time.time()
+
+        if self.current_street in ("PREFLOP", "FLOP", "TURN", "RIVER"):
+            summary = self.street_summaries.get(self.current_street)
+
+            if summary is not None and summary.ended_ts is None:
+                summary.ending_pot_bb = float(self.pot_bb or 0.0)
+                summary.ended_ts = showdown_ts
 
         self.showdown.append({
             "seat": seat,

@@ -78,14 +78,21 @@ hand.set_board(["Ah", "7c", "2d", "Ks", "3h"])
 hand.add_action("hero", "CHECK", ts=109.0)
 hand.add_action("seat_lower_right", "CHECK", ts=110.0)
 
-hand.add_showdown("hero", ["As", "Kd"])
-hand.add_showdown("seat_lower_right", ["Ac", "Qc"])
+hand.add_showdown("hero", ["As", "Kd"], ts=110.5)
+hand.add_showdown("seat_lower_right", ["Ac", "Qc"], ts=110.6)
+
+assert hand.street_summaries["RIVER"].ended_ts == 110.5
 hand.add_pot_result("main pot", 14.4, ["hero"])
 hand.finish("Hero wins main pot", ended_ts=111.0)
 
 text = render_canonical_hand(hand)
 
 assert "TABLE — 3 players" in text
+assert "Starting Pot: 0 BB" in text
+assert "Ending Pot: 3.4 BB" in text
+assert "Starting Pot: 3.4 BB" in text
+assert "Ending Pot: 8.4 BB" in text
+
 assert "CO (Alice) folds" in text
 assert "BTN (Bob) raises to 2.2 BB" in text
 assert "BB (Hero) calls 1.2 BB" in text

@@ -83,6 +83,32 @@ def format_action(action: CanonicalAction) -> str:
     return f"{player} {kind.lower().replace('_', ' ')}"
 
 
+def _append_street_pot(
+    lines,
+    hand: CanonicalHand,
+    street: str,
+    *,
+    opening: bool,
+):
+    summary = hand.street_summaries.get(street)
+
+    if summary is None:
+        return
+
+    if opening:
+        lines.append(
+            f"Starting Pot: {_format_bb(summary.starting_pot_bb)}"
+        )
+        lines.append("")
+        return
+
+    label = "Ending Pot" if summary.ended_ts is not None else "Current Pot"
+    lines.append("")
+    lines.append(
+        f"{label}: {_format_bb(summary.ending_pot_bb)}"
+    )
+
+
 def render_canonical_hand(hand: CanonicalHand) -> str:
     lines = [
         "CURRENT HAND",
@@ -147,10 +173,24 @@ def render_canonical_hand(hand: CanonicalHand) -> str:
         "-" * 72,
     ])
 
+    _append_street_pot(
+        lines,
+        hand,
+        "PREFLOP",
+        opening=True,
+    )
+
     preflop = actions_by_street["PREFLOP"]
     lines.extend(format_action(item) for item in preflop)
     if not preflop:
         lines.append("")
+
+    _append_street_pot(
+        lines,
+        hand,
+        "PREFLOP",
+        opening=False,
+    )
 
     if len(hand.board) >= 3:
         lines.extend([
@@ -159,10 +199,24 @@ def render_canonical_hand(hand: CanonicalHand) -> str:
             "-" * 72,
         ])
 
+        _append_street_pot(
+            lines,
+            hand,
+            "FLOP",
+            opening=True,
+        )
+
         flop = actions_by_street["FLOP"]
         lines.extend(format_action(item) for item in flop)
         if not flop:
             lines.append("")
+
+        _append_street_pot(
+            lines,
+            hand,
+            "FLOP",
+            opening=False,
+        )
 
     if len(hand.board) >= 4:
         lines.extend([
@@ -171,10 +225,24 @@ def render_canonical_hand(hand: CanonicalHand) -> str:
             "-" * 72,
         ])
 
+        _append_street_pot(
+            lines,
+            hand,
+            "TURN",
+            opening=True,
+        )
+
         turn = actions_by_street["TURN"]
         lines.extend(format_action(item) for item in turn)
         if not turn:
             lines.append("")
+
+        _append_street_pot(
+            lines,
+            hand,
+            "TURN",
+            opening=False,
+        )
 
     if len(hand.board) >= 5:
         lines.extend([
@@ -183,10 +251,24 @@ def render_canonical_hand(hand: CanonicalHand) -> str:
             "-" * 72,
         ])
 
+        _append_street_pot(
+            lines,
+            hand,
+            "RIVER",
+            opening=True,
+        )
+
         river = actions_by_street["RIVER"]
         lines.extend(format_action(item) for item in river)
         if not river:
             lines.append("")
+
+        _append_street_pot(
+            lines,
+            hand,
+            "RIVER",
+            opening=False,
+        )
 
     if hand.showdown:
         lines.extend([
