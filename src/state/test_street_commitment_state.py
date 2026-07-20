@@ -10,12 +10,20 @@ state = tracker._state("PREFLOP")
 assert state.street == "PREFLOP"
 
 assert state.committed == set()
+assert state.street_order == []
+assert state.street_order == []
 assert state.pending_to_act == []
 assert state.acted == set()
 
 assert state.last_aggressor is None
 assert state.current_price == 0.0
 assert state.betting_open is False
+
+state.street_order.extend([
+    "UTG",
+    "HJ",
+    "CO",
+])
 
 state.pending_to_act.extend([
     "UTG",
@@ -28,6 +36,12 @@ state.current_price = 2.5
 state.betting_open = True
 
 serialized = tracker.to_dict()
+
+assert serialized["PREFLOP"]["street_order"] == [
+    "UTG",
+    "HJ",
+    "CO",
+]
 
 assert serialized["PREFLOP"]["pending_to_act"] == [
     "UTG",

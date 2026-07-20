@@ -77,6 +77,15 @@ class BettingRoundTracker:
         self.processed_episode_ids = set()
         self.decisions: List[BettingRoundDecision] = []
 
+        self.commitment_tracker.initialize_street_order(
+            self.street,
+            self.hand.players_to_act,
+        )
+        self.commitment_tracker.sync_queue(
+            self.street,
+            self.hand.players_to_act,
+        )
+
     @staticmethod
     def _action_dict(action: Any) -> Dict:
         if isinstance(action, dict):
@@ -101,9 +110,18 @@ class BettingRoundTracker:
 
         self.hand.current_bet_bb = 0.0
         self.hand.last_aggressor_seat = None
-        self.hand.players_to_act = []
+        # CanonicalHand.set_board() has already initialized the new
+        # street's action queue. Preserve it instead of clearing it here.
         self.commitment_tracker.reset_street(
             self.street
+        )
+        self.commitment_tracker.initialize_street_order(
+            self.street,
+            self.hand.players_to_act,
+        )
+        self.commitment_tracker.sync_queue(
+            self.street,
+            self.hand.players_to_act,
         )
 
     def _consume_action_queue(self, seat: str) -> List[str]:

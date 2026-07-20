@@ -26,6 +26,10 @@ class StreetCommitmentState:
 
     committed: Set[str] = field(default_factory=set)
 
+    # Immutable action order established at the start of this street.
+    street_order: List[str] = field(default_factory=list)
+
+    # Mutable traversal queue synchronized from CanonicalHand.
     pending_to_act: List[str] = field(default_factory=list)
 
     acted: Set[str] = field(default_factory=set)
@@ -100,6 +104,21 @@ class StreetCommitmentTracker:
         )
 
 
+    def initialize_street_order(self, street, order):
+        """
+        Capture the authoritative action order once for this street.
+
+        Later queue consumption must not mutate this immutable reference.
+        Repeated initialization is intentionally ignored unless the stored
+        order is still empty.
+        """
+        state = self._state(street)
+
+        if not state.street_order:
+            state.street_order = list(order or [])
+
+        return list(state.street_order)
+
     def sync_queue(self, street, pending):
         state = self._state(street)
         state.pending_to_act = list(pending or [])
@@ -156,6 +175,7 @@ class StreetCommitmentTracker:
         return {
             street: {
                 "committed": sorted(state.committed),
+                "street_order": list(state.street_order),
                 "pending_to_act": list(state.pending_to_act),
                 "acted": sorted(state.acted),
                 "last_aggressor": state.last_aggressor,
