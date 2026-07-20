@@ -46,6 +46,19 @@ class CanonicalPlayer:
         return asdict(self)
 
 
+
+@dataclass
+class StreetSummary:
+    street: str
+    starting_pot_bb: float = 0.0
+    ending_pot_bb: float = 0.0
+    started_ts: Optional[float] = None
+    ended_ts: Optional[float] = None
+
+    def to_dict(self):
+        return asdict(self)
+
+
 @dataclass
 class CanonicalAction:
     sequence: int
@@ -89,6 +102,7 @@ class CanonicalHand:
         self.last_aggressor_seat: Optional[str] = None
         self.players_to_act: List[str] = []
 
+        self.street_summaries: Dict[str, StreetSummary] = {}
         self.showdown: List[dict] = []
         self.pots: List[dict] = []
         self.result = ""
@@ -163,6 +177,13 @@ class CanonicalHand:
             )
 
         self._initialize_players_to_act()
+
+        self.street_summaries["PREFLOP"] = StreetSummary(
+            street="PREFLOP",
+            starting_pot_bb=0.0,
+            ending_pot_bb=0.0,
+            started_ts=self.started_ts,
+        )
 
         return self
 
@@ -292,7 +313,7 @@ class CanonicalHand:
             "initialized": False,
         }
 
-    def set_board(self, cards: List[str]):
+    def set_board(self, cards: List[str], ts: Optional[float] = None):
         cards = list(cards)
 
         if len(cards) not in (0, 3, 4, 5):
@@ -301,15 +322,36 @@ class CanonicalHand:
         if len(cards) < len(self.board):
             raise ValueError("Board cannot move backwards")
 
-        self.board = cards
+        previous_street = self.current_street
+        transition_ts = ts or time.time()
 
         if len(cards) == 3:
-            self.current_street = "FLOP"
+            next_street = "FLOP"
         elif len(cards) == 4:
-            self.current_street = "TURN"
+            next_street = "TURN"
         elif len(cards) == 5:
-            self.current_street = "RIVER"
+            next_street = "RIVER"
+        else:
+            next_street = "PREFLOP"
 
+        self.board = cards
+
+        if next_street != previous_street:
+            previous_summary = self.street_summaries.get(previous_street)
+
+            if previous_summary is not None:
+                previous_summary.ending_pot_bb = float(self.pot_bb or 0.0)
+                previous_summary.ended_ts = transition_ts
+
+            if next_street in ("FLOP", "TURN", "RIVER"):
+                self.street_summaries[next_street] = StreetSummary(
+                    street=next_street,
+                    starting_pot_bb=float(self.pot_bb or 0.0),
+                    ending_pot_bb=float(self.pot_bb or 0.0),
+                    started_ts=transition_ts,
+                )
+
+        self.current_street = next_street
         self.current_bet_bb = 0.0
         self.last_aggressor_seat = None
 
@@ -386,6 +428,10 @@ class CanonicalHand:
 
             self._recompute_pot_bb()
 
+            summary = self.street_summaries.get(self.current_street)
+            if summary is not None:
+                summary.ending_pot_bb = float(self.pot_bb or 0.0)
+
         return item
 
     def _recompute_pot_bb(self):
@@ -443,6 +489,12 @@ class CanonicalHand:
     def finish(self, result: str = "", ended_ts: Optional[float] = None):
         self.result = result
         self.ended_ts = ended_ts or time.time()
+
+        summary = self.street_summaries.get(self.current_street)
+        if summary is not None:
+            summary.ending_pot_bb = float(self.pot_bb or 0.0)
+            summary.ended_ts = self.ended_ts
+
         self.current_street = "COMPLETE"
         self.players_to_act = []
         self.closed = True
@@ -519,6 +571,21 @@ class CanonicalHand:
         hand.last_aggressor_seat = data.get("last_aggressor_seat")
         hand.players_to_act = list(data.get("players_to_act") or [])
 
+        hand.street_summaries = {}
+
+        for street, item in (data.get("street_summaries") or {}).items():
+            hand.street_summaries[street] = StreetSummary(
+                street=item.get("street") or street,
+                starting_pot_bb=float(
+                    item.get("starting_pot_bb") or 0.0
+                ),
+                ending_pot_bb=float(
+                    item.get("ending_pot_bb") or 0.0
+                ),
+                started_ts=item.get("started_ts"),
+                ended_ts=item.get("ended_ts"),
+            )
+
         hand.showdown = list(data.get("showdown") or [])
         hand.pots = list(data.get("pots") or [])
         hand.result = data.get("result") or ""
@@ -553,6 +620,10 @@ class CanonicalHand:
             "pot_bb": self.pot_bb,
             "last_aggressor_seat": self.last_aggressor_seat,
             "players_to_act": list(self.players_to_act),
+            "street_summaries": {
+                street: summary.to_dict()
+                for street, summary in self.street_summaries.items()
+            },
             "showdown": list(self.showdown),
             "pots": list(self.pots),
             "result": self.result,
