@@ -205,6 +205,22 @@ class BettingRoundTracker:
 
         return inferred
 
+    def _response_eligible_seats(self) -> List[str]:
+        """
+        Return players who can legally owe a response on the current street.
+        """
+        eligible = []
+
+        for seat, player in self.hand.players.items():
+            if (
+                player.active
+                and not player.folded
+                and not player.all_in
+            ):
+                eligible.append(seat)
+
+        return eligible
+
     def _record_decision(
         self,
         episode_id: int,
@@ -492,6 +508,21 @@ class BettingRoundTracker:
             self.has_open_bet = True
             self.last_aggressor_seat = seat
             self.hand.last_aggressor_seat = seat
+
+            self.commitment_tracker.open_response_queue(
+                self.hand.current_street,
+                seat,
+                self._response_eligible_seats(),
+            )
+
+        elif canonical_action not in {
+            CANONICAL_POST_SMALL_BLIND,
+            CANONICAL_POST_BIG_BLIND,
+        }:
+            self.commitment_tracker.record_response(
+                self.hand.current_street,
+                seat,
+            )
 
         self.commitment_tracker.sync_queue(
             self.hand.current_street,

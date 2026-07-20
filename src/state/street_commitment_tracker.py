@@ -32,6 +32,9 @@ class StreetCommitmentState:
     # Mutable traversal queue synchronized from CanonicalHand.
     pending_to_act: List[str] = field(default_factory=list)
 
+    # Players who still owe a response to the current resolved aggression.
+    needs_response_from: List[str] = field(default_factory=list)
+
     acted: Set[str] = field(default_factory=set)
 
     last_aggressor: Optional[str] = None
@@ -123,6 +126,57 @@ class StreetCommitmentTracker:
         state = self._state(street)
         state.pending_to_act = list(pending or [])
 
+    def open_response_queue(
+        self,
+        street,
+        aggressor,
+        eligible_seats,
+    ):
+        """
+        Rebuild response obligations after a resolved BET or RAISE.
+
+        Ordering begins immediately after the aggressor in immutable
+        street_order and wraps around. The aggressor never owes a response
+        to their own action.
+        """
+        state = self._state(street)
+        order = list(state.street_order)
+        eligible = set(eligible_seats or [])
+
+        if aggressor not in order:
+            state.needs_response_from = []
+            return []
+
+        index = order.index(aggressor)
+
+        cyclic_after_aggressor = (
+            order[index + 1:]
+            + order[:index]
+        )
+
+        state.needs_response_from = [
+            seat
+            for seat in cyclic_after_aggressor
+            if seat in eligible
+            and seat != aggressor
+        ]
+
+        return list(state.needs_response_from)
+
+    def record_response(self, street, seat):
+        """
+        Mark one player as having responded to the current aggression.
+        """
+        state = self._state(street)
+
+        state.needs_response_from = [
+            pending_seat
+            for pending_seat in state.needs_response_from
+            if pending_seat != seat
+        ]
+
+        return list(state.needs_response_from)
+
     def record_action(
         self,
         street,
@@ -177,6 +231,9 @@ class StreetCommitmentTracker:
                 "committed": sorted(state.committed),
                 "street_order": list(state.street_order),
                 "pending_to_act": list(state.pending_to_act),
+                "needs_response_from": list(
+                    state.needs_response_from
+                ),
                 "acted": sorted(state.acted),
                 "last_aggressor": state.last_aggressor,
                 "current_price": state.current_price,
