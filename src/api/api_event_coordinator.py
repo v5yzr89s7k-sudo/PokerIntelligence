@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 import json
 import time
 import subprocess
@@ -11,6 +12,9 @@ sys.path.insert(0, str(ROOT))
 from src.events.detectors.action_buttons_detector import action_buttons_visible
 from src.events.detectors.hero_turn_detector import HeroBlinkBuffer
 from src.events.local_event_detector import LocalEventDetector
+from src.events.participant_evidence_collector import (
+    ParticipantEvidenceCollector,
+)
 from src.observer.continuous_observer import ContinuousObserver
 from src.observer.observation_timeline import ObservationTimeline
 from src.observer.observation_correlator import ObservationCorrelator
@@ -24,12 +28,51 @@ from src.state.street_commitment_tracker import (
     StreetCommitmentTracker,
 )
 from src.vision.window_capture import find_acr_table_window, capture_window_crop
+from src.api.canonical_frame import to_canonical_frame
 from src.vision.action_sequence_recorder import ActionSequenceRecorder
 from src.vision.stack_reader import read_stack
 
 CAPTURE = ROOT / "src/vision/window_capture.py"
 CAPTURE_DIR = ROOT / "runtime/window_captures"
 GEOM = json.load(open(ROOT / "config/geometry.json"))
+PARTICIPANT_COLLECTOR = ParticipantEvidenceCollector()
+
+
+def collect_participant_evidence(
+    frame,
+    frame_path,
+    state,
+):
+    """
+    Publish per-frame hand-start card-back evidence while Hero cards are
+    visible and before the participant roster has been frozen.
+    """
+    hand_token = str(
+        (state or {}).get("hand_token") or ""
+    )
+
+    if not hand_token:
+        return None
+
+    if frame is None or frame.size == 0:
+        return None
+
+    canonical = to_canonical_frame(
+        frame,
+        GEOM,
+    )
+
+    return PARTICIPANT_COLLECTOR.observe(
+        canonical,
+        GEOM,
+        hand_token=hand_token,
+        frame_path=str(frame_path or ""),
+        started_ts=(
+            (state or {}).get("hand_started_at")
+            or (state or {}).get("hero_request_ts")
+            or time.time()
+        ),
+    )
 
 
 EVENT_LOG = ROOT / "runtime/live/api_events.jsonl"
@@ -259,6 +302,104 @@ def enrich_stack_change_measurements(changes, img, state):
             continue
 
         reading = read_stack(crop)
+
+        # Resolve large OCR disagreements against the last trusted stack.
+        #
+        # Continuity may promote an ambiguous OCR candidate only when the
+        # transition is plausible. Otherwise preserve the resolver's original
+        # low-confidence result so the settlement retry mechanism rejects it.
+        raw_readings = reading.get("raw") or []
+        candidate_values = [
+            float(item["stack_bb"])
+            for item in raw_readings
+            if item.get("stack_bb") is not None
+            and float(item["stack_bb"]) > 0.0
+        ]
+
+        if (
+            previous is not None
+            and int(reading.get("votes") or 0) < 2
+            and len(set(candidate_values)) >= 2
+            and (
+                max(candidate_values) - min(candidate_values)
+            ) > 20.0
+        ):
+            previous_value = float(previous)
+
+            candidate_counts = {}
+            for value in candidate_values:
+                candidate_counts[value] = (
+                    candidate_counts.get(value, 0) + 1
+                )
+
+            continuity_value = min(
+                candidate_counts,
+                key=lambda value: abs(previous_value - value),
+            )
+            continuity_votes = candidate_counts[
+                continuity_value
+            ]
+            continuity_distance = abs(
+                previous_value - continuity_value
+            )
+
+            # Stack increases are never wagers. A single OCR variant may only
+            # be promoted when it is extremely close to the canonical value.
+            # A two-variant candidate gets a wider—but still bounded—window.
+            is_increase = (
+                continuity_value > previous_value + 0.05
+            )
+            single_vote_plausible = (
+                continuity_votes == 1
+                and continuity_distance <= 3.0
+            )
+            consensus_plausible = (
+                continuity_votes >= 2
+                and continuity_distance
+                <= max(12.0, previous_value * 0.35)
+            )
+
+            plausible = bool(
+                not is_increase
+                and (
+                    single_vote_plausible
+                    or consensus_plausible
+                )
+            )
+
+            original_value = reading.get("stack_bb")
+
+            if plausible:
+                reading["stack_bb"] = continuity_value
+                reading["stack_text"] = (
+                    f"{continuity_value:g} BB"
+                )
+                reading["confidence"] = 0.95
+                reading["votes"] = 2
+                reading["mode"] = "continuity"
+
+                print(
+                    f"[STACK_CONTINUITY] seat={seat} "
+                    f"previous={previous_value:.2f} "
+                    f"resolver={original_value} "
+                    f"selected={continuity_value:.2f} "
+                    f"distance={continuity_distance:.2f} "
+                    f"candidate_votes={continuity_votes} "
+                    f"candidates={candidate_values}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[STACK_CONTINUITY_REJECT] seat={seat} "
+                    f"previous={previous_value:.2f} "
+                    f"resolver={original_value} "
+                    f"nearest={continuity_value:.2f} "
+                    f"distance={continuity_distance:.2f} "
+                    f"candidate_votes={continuity_votes} "
+                    f"candidates={candidate_values}",
+                    flush=True,
+                )
+
         current = reading.get("stack_bb")
         confidence = float(
             reading.get("confidence")
@@ -468,6 +609,52 @@ def log_observation(changes):
 _CACHED_WINDOW = None
 
 
+def parse_tournament_level(title):
+    """
+    Parse ACR tournament level metadata from a table-window title.
+
+    Example:
+        "... - 700 / 1,400, Ante 175 Hold'em ..."
+
+    All canonical amounts are normalized to big blinds.
+    """
+    title = str(title or "")
+
+    match = re.search(
+        r"(\d[\d,]*)\s*/\s*(\d[\d,]*)"
+        r"(?:\s*,?\s*Ante\s+(\d[\d,]*))?",
+        title,
+        flags=re.IGNORECASE,
+    )
+
+    if not match:
+        return {}
+
+    small_blind_chips = int(match.group(1).replace(",", ""))
+    big_blind_chips = int(match.group(2).replace(",", ""))
+    ante_chips = int((match.group(3) or "0").replace(",", ""))
+
+    if big_blind_chips <= 0:
+        return {}
+
+    return {
+        "small_blind_chips": small_blind_chips,
+        "big_blind_chips": big_blind_chips,
+        "ante_chips": ante_chips,
+        "small_blind_bb": round(
+            small_blind_chips / big_blind_chips,
+            6,
+        ),
+        "big_blind_bb": 1.0,
+        "ante_bb": round(
+            ante_chips / big_blind_chips,
+            6,
+        ),
+        "source": "window_title",
+        "window_title": title,
+    }
+
+
 def capture():
     global _CACHED_WINDOW
 
@@ -610,6 +797,18 @@ def queue_hero_request(state, frame):
 
     queued_ts = time.time()
 
+    # Begin a fresh immutable-roster evidence window immediately when the
+    # hand token is created, before the asynchronous Hero API call returns.
+    PARTICIPANT_COLLECTOR.reset(
+        hand_token=hand_token,
+        started_ts=queued_ts,
+    )
+
+    # Make the token available to the live capture loop immediately.
+    # Otherwise participant frames are ignored while the Hero worker runs.
+    state["hand_token"] = hand_token
+    state["hand_started_at"] = queued_ts
+
     append_jsonl(HERO_REQUESTS, {
         "type": "hero_request",
         "request_id": request_id,
@@ -751,12 +950,46 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
         state["board_request_id"] = None
         state["board_request_expected_len"] = None
 
+        level = parse_tournament_level(
+            _CACHED_WINDOW.title
+            if _CACHED_WINDOW is not None
+            else ""
+        )
+
+        if level:
+            print(
+                "[LEVEL] "
+                f"SB={level['small_blind_chips']} "
+                f"BB={level['big_blind_chips']} "
+                f"ante={level['ante_chips']} "
+                f"ante_bb={level['ante_bb']}",
+                flush=True,
+            )
+        else:
+            print(
+                "[LEVEL] unavailable from window title",
+                flush=True,
+            )
+
+        frozen_participants = PARTICIPANT_COLLECTOR.freeze(
+            hand_token=request_token,
+            frozen_ts=time.time(),
+        )
+
+        print(
+            f"[PARTICIPANT_FREEZE_PUBLISH] "
+            f"count={len(frozen_participants)} "
+            f"seats={frozen_participants}",
+            flush=True,
+        )
+
         emit({
             "type": "hero_cards",
             "hero_cards": cards,
             "source_request_id": pending_id,
             "hand_token": request_token,
             "canonical_frame": result.get("canonical_frame"),
+            "level": level,
         })
 
         log_latency(
@@ -1212,6 +1445,16 @@ def main():
             continue
 
         img = cv2.resize(img, (934, 696))
+
+        # Continuously accumulate hand-start participant evidence while
+        # the coordinator is already processing live frames. This is
+        # intentionally lightweight and independent of API latency.
+        collect_participant_evidence(
+            img,
+            frame,
+            state,
+        )
+
         changes = local_detector.detect(img)
 
         enrich_stack_change_measurements(

@@ -1,6 +1,8 @@
 from pathlib import Path
 from time import perf_counter
+from datetime import datetime
 import json
+import re
 import cv2
 import subprocess
 import sys
@@ -13,11 +15,129 @@ from src.api.perception_latency import log as log_latency
 from src.api.position_engine import assign_positions
 from src.api.table_snapshot_reader_core_v2 import read_table_snapshot_v2
 from src.api.canonical_frame import to_canonical_frame
-from src.events.detectors.card_presence import hand_participant_presence
+from src.events.participant_freezer import ParticipantFreezer
+from src.events.participant_evidence_store import (
+    PARTICIPANT_EVIDENCE_PATH,
+    read_evidence,
+)
 
 EVENT_LOG = ROOT / "runtime/live/api_events.jsonl"
 CAPTURE_DIR = ROOT / "runtime/window_captures"
 SNAPSHOT_READER = ROOT / "src/api/table_snapshot_api_reader.py"
+
+CAPTURE_FILENAME_RE = re.compile(
+    r"acr_table_(\d{8})_(\d{6})_(\d{6})\.png$"
+)
+
+
+def capture_timestamp(path):
+    match = CAPTURE_FILENAME_RE.match(Path(path).name)
+
+    if not match:
+        return None
+
+    date_text, time_text, micro_text = match.groups()
+
+    return datetime.strptime(
+        date_text + time_text + micro_text,
+        "%Y%m%d%H%M%S%f",
+    )
+
+
+def freeze_temporal_participants(target_frame, geometry):
+    """
+    Reconstruct the immutable starting participant roster from captures
+    preceding the Hero-card frame.
+
+    Earlier frames preserve players who folded before the API result arrived.
+    Frames after the target are excluded so late table joins cannot enter the
+    current hand's participant roster.
+    """
+    target_frame = Path(target_frame)
+    target_ts = capture_timestamp(target_frame)
+
+    if target_ts is None:
+        raise ValueError(
+            f"could not parse capture timestamp: {target_frame.name}"
+        )
+
+    candidates = []
+
+    for candidate in sorted(CAPTURE_DIR.glob("acr_table_*.png")):
+        candidate_ts = capture_timestamp(candidate)
+
+        if candidate_ts is None:
+            continue
+
+        delta = (candidate_ts - target_ts).total_seconds()
+
+        if -8.0 <= delta <= 0.0:
+            candidates.append(candidate)
+
+    if not candidates:
+        candidates = [target_frame]
+
+    freezer = ParticipantFreezer()
+    freezer.reset(
+        started_ts=target_ts.timestamp(),
+    )
+
+    for candidate in candidates:
+        original = cv2.imread(str(candidate))
+
+        if original is None or original.size == 0:
+            continue
+
+        canonical = to_canonical_frame(
+            original,
+            geometry,
+        )
+
+        freezer.observe(
+            canonical,
+            geometry,
+            frame_path=str(candidate),
+        )
+
+    diagnostic = freezer.snapshot()
+
+    # A permanent hand roster must not be frozen from a tiny sampling window.
+    # When the observer was started after dealing began, early folders may
+    # already be absent from every available frame.
+    minimum_frames = 6
+
+    if diagnostic["frame_count"] < minimum_frames:
+        raise RuntimeError(
+            "insufficient hand-start participant evidence: "
+            f"frames={diagnostic['frame_count']} "
+            f"minimum={minimum_frames}"
+        )
+
+    dealt_in_seats = freezer.freeze(
+        hero_is_dealt=True,
+        frozen_ts=target_ts.timestamp(),
+    )
+
+    diagnostic = freezer.snapshot()
+
+    print(
+        f"[PARTICIPANT_FREEZE] "
+        f"frames={diagnostic['frame_count']} "
+        f"seats={dealt_in_seats}",
+        flush=True,
+    )
+
+    for seat, scores in diagnostic["max_scores"].items():
+        print(
+            f"[PARTICIPANT_EVIDENCE] "
+            f"seat={seat} "
+            f"card_1={scores['card_1']:.3f} "
+            f"card_2={scores['card_2']:.3f} "
+            f"dealt_in={seat in dealt_in_seats}",
+            flush=True,
+        )
+
+    return dealt_in_seats, diagnostic
 
 
 def latest_capture():
@@ -133,31 +253,113 @@ def process_event(event, processed_hero_events):
         (ROOT / "config/geometry.json").read_text()
     )
 
-    original = cv2.imread(str(frame))
+    expected_token = str(
+        event.get("hand_token") or ""
+    )
 
-    if original is None or original.size == 0:
+    # Hero-card recognition can complete before six temporal
+    # participant frames have accumulated. Wait briefly for the
+    # coordinator's shared evidence instead of failing immediately.
+    shared_evidence = {}
+    participant_wait_started = time.time()
+    participant_wait_timeout = 3.0
+
+    while True:
+        candidate_evidence = read_evidence(
+            PARTICIPANT_EVIDENCE_PATH
+        )
+
+        candidate_token = str(
+            candidate_evidence.get("hand_token") or ""
+        )
+        candidate_frames = int(
+            candidate_evidence.get("frame_count") or 0
+        )
+
+        if (
+            candidate_token == expected_token
+            and candidate_frames >= 6
+        ):
+            shared_evidence = candidate_evidence
+            wait_ms = (
+                time.time() - participant_wait_started
+            ) * 1000.0
+            print(
+                "[PARTICIPANT_EVIDENCE_READY] "
+                f"frames={candidate_frames} "
+                f"wait_ms={wait_ms:.1f}",
+                flush=True,
+            )
+            break
+
+        if (
+            time.time() - participant_wait_started
+            >= participant_wait_timeout
+        ):
+            shared_evidence = candidate_evidence
+            print(
+                "[PARTICIPANT_EVIDENCE_TIMEOUT] "
+                f"frames={candidate_frames} "
+                f"token_match={candidate_token == expected_token}",
+                flush=True,
+            )
+            break
+
+        time.sleep(0.10)
+
+    shared_token = str(
+        shared_evidence.get("hand_token") or ""
+    )
+    expected_token = str(hand_token or "")
+
+    if (
+        shared_token
+        and shared_token == expected_token
+        and int(shared_evidence.get("frame_count") or 0) >= 6
+    ):
+        freezer = ParticipantFreezer.from_evidence(
+            shared_evidence
+        )
+
+        dealt_in_seats = freezer.freeze(
+            hero_is_dealt=True,
+            frozen_ts=event_ts or time.time(),
+        )
+        participant_diagnostic = freezer.snapshot()
+
         print(
-            f"[SNAPSHOT] could not read participant frame: {frame}",
+            f"[PARTICIPANT_FREEZE] source=shared "
+            f"frames={participant_diagnostic['frame_count']} "
+            f"seats={dealt_in_seats}",
             flush=True,
         )
-        dealt_in_seats = []
     else:
-        canonical = to_canonical_frame(
-            original,
-            geometry,
-        )
-
-        participant_state = hand_participant_presence(
-            canonical,
-            geometry,
-            hero_is_dealt=True,
-        )
-
-        dealt_in_seats = [
-            seat
-            for seat, info in participant_state.items()
-            if info.get("dealt_in")
-        ]
+        try:
+            dealt_in_seats, participant_diagnostic = (
+                freeze_temporal_participants(
+                    frame,
+                    geometry,
+                )
+            )
+            print(
+                "[PARTICIPANT_FREEZE] source=historical",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"[PARTICIPANT_FREEZE] failed "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            dealt_in_seats = []
+            participant_diagnostic = {
+                "error": str(exc),
+                "shared_hand_token": shared_token,
+                "expected_hand_token": expected_token,
+                "shared_frame_count": int(
+                    shared_evidence.get("frame_count") or 0
+                ),
+            }
 
     print(
         f"[PARTICIPANTS] count={len(dealt_in_seats)} "
@@ -169,6 +371,7 @@ def process_event(event, processed_hero_events):
 
     if snapshot:
         snapshot["dealt_in_seats"] = dealt_in_seats
+        snapshot["participant_diagnostic"] = participant_diagnostic
 
     if not snapshot:
         log_latency(
