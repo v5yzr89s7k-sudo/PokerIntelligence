@@ -51,6 +51,8 @@ def default_state():
         "result": None,
         "hero_to_act": False,
         "forced_blinds_seeded": False,
+        "level": {},
+        "dealt_in_seats": [],
         "timeline": [],
     }
 
@@ -110,10 +112,10 @@ def transition_for_board_len(n):
 
 def seed_forced_blinds(state, canonical):
     """
-    Add mandatory SB and BB posts once per hand after authoritative
-    positions become available.
+    Add mandatory antes, SB, and BB once per hand after authoritative
+    positions and the dealt-in hand roster are available.
 
-    These are hand-initialization events, not inferred visual actions.
+    All contribution amounts are normalized to big blinds.
     """
     if state.get("phase") == "WAITING":
         return False
@@ -122,6 +124,10 @@ def seed_forced_blinds(state, canonical):
         return False
 
     positions = state.get("positions") or {}
+    dealt_in_seats = list(
+        state.get("dealt_in_seats") or []
+    )
+    level = state.get("level") or {}
 
     sb_seat = next(
         (
@@ -143,10 +149,39 @@ def seed_forced_blinds(state, canonical):
     if not sb_seat or not bb_seat:
         return False
 
+    small_blind_bb = float(
+        level.get("small_blind_bb")
+        if level.get("small_blind_bb") is not None
+        else 0.5
+    )
+    big_blind_bb = float(
+        level.get("big_blind_bb")
+        if level.get("big_blind_bb") is not None
+        else 1.0
+    )
+    ante_bb = float(level.get("ante_bb") or 0.0)
+
+    # Antes belong only to players dealt into this hand. This roster is
+    # immutable for the duration of the hand and does not shrink on folds.
+    if ante_bb > 0.0:
+        for seat in dealt_in_seats:
+            if seat not in canonical.players:
+                continue
+
+            canonical.add_action(
+                seat=seat,
+                action="POST_ANTE",
+                amount_bb=ante_bb,
+                confidence=1.0,
+                source="hand_initialization",
+                evidence=["mandatory_ante_from_tournament_level"],
+                ts=state.get("hand_started_at"),
+            )
+
     canonical.add_action(
         seat=sb_seat,
         action="POST_SMALL_BLIND",
-        amount_bb=0.5,
+        amount_bb=small_blind_bb,
         confidence=1.0,
         source="hand_initialization",
         evidence=["mandatory_blind_from_position"],
@@ -155,47 +190,108 @@ def seed_forced_blinds(state, canonical):
     canonical.add_action(
         seat=bb_seat,
         action="POST_BIG_BLIND",
-        amount_bb=1.0,
+        amount_bb=big_blind_bb,
         confidence=1.0,
         source="hand_initialization",
         evidence=["mandatory_blind_from_position"],
         ts=state.get("hand_started_at"),
     )
 
-    # The big blind establishes the live preflop price to call.
-    # Forced posts are not aggression, so last_aggressor_seat remains unset.
-    canonical.current_bet_bb = 1.0
+    canonical.current_bet_bb = big_blind_bb
     canonical.last_aggressor_seat = None
+
+    # The requested live-hand layout defines Starting Pot as the pot after
+    # mandatory contributions have been posted.
+    preflop_summary = canonical.street_summaries.get("PREFLOP")
+    if preflop_summary is not None:
+        preflop_summary.starting_pot_bb = float(
+            canonical.pot_bb or 0.0
+        )
+        preflop_summary.ending_pot_bb = float(
+            canonical.pot_bb or 0.0
+        )
 
     state["forced_blinds_seeded"] = True
 
     print(
-        f"[CANONICAL_INIT] SB={sb_seat} 0.5 BB "
-        f"BB={bb_seat} 1.0 BB",
+        f"[CANONICAL_INIT] antes={len(dealt_in_seats)}x{ante_bb:g} BB "
+        f"SB={sb_seat} {small_blind_bb:g} BB "
+        f"BB={bb_seat} {big_blind_bb:g} BB "
+        f"pot={float(canonical.pot_bb or 0.0):g} BB",
         flush=True,
     )
     return True
 
-
 def handle_table_snapshot(state, event):
     players = event.get("players") or []
+    dealt_in_seats = event.get("dealt_in_seats") or []
+
     dealer_button_seat = event.get("dealer_button_seat") or ""
     positions = assign_positions(players, dealer_button_seat)
     hero_position = positions.get("hero") or "unknown"
 
     state["players"] = players
+    state["dealt_in_seats"] = dealt_in_seats
     state["dealer_button_seat"] = dealer_button_seat
     state["positions"] = positions
     state["hero_position"] = hero_position
 
     if state.get("phase") != "WAITING":
         canonical = canonical_load()
+
         canonical.update_table_snapshot(
             players=players,
             hero_position=hero_position,
             positions=positions,
+            dealt_in_seats=dealt_in_seats,
         )
+
+        # The canonical hand must still be PREFLOP here so mandatory
+        # contributions are never attached to FLOP/TURN/RIVER.
+        canonical.current_street = "PREFLOP"
+
         seed_forced_blinds(state, canonical)
+
+        state["canonical_snapshot_ready"] = True
+        canonical_save(canonical)
+
+        pending = list(state.get("pending_board_events") or [])
+        state["pending_board_events"] = []
+
+        for pending_event in pending:
+            pending_board = normalize_cards(
+                pending_event.get("board") or []
+            )
+
+            if len(pending_board) not in (3, 4, 5):
+                continue
+
+            if len(pending_board) <= len(state.get("board") or []):
+                continue
+
+            next_phase = transition_for_board_len(
+                len(pending_board)
+            )
+
+            state["phase"] = next_phase
+            state["board"] = pending_board
+
+            canonical.set_board(
+                pending_board,
+                ts=pending_event.get("ts") or time.time(),
+            )
+
+            state = record_timeline(
+                state,
+                f"board {next_phase} {' '.join(pending_board)}",
+            )
+
+            print(
+                f"[STATE] replayed buffered board -> "
+                f"{next_phase} {pending_board}",
+                flush=True,
+            )
+
         canonical_save(canonical)
 
     print("[STATE] table_snapshot", hero_position, f"players={len(players)}")
@@ -220,6 +316,9 @@ def handle_hero_cards(state, event):
     state["hand_complete"] = False
     state["result"] = None
     state["forced_blinds_seeded"] = False
+    state["level"] = dict(event.get("level") or {})
+    state["canonical_snapshot_ready"] = False
+    state["pending_board_events"] = []
 
     canonical = CanonicalHand().start_hand(
         hand_id=f"live-{int(state['hand_started_at'] * 1000)}",
@@ -288,12 +387,40 @@ def handle_board(state, event):
         print("[SKIP] stale board", board)
         return state
 
+    if not state.get("canonical_snapshot_ready"):
+        pending = list(state.get("pending_board_events") or [])
+
+        pending.append({
+            "board": board,
+            "ts": event.get("ts") or time.time(),
+        })
+
+        pending.sort(
+            key=lambda item: (
+                len(item.get("board") or []),
+                float(item.get("ts") or 0.0),
+            )
+        )
+
+        state["pending_board_events"] = pending
+
+        print(
+            f"[STATE] buffered board len={n} "
+            f"waiting_for_snapshot",
+            flush=True,
+        )
+
+        return state
+
     next_phase = transition_for_board_len(n)
     state["phase"] = next_phase
     state["board"] = board
 
     canonical = canonical_load()
-    canonical.set_board(board)
+    canonical.set_board(
+        board,
+        ts=event.get("ts") or time.time(),
+    )
     canonical_save(canonical)
 
     state = record_timeline(state, f"board {next_phase} {' '.join(board)}")
@@ -398,6 +525,150 @@ def handle_inferred_action(state, event):
     return state
 
 
+VALIDATION_SUMMARY_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "runtime/live/validation_summary.txt"
+)
+
+
+def write_validation_summary(canonical, archived):
+    """
+    Write a compact operational summary for the most recently completed hand.
+
+    Detailed detector diagnostics remain in the console log. This file reports
+    only the information needed for routine hand validation.
+    """
+    data = canonical.to_dict()
+
+    players = data.get("players") or {}
+    if isinstance(players, list):
+        player_count = len(players)
+    else:
+        player_count = len(players.keys())
+
+    dealt_in = data.get("dealt_in_seats") or []
+    positions = data.get("positions") or {}
+    actions = data.get("actions") or []
+    board = data.get("board") or []
+    hero_cards = data.get("hero_cards") or []
+
+    hero_position = (
+        data.get("hero_position")
+        or positions.get(data.get("hero_seat"))
+        or "UNKNOWN"
+    )
+
+    reached = ["PREFLOP"]
+    if len(board) >= 3:
+        reached.append("FLOP")
+    if len(board) >= 4:
+        reached.append("TURN")
+    if len(board) >= 5:
+        reached.append("RIVER")
+
+    unknown_position_seats = [
+        seat
+        for seat in dealt_in
+        if not positions.get(seat)
+        or str(positions.get(seat)).upper() == "UNKNOWN"
+    ]
+
+    low_confidence_actions = [
+        action
+        for action in actions
+        if float(action.get("confidence") or 0.0) < 0.90
+    ]
+
+    warnings = []
+
+    if player_count == 0:
+        warnings.append("No starting players were recorded.")
+
+    if not dealt_in:
+        warnings.append("Starting participant roster was not frozen.")
+
+    if hero_position == "UNKNOWN":
+        warnings.append("Hero position is unknown.")
+
+    if unknown_position_seats:
+        warnings.append(
+            "Missing positions: "
+            + ", ".join(unknown_position_seats)
+        )
+
+    if not Path(archived).exists():
+        warnings.append("History archive was not created.")
+
+    if not CANONICAL_STORE.text_path.exists():
+        warnings.append("current_hand.txt is missing.")
+
+    status = "PASS" if not warnings else "WARN"
+
+    lines = [
+        "=" * 52,
+        "POKER INTELLIGENCE VALIDATION",
+        "=" * 52,
+        "",
+        f"Status: {status}",
+        f"Hand ID: {data.get('hand_id') or 'unknown'}",
+        f"Hero: {hero_position}",
+        f"Cards: {' '.join(hero_cards) if hero_cards else 'unknown'}",
+        f"Board: {' '.join(board) if board else 'none'}",
+        f"Result: {data.get('result') or 'unknown'}",
+        "",
+        "TABLE",
+        "-" * 52,
+        f"Seated players: {player_count}",
+        f"Dealt-in players: {len(dealt_in)}",
+        f"Positions assigned: {len(positions)}",
+        "",
+        "STREETS",
+        "-" * 52,
+        f"Reached: {' -> '.join(reached)}",
+        "",
+        "ACTIONS",
+        "-" * 52,
+        f"Canonical actions: {len(actions)}",
+        f"Low-confidence actions: {len(low_confidence_actions)}",
+        "",
+        "OUTPUT",
+        "-" * 52,
+        f"Current hand: {CANONICAL_STORE.text_path}",
+        f"Archive: {archived}",
+    ]
+
+    if warnings:
+        lines.extend([
+            "",
+            "WARNINGS",
+            "-" * 52,
+        ])
+        lines.extend(
+            f"- {warning}"
+            for warning in warnings
+        )
+
+    lines.extend([
+        "",
+        "=" * 52,
+        "",
+    ])
+
+    VALIDATION_SUMMARY_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    VALIDATION_SUMMARY_PATH.write_text(
+        "\n".join(lines)
+    )
+
+    print(
+        f"[VALIDATION] {status} "
+        f"summary={VALIDATION_SUMMARY_PATH}",
+        flush=True,
+    )
+
+
 def handle_hand_complete(state, event):
     if state["phase"] == "WAITING":
         return state
@@ -416,6 +687,11 @@ def handle_hand_complete(state, event):
     canonical_save(canonical)
 
     archived = CANONICAL_STORE.archive()
+    write_validation_summary(
+        canonical,
+        archived,
+    )
+
     print(f"[ARCHIVE] {archived}")
     print("[STATE] -> COMPLETE", result)
 

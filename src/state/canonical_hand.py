@@ -94,6 +94,7 @@ class CanonicalHand:
         self.hero_position = "unknown"
 
         self.players: Dict[str, CanonicalPlayer] = {}
+        self.dealt_in_seats: List[str] = []
         self.board: List[str] = []
         self.actions: List[CanonicalAction] = []
 
@@ -192,8 +193,12 @@ class CanonicalHand:
         players: List[dict],
         hero_position: str,
         positions: Optional[Dict[str, str]] = None,
+        dealt_in_seats: Optional[List[str]] = None,
     ):
         positions = positions or {}
+
+        if dealt_in_seats is not None:
+            self.dealt_in_seats = list(dealt_in_seats)
 
         self.hero_position = hero_position or self.hero_position
 
@@ -272,6 +277,26 @@ class CanonicalHand:
 
             action.position = player.position
             action.player_name = player.name
+
+        # Rebuild the canonical action queue once authoritative positions
+        # arrive, but only before the first voluntary preflop action.
+        forced_actions = {
+            "POST_ANTE",
+            "POST_SMALL_BLIND",
+            "POST_BIG_BLIND",
+        }
+
+        prior_voluntary_action = any(
+            action.street == "PREFLOP"
+            and action.action not in forced_actions
+            for action in self.actions
+        )
+
+        if (
+            self.current_street == "PREFLOP"
+            and not prior_voluntary_action
+        ):
+            self._initialize_players_to_act()
 
         return self
 
@@ -554,6 +579,10 @@ class CanonicalHand:
                 ),
             )
 
+        hand.dealt_in_seats = list(
+            data.get("dealt_in_seats") or []
+        )
+
         hand.board = list(data.get("board") or [])
 
         hand.actions = [
@@ -623,6 +652,7 @@ class CanonicalHand:
                 seat: player.to_dict()
                 for seat, player in self.players.items()
             },
+            "dealt_in_seats": list(self.dealt_in_seats),
             "board": list(self.board),
             "actions": [action.to_dict() for action in self.actions],
             "current_bet_bb": self.current_bet_bb,

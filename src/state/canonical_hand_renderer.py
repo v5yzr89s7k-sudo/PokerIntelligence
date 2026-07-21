@@ -28,6 +28,12 @@ def format_action(action: CanonicalAction) -> str:
     player = _player_label(action)
     kind = action.action.upper()
 
+    if kind == "POST_ANTE":
+        amount = _format_bb(action.amount_bb)
+        return f"{player} posts ante" + (
+            f" {amount}" if amount else ""
+        )
+
     if kind == "POST_SMALL_BLIND":
         amount = _format_bb(action.amount_bb)
         return f"{player} posts small blind" + (

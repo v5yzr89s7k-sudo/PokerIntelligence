@@ -25,6 +25,7 @@ RAISE = "RAISE"
 VOLUNTARY_COMMIT = "VOLUNTARY_COMMIT"
 
 # Forced posts are canonical poker events, not voluntary bets.
+CANONICAL_POST_ANTE = "POST_ANTE"
 CANONICAL_POST_SMALL_BLIND = "POST_SMALL_BLIND"
 CANONICAL_POST_BIG_BLIND = "POST_BIG_BLIND"
 
@@ -164,6 +165,7 @@ class BettingRoundTracker:
             return []
 
         forced_actions = {
+            CANONICAL_POST_ANTE,
             CANONICAL_POST_SMALL_BLIND,
             CANONICAL_POST_BIG_BLIND,
         }
@@ -476,6 +478,7 @@ class BettingRoundTracker:
         # Advance the queue before recording the observed action so inferred
         # opening folds preserve correct chronological order.
         if canonical_action not in {
+            CANONICAL_POST_ANTE,
             CANONICAL_POST_SMALL_BLIND,
             CANONICAL_POST_BIG_BLIND,
         }:
@@ -485,6 +488,32 @@ class BettingRoundTracker:
                 skipped_seats,
                 ts=item.get("ts"),
             )
+
+        # Mandatory blinds are seeded during hand initialization.
+        # Never duplicate them from later visual inference.
+        if canonical_action in {
+            CANONICAL_POST_ANTE,
+            CANONICAL_POST_SMALL_BLIND,
+            CANONICAL_POST_BIG_BLIND,
+        }:
+            already_recorded = any(
+                existing.seat == seat
+                and existing.street == "PREFLOP"
+                and existing.action == canonical_action
+                for existing in self.hand.actions
+            )
+
+            if already_recorded:
+                self._record_decision(
+                    episode_id,
+                    action_street,
+                    seat,
+                    action,
+                    None,
+                    False,
+                    "forced blind already present",
+                )
+                return None
 
         canonical = self.hand.add_action(
             seat=seat,
@@ -516,6 +545,7 @@ class BettingRoundTracker:
             )
 
         elif canonical_action not in {
+            CANONICAL_POST_ANTE,
             CANONICAL_POST_SMALL_BLIND,
             CANONICAL_POST_BIG_BLIND,
         }:
