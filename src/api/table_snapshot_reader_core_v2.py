@@ -49,6 +49,16 @@ INVALID_PLAYER_NAMES = {
     "SIT OUT",
     "MUCK",
     "SHOW",
+
+    # Physical geometry labels are metadata, never player names.
+    "SEAT_TOP",
+    "SEAT_UPPER_RIGHT",
+    "SEAT_MID_RIGHT",
+    "SEAT_LOWER_RIGHT",
+    "HERO",
+    "SEAT_LOWER_LEFT",
+    "SEAT_MID_LEFT",
+    "SEAT_UPPER_LEFT",
 }
 
 PROMPT_HEADER = """
@@ -478,19 +488,92 @@ def read_table_snapshot_v2(frame):
             for player in partial["players"]
         }
 
+        # Retry unreadable opponent names once using only the failed
+        # physical-seat crops.
+        missing_name_cards = [
+            card
+            for card in changed_cards
+            if card["seat"] != "hero"
+            and not fresh_players[
+                card["seat"]
+            ].get("name")
+        ]
+
+        if missing_name_cards:
+            retry_content, retry_image_bytes = _build_content(
+                missing_name_cards,
+            )
+
+            retry_t0 = perf_counter()
+            retry_response = CLIENT.responses.create(
+                model="gpt-4.1-mini",
+                input=[{
+                    "role": "user",
+                    "content": retry_content,
+                }],
+            )
+            api_ms += (
+                perf_counter() - retry_t0
+            ) * 1000.0
+            image_bytes += retry_image_bytes
+
+            retry_data = _extract_json(
+                retry_response.output_text
+            )
+            retry_partial = _normalize_result(
+                retry_data,
+                missing_name_cards,
+                dealer,
+            )
+
+            print(
+                "[SNAPSHOT_NAME_RETRY]",
+                {
+                    player["seat"]: player.get("name")
+                    for player in retry_partial["players"]
+                },
+                flush=True,
+            )
+
+            for retry_player in retry_partial["players"]:
+                seat = retry_player["seat"]
+
+                if retry_player.get("name"):
+                    fresh_players[seat]["name"] = (
+                        retry_player["name"]
+                    )
+
+                if (
+                    fresh_players[seat].get("stack_bb") is None
+                    and retry_player.get("stack_bb") is not None
+                ):
+                    fresh_players[seat]["stack_bb"] = (
+                        retry_player["stack_bb"]
+                    )
+                    fresh_players[seat]["stack_text"] = (
+                        retry_player["stack_text"]
+                    )
+
         for card in changed_cards:
             player = fresh_players[
                 card["seat"]
             ]
+
+            cache_payload = {
+                "stack_text": player["stack_text"],
+                "stack_bb": player["stack_bb"],
+            }
+
+            # Never persist an unreadable name. This guarantees another
+            # attempt on a future snapshot instead of preserving a blank.
+            if player.get("name"):
+                cache_payload["name"] = player["name"]
+
             cache_update(
                 cache,
                 card["seat"],
                 _cache_fingerprint_image(card),
-                {
-                    "name": player["name"],
-                    "stack_text": player["stack_text"],
-                    "stack_bb": player["stack_bb"],
-                },
+                cache_payload,
             )
 
         save_cache(cache)

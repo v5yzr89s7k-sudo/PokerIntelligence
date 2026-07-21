@@ -1,6 +1,7 @@
 from pathlib import Path
 from time import perf_counter
 import json
+import cv2
 import subprocess
 import sys
 import time
@@ -11,6 +12,8 @@ sys.path.insert(0, str(ROOT))
 from src.api.perception_latency import log as log_latency
 from src.api.position_engine import assign_positions
 from src.api.table_snapshot_reader_core_v2 import read_table_snapshot_v2
+from src.api.canonical_frame import to_canonical_frame
+from src.events.detectors.card_presence import hand_participant_presence
 
 EVENT_LOG = ROOT / "runtime/live/api_events.jsonl"
 CAPTURE_DIR = ROOT / "runtime/window_captures"
@@ -126,7 +129,46 @@ def process_event(event, processed_hero_events):
         frame=str(frame),
     )
 
+    geometry = json.loads(
+        (ROOT / "config/geometry.json").read_text()
+    )
+
+    original = cv2.imread(str(frame))
+
+    if original is None or original.size == 0:
+        print(
+            f"[SNAPSHOT] could not read participant frame: {frame}",
+            flush=True,
+        )
+        dealt_in_seats = []
+    else:
+        canonical = to_canonical_frame(
+            original,
+            geometry,
+        )
+
+        participant_state = hand_participant_presence(
+            canonical,
+            geometry,
+            hero_is_dealt=True,
+        )
+
+        dealt_in_seats = [
+            seat
+            for seat, info in participant_state.items()
+            if info.get("dealt_in")
+        ]
+
+    print(
+        f"[PARTICIPANTS] count={len(dealt_in_seats)} "
+        f"seats={dealt_in_seats}",
+        flush=True,
+    )
+
     snapshot, elapsed_ms = run_snapshot(frame)
+
+    if snapshot:
+        snapshot["dealt_in_seats"] = dealt_in_seats
 
     if not snapshot:
         log_latency(
@@ -140,20 +182,66 @@ def process_event(event, processed_hero_events):
         return
 
     players = snapshot.get("players") or []
+
+    dealt_in = set(
+        snapshot.get("dealt_in_seats") or []
+    )
+
+    hand_players = [
+        player
+        for player in players
+        if player.get("seat") in dealt_in
+    ]
+
     dealer_button_seat = (
         snapshot.get("dealer_button_seat")
         or ""
     )
 
     positions = assign_positions(
-        players,
+        hand_players,
         dealer_button_seat,
+    )
+
+    print(
+        f"[POSITIONS] seated={len(players)} "
+        f"hand={len(hand_players)} "
+        f"hero={positions.get('hero')}",
+        flush=True,
     )
 
     hero_position = (
         positions.get("hero")
         or "unknown"
     )
+
+    print("\n================ SNAPSHOT PLAYER DUMP ================", flush=True)
+    for player in players:
+        print(
+            f"{player.get('seat'):18} "
+            f"name={repr(player.get('name')):24} "
+            f"stack={repr(player.get('stack_text')):12} "
+            f"hero={player.get('is_hero')}",
+            flush=True,
+        )
+
+    print(
+        f"occupied_seats={snapshot.get('occupied_seats')}",
+        flush=True,
+    )
+    print(
+        f"dealt_in_seats={snapshot.get('dealt_in_seats')}",
+        flush=True,
+    )
+    print(
+        f"participant_count={len(snapshot.get('dealt_in_seats') or [])}",
+        flush=True,
+    )
+    print(
+        f"snapshot_count={len(players)}",
+        flush=True,
+    )
+    print("=====================================================\n", flush=True)
 
     log_latency(
         "worker_finished",
@@ -168,6 +256,7 @@ def process_event(event, processed_hero_events):
     emit({
         "type": "table_snapshot",
         "players": players,
+        "dealt_in_seats": snapshot.get("dealt_in_seats", []),
         "dealer_button_seat": dealer_button_seat,
         "positions": positions,
         "hero_position": hero_position,
