@@ -16,6 +16,9 @@ from src.api.position_engine import assign_positions
 from src.api.table_snapshot_reader_core_v2 import read_table_snapshot_v2
 from src.api.canonical_frame import to_canonical_frame
 from src.events.participant_freezer import ParticipantFreezer
+from src.api.snapshot_identity_guard import (
+    validate_unique_player_identities,
+)
 from src.events.participant_evidence_store import (
     PARTICIPANT_EVIDENCE_PATH,
     read_evidence,
@@ -366,6 +369,42 @@ def process_event(event, processed_hero_events):
         f"seats={dealt_in_seats}",
         flush=True,
     )
+
+    # A missing dealt-in seat must remain missing. Never compensate by
+    # reusing or copying another player's identity into that seat.
+    validate_unique_player_identities(players)
+
+    # Seat identities are immutable within one snapshot. Never compensate
+    # for a missing dealt-in seat by reusing another player's record.
+    seen_names = {}
+    duplicate_identities = []
+
+    for player in players:
+        if not isinstance(player, dict):
+            continue
+
+        seat = str(player.get("seat") or "")
+        name = str(player.get("name") or "").strip()
+
+        if not seat or not name:
+            continue
+
+        prior_seat = seen_names.get(name)
+
+        if prior_seat and prior_seat != seat:
+            duplicate_identities.append({
+                "name": name,
+                "first_seat": prior_seat,
+                "duplicate_seat": seat,
+            })
+        else:
+            seen_names[name] = seat
+
+    if duplicate_identities:
+        raise RuntimeError(
+            "snapshot contains duplicated player identity across seats: "
+            f"{duplicate_identities}"
+        )
 
     snapshot, elapsed_ms = run_snapshot(frame)
 
