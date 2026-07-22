@@ -102,17 +102,15 @@ def _append_street_pot(
         return
 
     if opening:
-        lines.append(
-            f"Starting Pot: {_format_bb(summary.starting_pot_bb)}"
-        )
+        value = _format_bb(summary.starting_pot_bb) or "unknown"
+        lines.append(f"Starting Pot: {value}")
         lines.append("")
         return
 
     label = "Ending Pot" if summary.ended_ts is not None else "Current Pot"
     lines.append("")
-    lines.append(
-        f"{label}: {_format_bb(summary.ending_pot_bb)}"
-    )
+    value = _format_bb(summary.ending_pot_bb) or "unknown"
+    lines.append(f"{label}: {value}")
 
 
 def render_canonical_hand(hand: CanonicalHand) -> str:

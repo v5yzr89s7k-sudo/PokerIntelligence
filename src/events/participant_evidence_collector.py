@@ -53,32 +53,12 @@ class ParticipantEvidenceCollector:
             frame_path=frame_path,
         )
 
-        snapshot = self.freezer.snapshot()
-        frame_count = int(
-            snapshot.get("frame_count") or 0
-        )
-
-        # Freeze the process-lifetime collector immediately when the
-        # minimum temporal evidence requirement is satisfied. This keeps
-        # the shared evidence immutable and prevents late seat arrivals
-        # from entering the current hand.
-        if (
-            frame_count >= 6
-            and not snapshot.get("frozen")
-        ):
-            self.freezer.freeze(
-                hero_is_dealt=True,
-                frozen_ts=time(),
-            )
-            snapshot = self.freezer.snapshot()
-
-            print(
-                "[PARTICIPANT_AUTO_FREEZE]",
-                f"frames={snapshot.get('frame_count')}",
-                f"seats={snapshot.get('dealt_in_seats')}",
-                flush=True,
-            )
-
+        # Continue accumulating hand-start card-back evidence until the
+        # coordinator accepts the Hero-card result. Freezing after an
+        # arbitrary frame count can permanently omit seats whose second
+        # card back becomes detectable slightly later.
+        #
+        # PARTICIPANT_COLLECTOR.freeze() is the single freeze point.
         self.publish()
         return self.snapshot()
 

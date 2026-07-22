@@ -370,9 +370,25 @@ def process_event(event, processed_hero_events):
         flush=True,
     )
 
-    # A missing dealt-in seat must remain missing. Never compensate by
-    # reusing or copying another player's identity into that seat.
-    validate_unique_player_identities(players)
+
+    snapshot, elapsed_ms = run_snapshot(frame)
+
+    if snapshot:
+        snapshot["dealt_in_seats"] = dealt_in_seats
+        snapshot["participant_diagnostic"] = participant_diagnostic
+
+    if not snapshot:
+        log_latency(
+            "worker_finished",
+            request_id=request_id,
+            worker="snapshot",
+            hand_token=hand_token,
+            ok=False,
+            elapsed_ms=elapsed_ms,
+        )
+        return
+
+    players = snapshot.get("players") or []
 
     # Seat identities are immutable within one snapshot. Never compensate
     # for a missing dealt-in seat by reusing another player's record.
@@ -406,24 +422,9 @@ def process_event(event, processed_hero_events):
             f"{duplicate_identities}"
         )
 
-    snapshot, elapsed_ms = run_snapshot(frame)
-
-    if snapshot:
-        snapshot["dealt_in_seats"] = dealt_in_seats
-        snapshot["participant_diagnostic"] = participant_diagnostic
-
-    if not snapshot:
-        log_latency(
-            "worker_finished",
-            request_id=request_id,
-            worker="snapshot",
-            hand_token=hand_token,
-            ok=False,
-            elapsed_ms=elapsed_ms,
-        )
-        return
-
-    players = snapshot.get("players") or []
+    # A missing dealt-in seat must remain missing. Never compensate by
+    # reusing or copying another player's identity into that seat.
+    validate_unique_player_identities(players)
 
     dealt_in = set(
         snapshot.get("dealt_in_seats") or []
@@ -498,10 +499,6 @@ def process_event(event, processed_hero_events):
     emit({
         "type": "table_snapshot",
         "players": players,
-        "dealt_in_seats": snapshot.get("dealt_in_seats", []),
-        "dealer_button_seat": dealer_button_seat,
-        "positions": positions,
-        "hero_position": hero_position,
         "confidence": snapshot.get("confidence"),
         "source_request_id": request_id,
         "hand_token": hand_token,

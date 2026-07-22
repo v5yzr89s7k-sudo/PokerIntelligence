@@ -233,7 +233,7 @@ class CanonicalHand:
                 ),
                 current_stack_bb=(
                     existing.current_stack_bb
-                    if existing
+                    if existing and existing.current_stack_bb is not None
                     else (
                         float(stack_bb)
                         if stack_bb is not None
@@ -242,7 +242,7 @@ class CanonicalHand:
                 ),
                 last_confirmed_stack_bb=(
                     existing.last_confirmed_stack_bb
-                    if existing
+                    if existing and existing.last_confirmed_stack_bb is not None
                     else (
                         float(stack_bb)
                         if stack_bb is not None
@@ -483,11 +483,12 @@ class CanonicalHand:
 
         self.expected_pot_bb = round(total, 2)
 
-        # Use deterministic commitments as the live fallback until OCR
-        # confirms an authoritative pot for this street.
+        # Canonical commitment arithmetic drives the live pot continuously.
+        # Pot OCR is corroborating evidence and must not freeze the displayed
+        # pot at an earlier value after new actions are recorded.
         summary = self.street_summaries.get(self.current_street)
 
-        if summary is not None and not summary.pot_observed:
+        if summary is not None:
             summary.ending_pot_bb = self.expected_pot_bb
 
 

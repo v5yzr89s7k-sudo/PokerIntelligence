@@ -200,16 +200,22 @@ def seed_forced_blinds(state, canonical):
     canonical.current_bet_bb = big_blind_bb
     canonical.last_aggressor_seat = None
 
-    # The requested live-hand layout defines Starting Pot as the pot after
-    # mandatory contributions have been posted.
+    # Starting Pot must be available immediately from mandatory
+    # contributions, before the asynchronous observed-pot OCR returns.
+    forced_pot_bb = float(canonical.expected_pot_bb or 0.0)
+
     preflop_summary = canonical.street_summaries.get("PREFLOP")
     if preflop_summary is not None:
-        preflop_summary.starting_pot_bb = float(
-            canonical.pot_bb or 0.0
-        )
-        preflop_summary.ending_pot_bb = float(
-            canonical.pot_bb or 0.0
-        )
+        # This value is derived from the tournament level frozen for this hand:
+        # dealt-in antes + SB + BB. It must be available immediately and must
+        # never temporarily regress to None/unknown.
+        preflop_summary.starting_pot_bb = forced_pot_bb
+        preflop_summary.ending_pot_bb = forced_pot_bb
+
+    # Seed the live pot from deterministic forced contributions. A later
+    # pot_update event may replace this with the authoritative observed pot.
+    if canonical.pot_bb is None:
+        canonical.pot_bb = forced_pot_bb
 
     state["forced_blinds_seeded"] = True
 
@@ -224,17 +230,13 @@ def seed_forced_blinds(state, canonical):
 
 def handle_table_snapshot(state, event):
     players = event.get("players") or []
-    dealt_in_seats = event.get("dealt_in_seats") or []
+    dealt_in_seats = state.get("dealt_in_seats") or []
 
-    dealer_button_seat = event.get("dealer_button_seat") or ""
-    positions = assign_positions(players, dealer_button_seat)
-    hero_position = positions.get("hero") or "unknown"
+    dealer_button_seat = state.get("dealer_button_seat") or ""
+    positions = state.get("positions") or {}
+    hero_position = state.get("hero_position") or "unknown"
 
     state["players"] = players
-    state["dealt_in_seats"] = dealt_in_seats
-    state["dealer_button_seat"] = dealer_button_seat
-    state["positions"] = positions
-    state["hero_position"] = hero_position
 
     if state.get("phase") != "WAITING":
         canonical = canonical_load()
@@ -299,6 +301,51 @@ def handle_table_snapshot(state, event):
 
 
 
+def handle_table_context(state, event):
+    """
+    Accept the coordinator-owned immutable roster and position context.
+
+    The asynchronous table snapshot may later enrich names and starting
+    stacks, but it may not redefine the current hand's participants,
+    dealer, positions, or Hero position.
+    """
+    dealt_in_seats = list(event.get("dealt_in_seats") or [])
+    positions = dict(event.get("positions") or {})
+    dealer_button_seat = event.get("dealer_button_seat") or ""
+    hero_position = event.get("hero_position") or positions.get("hero") or "unknown"
+
+    if not dealt_in_seats:
+        print("[SKIP] table_context has no dealt-in seats", flush=True)
+        return state
+
+    players = [
+        {
+            "seat": seat,
+            "name": seat,
+            "stack_bb": None,
+            "is_hero": seat == "hero",
+            "is_active": True,
+        }
+        for seat in dealt_in_seats
+    ]
+
+    state["players"] = players
+    state["dealt_in_seats"] = dealt_in_seats
+    state["dealer_button_seat"] = dealer_button_seat
+    state["positions"] = positions
+    state["hero_position"] = hero_position
+
+    print(
+        f"[STATE] table_context "
+        f"dealer={dealer_button_seat or 'unknown'} "
+        f"hero_position={hero_position} "
+        f"players={len(dealt_in_seats)}",
+        flush=True,
+    )
+
+    return state
+
+
 def handle_hero_cards(state, event):
     cards = normalize_cards(event.get("hero_cards") or [])
 
@@ -317,7 +364,12 @@ def handle_hero_cards(state, event):
     state["result"] = None
     state["forced_blinds_seeded"] = False
     state["level"] = dict(event.get("level") or {})
-    state["canonical_snapshot_ready"] = False
+    # table_context is the authoritative prerequisite for live poker state.
+    # Snapshot OCR is enrichment only and must not delay the hand.
+    state["canonical_snapshot_ready"] = bool(
+        state.get("dealt_in_seats")
+        and state.get("positions")
+    )
     state["pending_board_events"] = []
 
     canonical = CanonicalHand().start_hand(
@@ -328,6 +380,12 @@ def handle_hero_cards(state, event):
         positions=state.get("positions", {}),
         started_ts=state["hand_started_at"],
     )
+
+    canonical.dealt_in_seats = list(
+        state.get("dealt_in_seats") or []
+    )
+
+    seed_forced_blinds(state, canonical)
     canonical_save(canonical)
 
     state = record_timeline(state, f"hero_cards {' '.join(cards)}")
@@ -370,6 +428,76 @@ def handle_stack_update(state, event):
 
     return state
 
+
+def handle_pot_update(state, event):
+    """
+    Validate an observed ACR pot before allowing it to mutate CanonicalHand.
+
+    The canonical commitment total is authoritative for live publication.
+    OCR remains corroborating evidence and may not overwrite the hand when it
+    materially conflicts with recorded actions.
+    """
+    if state.get("phase") == "WAITING":
+        print("[SKIP] pot_update while waiting")
+        return state
+
+    pot_bb = event.get("pot_bb")
+
+    if pot_bb is None:
+        print("[SKIP] invalid pot_update", event)
+        return state
+
+    try:
+        observed = round(float(pot_bb), 2)
+    except (TypeError, ValueError):
+        print("[SKIP] invalid pot_update", event)
+        return state
+
+    if not 0.1 <= observed <= 1000.0:
+        print(f"[SKIP] out-of-range pot_update pot={observed}")
+        return state
+
+    canonical = canonical_load()
+    expected = canonical.expected_pot_bb
+
+    # Without a canonical commitment total, preserve the observation only in
+    # logs. Do not publish an unvalidated OCR value into current_hand.txt.
+    if expected is None:
+        print(
+            f"[POT_REJECTED] observed={observed:.2f} "
+            "expected=unknown reason=no_canonical_commitment_total",
+            flush=True,
+        )
+        return state
+
+    expected = round(float(expected), 2)
+    difference = round(observed - expected, 2)
+
+    # Allow only small OCR/rounding variance. Materially conflicting readings
+    # remain diagnostic observations and cannot mutate CanonicalHand.
+    tolerance_bb = 0.25
+
+    if abs(difference) > tolerance_bb:
+        print(
+            f"[POT_REJECTED] observed={observed:.2f} "
+            f"expected={expected:.2f} "
+            f"difference={difference:.2f} "
+            "reason=inconsistent_with_canonical_commitments",
+            flush=True,
+        )
+        return state
+
+    accepted = canonical.set_observed_pot(observed)
+    canonical_save(canonical)
+
+    print(
+        f"[CANONICAL_POT] accepted={accepted:.2f} "
+        f"expected={expected:.2f} "
+        f"difference={difference:.2f}",
+        flush=True,
+    )
+
+    return state
 
 def handle_board(state, event):
     board = normalize_cards(event.get("board") or [])
@@ -701,11 +829,17 @@ def handle_hand_complete(state, event):
 def handle_event(state, event):
     t = event.get("type")
 
+    if t == "table_context":
+        return handle_table_context(state, event)
+
     if t == "table_snapshot":
         return handle_table_snapshot(state, event)
 
     if t == "stack_update":
         return handle_stack_update(state, event)
+
+    if t == "pot_update":
+        return handle_pot_update(state, event)
 
     if t == "hero_cards":
         return handle_hero_cards(state, event)

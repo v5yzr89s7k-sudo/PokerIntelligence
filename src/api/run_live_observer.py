@@ -24,6 +24,8 @@ def reset_runtime():
     (LIVE / "board_results.jsonl").write_text("")
     (LIVE / "hero_requests.jsonl").write_text("")
     (LIVE / "hero_results.jsonl").write_text("")
+    (LIVE / "pot_requests.jsonl").write_text("")
+    (LIVE / "pot_results.jsonl").write_text("")
     (LIVE / "perception_latency.jsonl").write_text("")
     (LIVE / "participant_evidence.json").write_text("{}\n")
 
@@ -155,6 +157,7 @@ def stop_all(*_):
     terminate_process("snapshot_worker")
     terminate_process("board_worker")
     terminate_process("hero_worker")
+    terminate_process("pot_worker")
 
     # Leave the state machine alive until all durable events are consumed.
     drain_state_machine()
@@ -177,6 +180,7 @@ start("state_machine", ["src/api/api_event_state_machine.py"])
 start("snapshot_worker", ["src/api/api_snapshot_worker.py"])
 start("board_worker", ["src/api/api_board_worker.py"])
 start("hero_worker", ["src/api/api_hero_worker.py"])
+start("pot_worker", ["src/api/api_pot_worker.py"])
 time.sleep(0.5)
 start("coordinator", ["src/api/api_event_coordinator.py"])
 

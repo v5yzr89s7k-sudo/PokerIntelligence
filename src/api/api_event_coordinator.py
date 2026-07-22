@@ -31,6 +31,8 @@ from src.vision.window_capture import find_acr_table_window, capture_window_crop
 from src.api.canonical_frame import to_canonical_frame
 from src.vision.action_sequence_recorder import ActionSequenceRecorder
 from src.vision.stack_reader import read_stack
+from src.vision.dealer_detector import detect_dealer_button
+from src.api.position_engine import assign_positions
 
 CAPTURE = ROOT / "src/vision/window_capture.py"
 CAPTURE_DIR = ROOT / "runtime/window_captures"
@@ -80,6 +82,8 @@ COORD_STATE = ROOT / "runtime/live/api_event_coordinator_state.json"
 STATE_MACHINE_STATE = (
     ROOT / "runtime/live/api_event_state_machine_state.json"
 )
+
+TABLE_CONTEXT_CACHE = ROOT / "runtime/live/table_context.json"
 CANONICAL_HAND_JSON = ROOT / "runtime/live/canonical_hand.json"
 OBS_LOG = ROOT / "runtime/live/local_observations.jsonl"
 TIMELINE_JSON = ROOT / "runtime/live/current_observation_timeline.json"
@@ -90,6 +94,8 @@ BOARD_REQUESTS = ROOT / "runtime/live/board_requests.jsonl"
 BOARD_RESULTS = ROOT / "runtime/live/board_results.jsonl"
 HERO_REQUESTS = ROOT / "runtime/live/hero_requests.jsonl"
 HERO_RESULTS = ROOT / "runtime/live/hero_results.jsonl"
+POT_REQUESTS = ROOT / "runtime/live/pot_requests.jsonl"
+POT_RESULTS = ROOT / "runtime/live/pot_results.jsonl"
 EVENT_LOG.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -113,6 +119,9 @@ def fresh_state():
         "hero_request_id": None,
         "hero_request_token": None,
         "hero_request_ts": None,
+        "pot_request_id": None,
+        "pot_request_ts": None,
+        "initial_pot_queued": False,
         "last_local_board_count": 0,
         "last_local_hero_visible": False,
         "pending_stack_reads": {},
@@ -246,6 +255,15 @@ def enrich_stack_change_measurements(changes, img, state):
         )
 
         entry["last_change_ts"] = now
+
+        # If the stack transition began before Hero cards completed,
+        # promote the transition to the current street as soon as the
+        # hand becomes active.
+        if (
+            entry.get("origin_street") == "WAITING"
+            and state.get("phase") != "WAITING"
+        ):
+            entry["origin_street"] = state.get("phase")
 
         mean_diff = float(
             (raw_details.get(seat) or {}).get("mean_diff")
@@ -538,6 +556,26 @@ def load_table_context():
         "hand_started_at": None,
     }
 
+    if TABLE_CONTEXT_CACHE.exists():
+        try:
+            cached = json.loads(
+                TABLE_CONTEXT_CACHE.read_text()
+            )
+
+            context["hero_position"] = (
+                cached.get("hero_position")
+                or context["hero_position"]
+            )
+            context["dealer_button_seat"] = (
+                cached.get("dealer_button_seat")
+                or context["dealer_button_seat"]
+            )
+            context["positions"] = dict(
+                cached.get("positions") or {}
+            )
+        except Exception:
+            pass
+
     if not STATE_MACHINE_STATE.exists():
         return context
 
@@ -579,11 +617,22 @@ def emit(event):
     event["ts"] = time.time()
     EVENT_LOG.open("a").write(json.dumps(event) + "\n")
 
+    if event.get("type") == "table_context":
+        TABLE_CONTEXT_CACHE.write_text(
+            json.dumps(event, indent=2)
+        )
+
     kind = event.get("type")
     if kind == "hero_cards":
         print(f"[HAND] Hero cards: {' '.join(event.get('hero_cards') or [])}")
     elif kind == "table_snapshot":
         print(f"[HAND] Table snapshot: players={len(event.get('players') or [])} dealer={event.get('dealer_button_seat') or 'unknown'} hero_position={event.get('hero_position') or 'unknown'}")
+    elif kind == "table_context":
+        print(
+            f"[CONTEXT] hero_position={event.get('hero_position','unknown')} "
+            f"dealer={event.get('dealer_button_seat') or 'unknown'} "
+            f"seats={len(event.get('dealt_in_seats') or [])}"
+        )
     elif kind == "hero_decision":
         print("[ACTION] Hero to act")
     elif kind == "hero_action_complete":
@@ -793,21 +842,29 @@ def maybe_emit_hero_decision(state, visible, hero_visible):
 
 def queue_hero_request(state, frame):
     request_id = uuid.uuid4().hex
-    hand_token = uuid.uuid4().hex
-
     queued_ts = time.time()
 
-    # Begin a fresh immutable-roster evidence window immediately when the
-    # hand token is created, before the asynchronous Hero API call returns.
-    PARTICIPANT_COLLECTOR.reset(
-        hand_token=hand_token,
-        started_ts=queued_ts,
+    # Prefer the provisional token created on first local Hero-card
+    # visibility. Only create/reset here as a fallback when local hand-start
+    # detection did not fire.
+    hand_token = str(
+        state.get("hand_token") or uuid.uuid4().hex
     )
 
-    # Make the token available to the live capture loop immediately.
-    # Otherwise participant frames are ignored while the Hero worker runs.
+    if PARTICIPANT_COLLECTOR.hand_token != hand_token:
+        PARTICIPANT_COLLECTOR.reset(
+            hand_token=hand_token,
+            started_ts=(
+                state.get("hand_started_at")
+                or queued_ts
+            ),
+        )
+
     state["hand_token"] = hand_token
-    state["hand_started_at"] = queued_ts
+    state.setdefault(
+        "hand_started_at",
+        queued_ts,
+    )
 
     append_jsonl(HERO_REQUESTS, {
         "type": "hero_request",
@@ -982,6 +1039,31 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
             f"seats={frozen_participants}",
             flush=True,
         )
+
+        dealer = detect_dealer_button(
+            result["canonical_frame"]
+        )
+
+        position_players = [
+            {"seat": seat}
+            for seat in frozen_participants
+        ]
+
+        positions = assign_positions(
+            position_players,
+            dealer["dealer_button_seat"],
+        )
+
+        emit({
+            "type": "table_context",
+            "dealer_button_seat": dealer["dealer_button_seat"],
+            "dealt_in_seats": frozen_participants,
+            "positions": positions,
+            "hero_position": positions.get(
+                "hero",
+                "unknown",
+            ),
+        })
 
         emit({
             "type": "hero_cards",
@@ -1202,6 +1284,118 @@ def maybe_read_board(state, count, frame):
     return queue_board_request(state, expected_next, frame)
 
 
+def queue_pot_request(state, frame):
+    if frame is None:
+        return state
+
+    request_id = uuid.uuid4().hex
+
+    append_jsonl(POT_REQUESTS, {
+        "type": "pot_request",
+        "request_id": request_id,
+        "hand_token": state.get("hand_token"),
+        "frame": str(frame),
+        "ts": time.time(),
+    })
+
+    state["pot_request_id"] = request_id
+    state["pot_request_ts"] = time.time()
+
+    log_latency(
+        "queued",
+        request_id=request_id,
+        worker="pot",
+        hand_token=state.get("hand_token"),
+        frame=str(frame),
+    )
+
+    print(f"[POT] queued request={request_id[:8]}", flush=True)
+    return state
+
+
+def find_pot_result(request_id):
+    if not request_id or not POT_RESULTS.exists():
+        return None
+
+    try:
+        lines = POT_RESULTS.read_text().splitlines()
+    except Exception:
+        return None
+
+    for line in reversed(lines):
+        try:
+            result = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        if result.get("request_id") == request_id:
+            return result
+
+    return None
+
+
+def apply_pot_result(state, result):
+    request_id = state.get("pot_request_id")
+
+    if result.get("request_id") != request_id:
+        return state, False
+
+    state["pot_request_id"] = None
+    state["pot_request_ts"] = None
+
+    result_token = result.get("hand_token")
+    current_token = state.get("hand_token")
+
+    if result_token and current_token and result_token != current_token:
+        print("[POT] ignored stale result from another hand", flush=True)
+        return state, False
+
+    log_latency(
+        "coordinator_consumed",
+        request_id=request_id,
+        worker="pot",
+        ok=result.get("ok"),
+        elapsed_ms=result.get("elapsed_ms"),
+    )
+
+    if not result.get("ok"):
+        print(
+            f"[POT] worker result failed "
+            f"error={result.get('error') or 'unknown'} "
+            f"raw={result.get('raw_text')!r}",
+            flush=True,
+        )
+        return state, False
+
+    pot_bb = result.get("pot_bb")
+
+    try:
+        pot_bb = float(pot_bb)
+    except (TypeError, ValueError):
+        print(f"[POT] invalid result pot={pot_bb!r}", flush=True)
+        return state, False
+
+    if not 0.1 <= pot_bb <= 1000.0:
+        print(f"[POT] out-of-range result pot={pot_bb}", flush=True)
+        return state, False
+
+    emit({
+        "type": "pot_update",
+        "pot_bb": round(pot_bb, 2),
+        "raw_text": result.get("raw_text"),
+        "source_request_id": request_id,
+        "confidence": result.get("confidence"),
+    })
+
+    print(
+        f"[POT] observed={pot_bb:.2f} BB "
+        f"raw={result.get('raw_text')!r}",
+        flush=True,
+    )
+
+    return state, True
+
+
 def consume_ready_worker_results(state):
     """
     Consume completed worker results before performing another expensive
@@ -1231,6 +1425,14 @@ def consume_ready_worker_results(state):
             consumed = True
 
             if before_phase == "WAITING" and state.get("phase") != "WAITING":
+                # Queue the initial pot read immediately after the hand
+                # becomes active so current_hand.txt has a starting pot
+                # before the first betting round completes.
+                if state.get("pot_request_id") is None:
+                    latest = latest_capture()
+                    if latest is not None:
+                        state = queue_pot_request(state, latest)
+
                 save_state(state)
                 return state, True, False
 
@@ -1253,6 +1455,18 @@ def consume_ready_worker_results(state):
             state, board_emitted = apply_board_result(
                 state,
                 board_result,
+            )
+            consumed = True
+
+    pot_request_id = state.get("pot_request_id")
+
+    if pot_request_id:
+        pot_result = find_pot_result(pot_request_id)
+
+        if pot_result is not None:
+            state, pot_emitted = apply_pot_result(
+                state,
+                pot_result,
             )
             consumed = True
 
@@ -1457,6 +1671,45 @@ def main():
 
         changes = local_detector.detect(img)
 
+        # Hero cards appear at the deal, before any player can act.
+        # Start participant evidence immediately instead of waiting for
+        # Hero API request stability. This preserves early-position players
+        # who may fold before the asynchronous Hero reader completes.
+        local_hero_visible = bool(
+            getattr(changes, "hero_cards_visible", False)
+            or getattr(changes, "hero_visible", False)
+        )
+
+        if (
+            state.get("phase") == "WAITING"
+            and local_hero_visible
+            and not state.get("hand_token")
+        ):
+            provisional_hand_token = uuid.uuid4().hex
+            provisional_started_ts = time.time()
+
+            state["hand_token"] = provisional_hand_token
+            state["hand_started_at"] = provisional_started_ts
+
+            PARTICIPANT_COLLECTOR.reset(
+                hand_token=provisional_hand_token,
+                started_ts=provisional_started_ts,
+            )
+
+            print(
+                "[HAND_START_LOCAL] "
+                f"token={provisional_hand_token[:8]} "
+                "source=hero_cards_visible",
+                flush=True,
+            )
+
+            # Include the same frame that triggered local hand start.
+            collect_participant_evidence(
+                img,
+                frame,
+                state,
+            )
+
         enrich_stack_change_measurements(
             changes,
             img,
@@ -1464,6 +1717,36 @@ def main():
         )
 
         log_observation(changes)
+
+        # Queue the first pot read as soon as the state machine has
+        # initialized CanonicalHand from the authoritative table snapshot.
+        # Do not wait for a later visual pot-change transition.
+        state_machine_state = {}
+
+        if STATE_MACHINE_STATE.exists():
+            try:
+                state_machine_state = json.loads(
+                    STATE_MACHINE_STATE.read_text()
+                )
+            except Exception:
+                state_machine_state = {}
+
+        if (
+            state.get("phase") != "WAITING"
+            and state_machine_state.get("canonical_snapshot_ready")
+            and not state.get("initial_pot_queued")
+            and state.get("pot_request_id") is None
+        ):
+            state = queue_pot_request(state, frame)
+            state["initial_pot_queued"] = True
+            print("[POT] initial canonical request queued", flush=True)
+
+        if (
+            state.get("phase") != "WAITING"
+            and bool(getattr(changes, "pot_changed", False))
+            and state.get("pot_request_id") is None
+        ):
+            state = queue_pot_request(state, frame)
 
         sequence_recorder.record(
             frame=img,
