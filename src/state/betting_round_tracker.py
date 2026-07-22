@@ -145,39 +145,26 @@ class BettingRoundTracker:
 
         return skipped
 
-    def _infer_opening_preflop_folds(
+    def _infer_skipped_actions(
         self,
         skipped_seats: List[str],
         ts=None,
     ) -> List[CanonicalAction]:
         """
-        Infer folds only for seats skipped before the first voluntary
-        preflop action.
+        Resolve seats skipped before an observed actor.
 
-        This intentionally does not infer later preflop gaps or postflop
-        gaps. Postflop skipped players may have checked, and later gaps may
-        require additional betting-state context.
+        Preflop skipped seats fold. Postflop skipped seats check when no
+        voluntary bet is open, otherwise they fold.
         """
-        if (
-            self.hand.current_street != "PREFLOP"
-            or not skipped_seats
-        ):
+        if not skipped_seats:
             return []
 
-        forced_actions = {
-            CANONICAL_POST_ANTE,
-            CANONICAL_POST_SMALL_BLIND,
-            CANONICAL_POST_BIG_BLIND,
-        }
-
-        prior_voluntary_action = any(
-            action.street == "PREFLOP"
-            and action.action not in forced_actions
-            for action in self.hand.actions
+        street = self.hand.current_street
+        passive_action = (
+            "CHECK"
+            if street != "PREFLOP" and not self.has_open_bet
+            else "FOLD"
         )
-
-        if prior_voluntary_action:
-            return []
 
         inferred = []
 
@@ -195,14 +182,24 @@ class BettingRoundTracker:
             inferred.append(
                 self.hand.add_action(
                     seat=skipped_seat,
-                    action="FOLD",
+                    action=passive_action,
                     confidence=0.90,
-                    source="passive_inference",
+                    source="action_order_inference",
                     evidence=[
-                        "skipped_before_first_preflop_action",
+                        "seat_skipped_before_observed_actor",
+                        (
+                            "no_open_postflop_bet"
+                            if passive_action == "CHECK"
+                            else "action_required_but_no_commitment_observed"
+                        ),
                     ],
                     ts=ts,
                 )
+            )
+
+            self.commitment_tracker.record_response(
+                street,
+                skipped_seat,
             )
 
         return inferred
@@ -484,7 +481,7 @@ class BettingRoundTracker:
         }:
             skipped_seats = self._consume_action_queue(seat)
 
-            self._infer_opening_preflop_folds(
+            self._infer_skipped_actions(
                 skipped_seats,
                 ts=item.get("ts"),
             )
