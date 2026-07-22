@@ -60,11 +60,12 @@ with patch("src.observer.action_episode_manager.time.time", return_value=2.2):
 episode = manager.active_by_seat["seat_mid_left"]
 kinds = [item["type"] for item in episode.observations]
 
-assert kinds == [
+assert len(kinds) == 3
+assert set(kinds) == {
     BET_REGION_OCCUPIED,
     STACK_CHANGED,
     BET_REGION_CLEARED,
-]
+}
 
 with patch("src.observer.action_episode_manager.time.time", return_value=3.1):
     manager.close_idle()

@@ -33,7 +33,13 @@ class ActionEpisode:
     def add(self, observation):
         item = observation.to_dict()
         self.observations.append(item)
-        self.updated_ts = item["ts"]
+
+        # Late evidence may have been captured before the observation that
+        # opened the episode. Never move the episode clock backward.
+        self.updated_ts = max(
+            float(self.updated_ts),
+            float(item["ts"]),
+        )
 
         if item.get("type") == BET_REGION_CLEARED:
             self.pending_close_ts = item["ts"]
@@ -107,6 +113,38 @@ class ActionEpisodeManager:
     def set_table_context(self, context):
         self.table_context = deepcopy(context or {})
 
+    def _normalize_pending_waiting_street(self, context):
+        """
+        Reclassify pending stack observations captured before the asynchronous
+        snapshot initialized the canonical hand.
+
+        The original detector street remains available in
+        payload["origin_street"] for diagnostics.
+        """
+        phase = str((context or {}).get("phase") or "").upper()
+
+        if phase != "PREFLOP":
+            return 0
+
+        normalized = 0
+
+        for observation in self.pending_stack_by_seat.values():
+            street = str(observation.street or "unknown").upper()
+
+            if street != "WAITING":
+                continue
+
+            observation.street = "PREFLOP"
+            normalized += 1
+
+            print(
+                f"[EPISODE] normalize_pending_stack "
+                f"seat={observation.seat} WAITING->PREFLOP",
+                flush=True,
+            )
+
+        return normalized
+
     def backfill_table_context(self, context):
         """
         Enrich active and closed episodes from the current hand when the
@@ -118,6 +156,8 @@ class ActionEpisodeManager:
 
         if hand_started_at is None or not positions:
             return 0
+
+        self._normalize_pending_waiting_street(context)
 
         updated = 0
 
@@ -165,6 +205,11 @@ class ActionEpisodeManager:
             self.pending_stack_by_seat.pop(seat, None)
 
     def _cache_pending_stack(self, observation):
+        print(
+            f"[EPISODE] cache_pending_stack seat={observation.seat} "
+            f"street={observation.street} ts={observation.ts:.3f}",
+            flush=True,
+        )
         self.pending_stack_by_seat[
             observation.seat or "table"
         ] = observation
@@ -199,6 +244,12 @@ class ActionEpisodeManager:
             if BET_REGION_OCCUPIED not in kinds:
                 continue
 
+            print(
+                f"[EPISODE] attach_late_stack "
+                f"episode={episode.episode_id} "
+                f"seat={seat} street={street}",
+                flush=True,
+            )
             episode.add(observation)
             return True
 
@@ -225,6 +276,11 @@ class ActionEpisodeManager:
                 )
             return None
 
+        print(
+            f"[EPISODE] consume_pending_stack "
+            f"seat={seat} street={street}",
+            flush=True,
+        )
         self.pending_stack_by_seat.pop(
             seat,
             None,
