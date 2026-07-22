@@ -50,10 +50,11 @@ class CanonicalPlayer:
 @dataclass
 class StreetSummary:
     street: str
-    starting_pot_bb: float = 0.0
-    ending_pot_bb: float = 0.0
+    starting_pot_bb: Optional[float] = None
+    ending_pot_bb: Optional[float] = None
     started_ts: Optional[float] = None
     ended_ts: Optional[float] = None
+    pot_observed: bool = False
 
     def to_dict(self):
         return asdict(self)
@@ -100,6 +101,7 @@ class CanonicalHand:
 
         self.current_bet_bb = 0.0
         self.pot_bb: Optional[float] = None
+        self.expected_pot_bb: Optional[float] = None
         self.last_aggressor_seat: Optional[str] = None
         self.players_to_act: List[str] = []
 
@@ -365,14 +367,23 @@ class CanonicalHand:
             previous_summary = self.street_summaries.get(previous_street)
 
             if previous_summary is not None:
-                previous_summary.ending_pot_bb = float(self.pot_bb or 0.0)
                 previous_summary.ended_ts = transition_ts
 
             if next_street in ("FLOP", "TURN", "RIVER"):
+                start_pot = (
+                    previous_summary.ending_pot_bb
+                    if previous_summary is not None
+                    else None
+                )
+
                 self.street_summaries[next_street] = StreetSummary(
                     street=next_street,
-                    starting_pot_bb=float(self.pot_bb or 0.0),
-                    ending_pot_bb=float(self.pot_bb or 0.0),
+                    starting_pot_bb=start_pot,
+
+                    # A newly opened street initially contains the same pot
+                    # carried forward from the prior street. Canonical actions
+                    # or a later observed-pot update may increase or replace it.
+                    ending_pot_bb=start_pot,
                     started_ts=transition_ts,
                 )
 
@@ -451,23 +462,16 @@ class CanonicalHand:
 
             player.committed_by_street[self.current_street] = committed
 
-            self._recompute_pot_bb()
-
-            summary = self.street_summaries.get(self.current_street)
-            if summary is not None:
-                summary.ending_pot_bb = float(self.pot_bb or 0.0)
+            self._recompute_expected_pot_bb()
 
         return item
 
-    def _recompute_pot_bb(self):
+    def _recompute_expected_pot_bb(self):
         """
-        Canonical pot reconstruction.
+        Reconstruct the expected pot from canonical commitments.
 
-        The pot is defined as the total chips committed by every player
-        across every completed and current betting street.
-
-        This is the authoritative live pot. OCR pot detection is used
-        only as validation, never as the source of truth.
+        The displayed Total value read from ACR remains authoritative in
+        pot_bb. This reconstructed value is retained only for validation.
         """
         total = 0.0
 
@@ -477,8 +481,30 @@ class CanonicalHand:
                 for v in player.committed_by_street.values()
             )
 
-        self.pot_bb = round(total, 2)
+        self.expected_pot_bb = round(total, 2)
 
+        # Use deterministic commitments as the live fallback until OCR
+        # confirms an authoritative pot for this street.
+        summary = self.street_summaries.get(self.current_street)
+
+        if summary is not None and not summary.pot_observed:
+            summary.ending_pot_bb = self.expected_pot_bb
+
+
+    def set_observed_pot(self, pot_bb: float) -> float:
+        value = round(float(pot_bb), 2)
+
+        if value < 0.0:
+            raise ValueError("Observed pot cannot be negative")
+
+        self.pot_bb = value
+
+        summary = self.street_summaries.get(self.current_street)
+        if summary is not None:
+            summary.ending_pot_bb = value
+            summary.pot_observed = True
+
+        return value
 
     def add_showdown(
         self,
@@ -494,7 +520,6 @@ class CanonicalHand:
             summary = self.street_summaries.get(self.current_street)
 
             if summary is not None and summary.ended_ts is None:
-                summary.ending_pot_bb = float(self.pot_bb or 0.0)
                 summary.ended_ts = showdown_ts
 
         self.showdown.append({
@@ -526,7 +551,6 @@ class CanonicalHand:
 
         summary = self.street_summaries.get(self.current_street)
         if summary is not None:
-            summary.ending_pot_bb = float(self.pot_bb or 0.0)
             summary.ended_ts = self.ended_ts
 
         self.current_street = "COMPLETE"
@@ -606,6 +630,7 @@ class CanonicalHand:
 
         hand.current_bet_bb = float(data.get("current_bet_bb") or 0.0)
         hand.pot_bb = data.get("pot_bb")
+        hand.expected_pot_bb = data.get("expected_pot_bb")
         hand.last_aggressor_seat = data.get("last_aggressor_seat")
         hand.players_to_act = list(data.get("players_to_act") or [])
 
@@ -614,14 +639,19 @@ class CanonicalHand:
         for street, item in (data.get("street_summaries") or {}).items():
             hand.street_summaries[street] = StreetSummary(
                 street=item.get("street") or street,
-                starting_pot_bb=float(
-                    item.get("starting_pot_bb") or 0.0
+                starting_pot_bb=(
+                    float(item["starting_pot_bb"])
+                    if item.get("starting_pot_bb") is not None
+                    else None
                 ),
-                ending_pot_bb=float(
-                    item.get("ending_pot_bb") or 0.0
+                ending_pot_bb=(
+                    float(item["ending_pot_bb"])
+                    if item.get("ending_pot_bb") is not None
+                    else None
                 ),
                 started_ts=item.get("started_ts"),
                 ended_ts=item.get("ended_ts"),
+                pot_observed=bool(item.get("pot_observed", False)),
             )
 
         hand.showdown = list(data.get("showdown") or [])
@@ -657,6 +687,7 @@ class CanonicalHand:
             "actions": [action.to_dict() for action in self.actions],
             "current_bet_bb": self.current_bet_bb,
             "pot_bb": self.pot_bb,
+            "expected_pot_bb": self.expected_pot_bb,
             "last_aggressor_seat": self.last_aggressor_seat,
             "players_to_act": list(self.players_to_act),
             "street_summaries": {
