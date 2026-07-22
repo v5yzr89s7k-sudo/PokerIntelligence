@@ -499,6 +499,9 @@ def process_event(event, processed_hero_events):
     emit({
         "type": "table_snapshot",
         "players": players,
+        "dealt_in_seats": list(
+            snapshot.get("dealt_in_seats") or []
+        ),
         "confidence": snapshot.get("confidence"),
         "source_request_id": request_id,
         "hand_token": hand_token,

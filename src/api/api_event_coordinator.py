@@ -33,6 +33,11 @@ from src.vision.action_sequence_recorder import ActionSequenceRecorder
 from src.vision.stack_reader import read_stack
 from src.vision.dealer_detector import detect_dealer_button
 from src.api.position_engine import assign_positions
+from src.api.stack_transition_validator import (
+    ACCEPT as STACK_ACCEPT,
+    REJECT as STACK_REJECT,
+    validate_stack_transition,
+)
 
 CAPTURE = ROOT / "src/vision/window_capture.py"
 CAPTURE_DIR = ROOT / "runtime/window_captures"
@@ -200,7 +205,14 @@ def _canonical_stack_values():
     return values
 
 
-def enrich_stack_change_measurements(changes, img, state):
+def enrich_stack_change_measurements(
+    changes,
+    img,
+    state,
+    *,
+    prior_occupied_bet_regions=None,
+    prior_commitment_seats=None,
+):
     """
     Convert noisy stack-region movement into one settled quantitative
     transition.
@@ -212,6 +224,13 @@ def enrich_stack_change_measurements(changes, img, state):
     now = time.time()
     settle_seconds = 0.45
     minimum_delta_bb = 0.05
+
+    prior_occupied_bet_regions = set(
+        prior_occupied_bet_regions or []
+    )
+    prior_commitment_seats = set(
+        prior_commitment_seats or []
+    )
 
     # Quantitative stack transitions must be supported by at least two
     # agreeing OCR variants. Single-variant reads are too unstable to
@@ -456,23 +475,59 @@ def enrich_stack_change_measurements(changes, img, state):
             )
             continue
 
-        # Zero is frequently produced when chips, cards, animations, or
-        # table transitions obscure the stack text. Until an independent
-        # all-in signal is available, zero must never mutate the baseline.
-        if float(current) <= 0.0:
-            pending.pop(seat, None)
+        previous = float(previous)
+        current = float(current)
+
+        has_commitment_evidence = bool(
+            seat in prior_occupied_bet_regions
+            or seat in prior_commitment_seats
+        )
+
+        validation = validate_stack_transition(
+            previous,
+            current,
+            confidence=confidence,
+            votes=votes,
+            phase=state.get("phase", "WAITING"),
+            has_commitment_evidence=has_commitment_evidence,
+            # No independent all-in detector exists yet.
+            all_in_confirmed=False,
+            minimum_confidence=minimum_confidence,
+            minimum_votes=minimum_votes,
+        )
+
+        if validation.decision != STACK_ACCEPT:
+            attempts = int(entry.get("validation_attempts") or 0) + 1
+            entry["validation_attempts"] = attempts
+
+            pending_age = (
+                now - float(entry.get("first_change_ts") or now)
+            )
+
+            retrying = bool(
+                validation.decision != STACK_REJECT
+                and attempts < maximum_ocr_attempts
+                and pending_age < maximum_pending_seconds
+            )
+
+            if not retrying:
+                pending.pop(seat, None)
+
             print(
-                f"[STACK_SETTLE_SKIP] seat={seat} "
-                f"reason=zero_without_all_in_confirmation "
-                f"confidence={confidence:.2f} "
-                f"votes={votes}",
+                f"[STACK_VALIDATE] seat={seat} "
+                f"decision={validation.decision} "
+                f"reason={validation.reason} "
+                f"previous={previous:.2f} "
+                f"current={current:.2f} "
+                f"delta={validation.delta_bb:.2f} "
+                f"commitment_evidence={has_commitment_evidence} "
+                f"attempt={attempts} "
+                f"retrying={retrying}",
                 flush=True,
             )
             continue
 
-        previous = float(previous)
-        current = float(current)
-        delta = round(previous - current, 2)
+        delta = validation.delta_bb
 
         # Zero deltas are visual noise. Negative deltas represent chips
         # returning to the stack or an OCR disagreement, not a wager.
@@ -1054,8 +1109,105 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
             dealer["dealer_button_seat"],
         )
 
+        # Seed the fast table context with local stack OCR from the same
+        # canonical Hero-card frame. GPT remains deferred name enrichment.
+        local_players = []
+        canonical_frame_path = result.get("canonical_frame")
+        canonical_image = (
+            cv2.imread(str(canonical_frame_path))
+            if canonical_frame_path
+            else None
+        )
+
+        if canonical_image is not None:
+            canonical_image = cv2.resize(
+                canonical_image,
+                (934, 696),
+            )
+
+        for seat in frozen_participants:
+            stack_result = {
+                "stack_bb": None,
+                "stack_text": "",
+                "confidence": 0.0,
+                "mode": "unavailable",
+            }
+
+            region = (GEOM.get("stack_regions") or {}).get(seat)
+
+            if canonical_image is not None and region:
+                stack_crop = _crop_geometry_region(
+                    canonical_image,
+                    region,
+                )
+
+                if stack_crop is not None and stack_crop.size:
+                    try:
+                        stack_result = read_stack(stack_crop)
+                    except Exception as exc:
+                        print(
+                            f"[LOCAL_STACK] seat={seat} "
+                            f"failed={type(exc).__name__}: {exc}",
+                            flush=True,
+                        )
+
+            stack_bb = stack_result.get("stack_bb")
+            confidence = float(
+                stack_result.get("confidence") or 0.0
+            )
+            votes = int(
+                stack_result.get("votes") or 0
+            )
+
+            trusted = (
+                stack_bb is not None
+                and float(stack_bb) > 0.0
+                and confidence >= 0.95
+                and votes >= 2
+            )
+
+            local_players.append({
+                "seat": seat,
+                "name": "",
+                "stack_bb": (
+                    float(stack_bb)
+                    if trusted
+                    else None
+                ),
+                "stack_text": (
+                    str(stack_result.get("stack_text") or "")
+                    if trusted
+                    else ""
+                ),
+                "stack_confidence": confidence,
+                "stack_read_mode": stack_result.get(
+                    "mode",
+                    "unknown",
+                ),
+                "is_hero": seat == "hero",
+                "is_active": True,
+            })
+
+            print(
+                f"[LOCAL_STACK] seat={seat} "
+                f"stack={stack_bb if trusted else None} "
+                f"confidence={confidence:.2f} "
+                f"votes={votes} "
+                f"trusted={trusted}",
+                flush=True,
+            )
+
+        participant_evidence = (
+            PARTICIPANT_COLLECTOR.snapshot()
+        )
+
         emit({
             "type": "table_context",
+            "hand_token": request_token,
+            "participant_frame_count": int(
+                participant_evidence.get("frame_count")
+                or 0
+            ),
             "dealer_button_seat": dealer["dealer_button_seat"],
             "dealt_in_seats": frozen_participants,
             "positions": positions,
@@ -1063,6 +1215,7 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
                 "hero",
                 "unknown",
             ),
+            "players": local_players,
         })
 
         emit({
@@ -1710,10 +1863,26 @@ def main():
                 state,
             )
 
+        current_stack_street = str(
+            state.get("phase") or "WAITING"
+        ).upper()
+
+        prior_commitment_seats = (
+            commitment_tracker.committed_players(
+                current_stack_street
+            )
+            if current_stack_street != "WAITING"
+            else []
+        )
+
         enrich_stack_change_measurements(
             changes,
             img,
             state,
+            prior_occupied_bet_regions=(
+                previous_occupied_bet_regions
+            ),
+            prior_commitment_seats=prior_commitment_seats,
         )
 
         log_observation(changes)

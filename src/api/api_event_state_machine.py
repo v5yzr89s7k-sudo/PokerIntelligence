@@ -14,6 +14,9 @@ from src.api.position_engine import assign_positions
 from src.state.canonical_hand import CanonicalHand
 from src.state.canonical_hand_store import CanonicalHandStore
 from src.state.betting_round_tracker import BettingRoundTracker
+from src.api.participant_validation_recorder import (
+    record_participant_comparison,
+)
 
 
 CANONICAL_STORE = CanonicalHandStore()
@@ -53,6 +56,9 @@ def default_state():
         "forced_blinds_seeded": False,
         "level": {},
         "dealt_in_seats": [],
+        "hand_token": "",
+        "participant_frame_count": 0,
+        "participant_validation_recorded": False,
         "timeline": [],
     }
 
@@ -231,6 +237,73 @@ def seed_forced_blinds(state, canonical):
 def handle_table_snapshot(state, event):
     players = event.get("players") or []
     dealt_in_seats = state.get("dealt_in_seats") or []
+    snapshot_dealt_in_seats = list(
+        event.get("dealt_in_seats") or []
+    )
+
+    event_hand_token = str(
+        event.get("hand_token") or ""
+    )
+    state_hand_token = str(
+        state.get("hand_token") or ""
+    )
+
+    if (
+        not state.get("participant_validation_recorded")
+        and dealt_in_seats
+        and snapshot_dealt_in_seats
+        and event_hand_token
+        and (
+            not state_hand_token
+            or event_hand_token == state_hand_token
+        )
+    ):
+        validation = record_participant_comparison(
+            hand_token=event_hand_token,
+            local_dealt_in=dealt_in_seats,
+            snapshot_dealt_in=snapshot_dealt_in_seats,
+            local_frame_count=state.get(
+                "participant_frame_count"
+            ),
+            recorded_ts=event.get("ts") or time.time(),
+        )
+
+        if validation.get("recorded"):
+            state["participant_validation_recorded"] = True
+
+            record = validation.get("record") or {}
+            summary = validation.get("summary") or {}
+
+            print(
+                "[PARTICIPANT_VALIDATION] "
+                f"match={record.get('exact_match')} "
+                f"local={record.get('local_dealt_in')} "
+                f"snapshot={record.get('snapshot_dealt_in')} "
+                f"missing={record.get('missing_locally')} "
+                f"extra={record.get('extra_locally')} "
+                f"hands={summary.get('hands_compared')} "
+                f"accuracy={summary.get('accuracy_percent')}%",
+                flush=True,
+            )
+        else:
+            print(
+                "[PARTICIPANT_VALIDATION_SKIP] "
+                f"reason={validation.get('reason')}",
+                flush=True,
+            )
+    elif (
+        snapshot_dealt_in_seats
+        and event_hand_token
+        and state_hand_token
+        and event_hand_token != state_hand_token
+    ):
+        print(
+            "[PARTICIPANT_VALIDATION_SKIP] "
+            "reason=hand_token_mismatch "
+            f"state={state_hand_token[:8]} "
+            f"event={event_hand_token[:8]}",
+            flush=True,
+        )
 
     dealer_button_seat = state.get("dealer_button_seat") or ""
     positions = state.get("positions") or {}
@@ -318,19 +391,38 @@ def handle_table_context(state, event):
         print("[SKIP] table_context has no dealt-in seats", flush=True)
         return state
 
-    players = [
-        {
+    event_players = {
+        item.get("seat"): item
+        for item in (event.get("players") or [])
+        if isinstance(item, dict)
+        and item.get("seat") in dealt_in_seats
+    }
+
+    players = []
+
+    for seat in dealt_in_seats:
+        local = event_players.get(seat) or {}
+
+        players.append({
             "seat": seat,
-            "name": seat,
-            "stack_bb": None,
+            "name": local.get("name") or seat,
+            "stack_bb": local.get("stack_bb"),
+            "stack_text": local.get("stack_text") or "",
+            "stack_confidence": local.get("stack_confidence"),
+            "stack_read_mode": local.get("stack_read_mode") or "unknown",
             "is_hero": seat == "hero",
             "is_active": True,
-        }
-        for seat in dealt_in_seats
-    ]
+        })
 
     state["players"] = players
     state["dealt_in_seats"] = dealt_in_seats
+    state["hand_token"] = str(
+        event.get("hand_token") or ""
+    )
+    state["participant_frame_count"] = int(
+        event.get("participant_frame_count") or 0
+    )
+    state["participant_validation_recorded"] = False
     state["dealer_button_seat"] = dealer_button_seat
     state["positions"] = positions
     state["hero_position"] = hero_position

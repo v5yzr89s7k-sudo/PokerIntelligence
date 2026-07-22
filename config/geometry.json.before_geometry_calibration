@@ -1,0 +1,423 @@
+{
+  "table_size": {
+    "width": 934,
+    "height": 696
+  },
+  "dealer_button_zones": {
+    "seat_lower_left": {
+      "x": 283,
+      "y": 467,
+      "width": 64,
+      "height": 52
+    },
+    "seat_mid_left": {
+      "x": 174,
+      "y": 363,
+      "width": 64,
+      "height": 52
+    },
+    "seat_upper_left": {
+      "x": 169,
+      "y": 228,
+      "width": 64,
+      "height": 52
+    },
+    "seat_top": {
+      "x": 513,
+      "y": 178,
+      "width": 64,
+      "height": 52
+    },
+    "seat_upper_right": {
+      "x": 718,
+      "y": 228,
+      "width": 64,
+      "height": 52
+    },
+    "seat_mid_right": {
+      "x": 694,
+      "y": 362,
+      "width": 64,
+      "height": 52
+    },
+    "seat_lower_right": {
+      "x": 587,
+      "y": 467,
+      "width": 64,
+      "height": 52
+    },
+    "hero": {
+      "x": 512,
+      "y": 471,
+      "width": 64,
+      "height": 52
+    }
+  },
+  "hero_cards": {
+    "card_1": {
+      "x": 421,
+      "y": 516,
+      "width": 60,
+      "height": 82
+    },
+    "card_2": {
+      "x": 482,
+      "y": 516,
+      "width": 60,
+      "height": 82
+    }
+  },
+  "board": {
+    "flop_1": {
+      "x": 273,
+      "y": 302,
+      "width": 73,
+      "height": 102
+    },
+    "flop_2": {
+      "x": 350,
+      "y": 303,
+      "width": 75,
+      "height": 102
+    },
+    "flop_3": {
+      "x": 431,
+      "y": 301,
+      "width": 73,
+      "height": 102
+    },
+    "turn": {
+      "x": 507,
+      "y": 303,
+      "width": 73,
+      "height": 94
+    },
+    "river": {
+      "x": 583,
+      "y": 303,
+      "width": 71,
+      "height": 92
+    }
+  },
+  "action_buttons": {
+    "primary": {
+      "x": 405,
+      "y": 510,
+      "width": 165,
+      "height": 70
+    }
+  },
+  "pot_region": {
+    "main_pot": {
+      "x": 407,
+      "y": 389,
+      "width": 130,
+      "height": 45
+    }
+  },
+  "bet_regions": {
+    "seat_top": {
+      "x": 402,
+      "y": 201,
+      "width": 90,
+      "height": 43
+    },
+    "seat_upper_right": {
+      "x": 612,
+      "y": 201,
+      "width": 90,
+      "height": 49
+    },
+    "seat_mid_right": {
+      "x": 645,
+      "y": 309,
+      "width": 90,
+      "height": 45
+    },
+    "seat_lower_right": {
+      "x": 553,
+      "y": 451,
+      "width": 90,
+      "height": 53
+    },
+    "hero": {
+      "x": 439,
+      "y": 432,
+      "width": 90,
+      "height": 45
+    },
+    "seat_lower_left": {
+      "x": 281,
+      "y": 457,
+      "width": 90,
+      "height": 45
+    },
+    "seat_mid_left": {
+      "x": 180,
+      "y": 326,
+      "width": 90,
+      "height": 53
+    },
+    "seat_upper_left": {
+      "x": 232,
+      "y": 202,
+      "width": 90,
+      "height": 59
+    }
+  },
+  "seat_regions": {
+    "seat_top": {
+      "x": 405,
+      "y": 127,
+      "width": 124,
+      "height": 70
+    },
+    "seat_upper_right": {
+      "x": 714,
+      "y": 181,
+      "width": 138,
+      "height": 70
+    },
+    "seat_mid_right": {
+      "x": 774,
+      "y": 366,
+      "width": 126,
+      "height": 70
+    },
+    "seat_lower_right": {
+      "x": 647,
+      "y": 519,
+      "width": 120,
+      "height": 70
+    },
+    "hero": {
+      "x": 431,
+      "y": 561,
+      "width": 120,
+      "height": 70
+    },
+    "seat_lower_left": {
+      "x": 165,
+      "y": 505,
+      "width": 120,
+      "height": 70
+    },
+    "seat_mid_left": {
+      "x": 41,
+      "y": 368,
+      "width": 124,
+      "height": 70
+    },
+    "seat_upper_left": {
+      "x": 90,
+      "y": 178,
+      "width": 120,
+      "height": 70
+    }
+  },
+  "stack_regions": {
+    "seat_top": {
+      "x": 410,
+      "y": 162,
+      "width": 120,
+      "height": 35
+    },
+    "seat_upper_right": {
+      "x": 724,
+      "y": 211,
+      "width": 120,
+      "height": 35
+    },
+    "seat_mid_right": {
+      "x": 774,
+      "y": 399,
+      "width": 120,
+      "height": 35
+    },
+    "seat_lower_right": {
+      "x": 653,
+      "y": 546,
+      "width": 120,
+      "height": 35
+    },
+    "hero": {
+      "x": 428,
+      "y": 597,
+      "width": 120,
+      "height": 35
+    },
+    "seat_lower_left": {
+      "x": 164,
+      "y": 545,
+      "width": 120,
+      "height": 35
+    },
+    "seat_mid_left": {
+      "x": 45,
+      "y": 399,
+      "width": 120,
+      "height": 35
+    },
+    "seat_upper_left": {
+      "x": 99,
+      "y": 212,
+      "width": 120,
+      "height": 35
+    }
+  },
+  "hole_cards": {
+    "seat_top": {
+      "card_1": {
+        "x": 402,
+        "y": 86,
+        "width": 60,
+        "height": 86
+      },
+      "card_2": {
+        "x": 463,
+        "y": 86,
+        "width": 60,
+        "height": 86
+      }
+    },
+    "seat_upper_right": {
+      "card_1": {
+        "x": 728,
+        "y": 137,
+        "width": 60,
+        "height": 88
+      },
+      "card_2": {
+        "x": 789,
+        "y": 137,
+        "width": 60,
+        "height": 88
+      }
+    },
+    "seat_mid_right": {
+      "card_1": {
+        "x": 768,
+        "y": 327,
+        "width": 60,
+        "height": 88
+      },
+      "card_2": {
+        "x": 829,
+        "y": 327,
+        "width": 60,
+        "height": 88
+      }
+    },
+    "seat_lower_right": {
+      "card_1": {
+        "x": 647,
+        "y": 476,
+        "width": 60,
+        "height": 88
+      },
+      "card_2": {
+        "x": 708,
+        "y": 476,
+        "width": 60,
+        "height": 88
+      }
+    },
+    "hero": {
+      "card_1": {
+        "x": 421,
+        "y": 516,
+        "width": 60,
+        "height": 82
+      },
+      "card_2": {
+        "x": 482,
+        "y": 516,
+        "width": 60,
+        "height": 82
+      }
+    },
+    "seat_lower_left": {
+      "card_1": {
+        "x": 159,
+        "y": 476,
+        "width": 60,
+        "height": 88
+      },
+      "card_2": {
+        "x": 220,
+        "y": 476,
+        "width": 60,
+        "height": 88
+      }
+    },
+    "seat_mid_left": {
+      "card_1": {
+        "x": 34,
+        "y": 327,
+        "width": 60,
+        "height": 88
+      },
+      "card_2": {
+        "x": 95,
+        "y": 327,
+        "width": 60,
+        "height": 88
+      }
+    },
+    "seat_upper_left": {
+      "card_1": {
+        "x": 95,
+        "y": 137,
+        "width": 60,
+        "height": 88
+      },
+      "card_2": {
+        "x": 156,
+        "y": 137,
+        "width": 60,
+        "height": 88
+      }
+    }
+  },
+  "geometry_version": "v0.11.2-click-calibrated-dealer",
+  "dealer_button_centers": {
+    "seat_lower_left": {
+      "x": 315,
+      "y": 493
+    },
+    "seat_mid_left": {
+      "x": 206,
+      "y": 389
+    },
+    "seat_upper_left": {
+      "x": 201,
+      "y": 254
+    },
+    "seat_top": {
+      "x": 545,
+      "y": 204
+    },
+    "seat_upper_right": {
+      "x": 750,
+      "y": 254
+    },
+    "seat_mid_right": {
+      "x": 726,
+      "y": 388
+    },
+    "seat_lower_right": {
+      "x": 619,
+      "y": 493
+    },
+    "hero": {
+      "x": 544,
+      "y": 497
+    }
+  },
+  "board_api_crop": {
+    "x": 240,
+    "y": 225,
+    "width": 460,
+    "height": 155
+  }
+}

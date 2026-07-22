@@ -95,6 +95,44 @@ class ParticipantEvidenceCollector:
             frozen_ts=frozen_ts or time(),
         )
 
+        evidence = self.freezer.snapshot()
+        stable_seats = list(
+            evidence.get("stable_dealt_in_seats") or []
+        )
+
+        seat_evidence = {}
+        positive_frames = (
+            evidence.get("positive_frames") or {}
+        )
+        paired_frames = (
+            evidence.get("paired_positive_frames") or {}
+        )
+
+        for seat, card_hits in positive_frames.items():
+            if seat == "hero":
+                continue
+
+            seat_evidence[seat] = {
+                "card_1": int(
+                    (card_hits or {}).get("card_1") or 0
+                ),
+                "card_2": int(
+                    (card_hits or {}).get("card_2") or 0
+                ),
+                "paired": int(
+                    paired_frames.get(seat) or 0
+                ),
+            }
+
+        print(
+            "[PARTICIPANT_TEMPORAL] "
+            f"frames={frame_count} "
+            f"authoritative={seats} "
+            f"stable={stable_seats} "
+            f"evidence={seat_evidence}",
+            flush=True,
+        )
+
         self.publish()
         return seats
 
