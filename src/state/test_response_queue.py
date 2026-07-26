@@ -160,12 +160,12 @@ def test_reraise_reopens_response_queue_in_cyclic_order():
 
     state = tracker.commitment_tracker._state("PREFLOP")
 
-    # BB raised. Action wraps to UTG/HJ/BTN/SB, excluding the BB.
-    # UTG was passively inferred folded before HJ's opening action.
+    # BB raised. Action wraps to the remaining active players,
+    # excluding the BB. UTG folded before HJ's opening action,
+    # and SB folded when skipped before the BB's raise.
     assert state.needs_response_from == [
         "seat_upper_right",
         "hero",
-        "seat_mid_left",
     ]
 
 

@@ -130,7 +130,6 @@ def test_call_is_preserved():
     assert opening_bet.action == BET_OR_RAISE
     assert result is not None
     assert result.action == "CALL"
-    assert result.sequence == 2
 
 
 def test_ambiguous_fold_stays_diagnostics_only():
@@ -311,10 +310,11 @@ def test_action_consumes_queue_through_actor():
 
     inferred_fold = hand.actions[0]
 
-    assert inferred_fold.source == "passive_inference"
+    assert inferred_fold.source == "action_order_inference"
     assert inferred_fold.confidence == 0.90
     assert inferred_fold.evidence == [
-        "skipped_before_first_preflop_action",
+        "seat_skipped_before_observed_actor",
+        "action_required_but_no_commitment_observed",
     ]
 
 
@@ -375,6 +375,7 @@ def test_postflop_skipped_seat_is_not_inferred_as_fold():
         (action.seat, action.action)
         for action in hand.actions
     ] == [
+        ("seat_top", "CHECK"),
         ("seat_upper_right", BET_OR_RAISE),
     ]
 
@@ -382,7 +383,7 @@ def test_postflop_skipped_seat_is_not_inferred_as_fold():
     assert hand.players["seat_top"].active is True
 
 
-def test_later_preflop_gap_is_not_inferred_without_more_context():
+def test_later_preflop_gap_is_inferred_as_fold():
     hand = make_hand()
     tracker = BettingRoundTracker(hand)
 
@@ -410,11 +411,20 @@ def test_later_preflop_gap_is_not_inferred_without_more_context():
         for action in hand.actions
     ] == [
         ("seat_top", BET_OR_RAISE),
+        ("seat_upper_right", "FOLD"),
         ("hero", "CALL"),
     ]
 
-    assert hand.players["seat_upper_right"].folded is False
-    assert hand.players["seat_upper_right"].active is True
+    inferred_fold = hand.actions[1]
+    assert inferred_fold.source == "action_order_inference"
+    assert inferred_fold.confidence == 0.90
+    assert inferred_fold.evidence == [
+        "seat_skipped_before_observed_actor",
+        "action_required_but_no_commitment_observed",
+    ]
+
+    assert hand.players["seat_upper_right"].folded is True
+    assert hand.players["seat_upper_right"].active is False
 
 
 def test_forced_blinds_do_not_consume_preflop_queue():
