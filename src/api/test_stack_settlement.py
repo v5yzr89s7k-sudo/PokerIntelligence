@@ -38,8 +38,8 @@ def run_settlement(reading, previous_stack=39.38):
 
     with (
         patch(
-            "src.api.api_event_coordinator._snapshot_stack_values",
-            return_value={},
+            "src.api.api_event_coordinator._canonical_stack_values",
+            return_value={"hero": previous_stack},
         ),
         patch(
             "src.api.api_event_coordinator.read_stack",
@@ -55,7 +55,7 @@ def run_settlement(reading, previous_stack=39.38):
     return changes, state
 
 
-def test_zero_stack_is_rejected():
+def test_zero_stack_is_retried_without_all_in_confirmation():
     changes, state = run_settlement({
         "stack_bb": 0.0,
         "stack_text": "0 BB",
@@ -67,7 +67,10 @@ def test_zero_stack_is_rejected():
     assert changes.stack_changed_seats == []
     assert changes.stack_change_details == {}
     assert state["live_stack_bb_by_seat"]["hero"] == 39.38
-    assert "hero" not in state["pending_stack_reads"]
+
+    pending = state["pending_stack_reads"]["hero"]
+    assert pending["validation_attempts"] == 1
+    assert pending["origin_street"] == "PREFLOP"
 
 
 def test_single_vote_is_retried_without_mutating_baseline():
@@ -107,7 +110,10 @@ def test_trusted_decrease_is_accepted():
     assert measurement["stack_read_confidence"] == 0.98
     assert measurement["stack_read_mode"] == "agreement"
 
-    assert state["live_stack_bb_by_seat"]["hero"] == 27.38
+    # The coordinator emits the authoritative transition but does not
+    # maintain a second persistent stack baseline. CanonicalHand is updated
+    # later by the API event state machine.
+    assert state["live_stack_bb_by_seat"]["hero"] == 39.38
     assert "hero" not in state["pending_stack_reads"]
 
 
@@ -127,7 +133,7 @@ def test_positive_jump_does_not_mutate_baseline():
 
 
 def main():
-    test_zero_stack_is_rejected()
+    test_zero_stack_is_retried_without_all_in_confirmation()
     test_single_vote_is_retried_without_mutating_baseline()
     test_trusted_decrease_is_accepted()
     test_positive_jump_does_not_mutate_baseline()
