@@ -73,6 +73,28 @@ with TemporaryDirectory() as tmp:
         },
     ]
 
+    state = sm.handle_table_context(
+        state,
+        {
+            "type": "table_context",
+            "hand_token": "test-hand",
+            "dealer_button_seat": "seat_upper_right",
+            "hero_position": "SB",
+            "participant_frame_count": 6,
+            "dealt_in_seats": [
+                "seat_upper_right",
+                "hero",
+                "seat_lower_left",
+            ],
+            "positions": {
+                "seat_upper_right": "BTN",
+                "hero": "SB",
+                "seat_lower_left": "BB",
+            },
+            "players": players,
+        },
+    )
+
     state = sm.handle_table_snapshot(
         state,
         {
