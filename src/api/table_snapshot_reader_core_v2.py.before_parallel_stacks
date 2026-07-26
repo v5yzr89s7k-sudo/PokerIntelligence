@@ -1,8 +1,6 @@
 from pathlib import Path
 from time import perf_counter
-from concurrent.futures import ThreadPoolExecutor
 import base64
-import copy
 import json
 
 import cv2
@@ -390,18 +388,203 @@ def _cache_player(entry, card):
     }
 
 
+def read_table_snapshot_v2(frame):
+    total_t0 = perf_counter()
 
-def _read_local_stacks(cards, cache_snapshot):
-    """
-    Read local stacks without mutating the shared snapshot cache.
+    frame_path = Path(
+        frame
+    ).expanduser().resolve()
 
-    This function is safe to run concurrently with the Vision API
-    request. Cache updates are returned and applied later by the
-    main thread.
-    """
+    if not frame_path.exists():
+        raise FileNotFoundError(
+            frame_path
+        )
+
+    prepare_t0 = perf_counter()
+    canonical, cards = _prepare(
+        frame_path
+    )
+    prepare_ms = (
+        perf_counter() - prepare_t0
+    ) * 1000.0
+
+    dealer_t0 = perf_counter()
+    dealer_result = detect_dealer_button(
+        canonical
+    )
+    dealer = (
+        dealer_result["dealer_button_seat"]
+        if dealer_result["found"]
+        else ""
+    )
+    dealer_ms = (
+        perf_counter() - dealer_t0
+    ) * 1000.0
+
+    cache = load_cache()
+    cached_players = {}
+    changed_cards = []
+
+    for card in cards:
+        entry = cache_lookup(
+            cache,
+            card["seat"],
+            _cache_fingerprint_image(card),
+        )
+
+        if entry is None:
+            changed_cards.append(card)
+        else:
+            cached_players[card["seat"]] = (
+                _cache_player(entry, card)
+            )
+
+    payload_t0 = perf_counter()
+
+    if changed_cards:
+        content, image_bytes = _build_content(
+            changed_cards,
+        )
+    else:
+        content = None
+        image_bytes = 0
+
+    payload_ms = (
+        perf_counter() - payload_t0
+    ) * 1000.0
+
+    api_ms = 0.0
+    parse_ms = 0.0
+    confidence = None
+    fresh_players = {}
+
+    if changed_cards:
+        api_t0 = perf_counter()
+        response = CLIENT.responses.create(
+            model="gpt-4.1-mini",
+            input=[{
+                "role": "user",
+                "content": content,
+            }],
+        )
+        api_ms = (
+            perf_counter() - api_t0
+        ) * 1000.0
+
+        parse_t0 = perf_counter()
+        data = _extract_json(
+            response.output_text
+        )
+        partial = _normalize_result(
+            data,
+            changed_cards,
+            dealer,
+        )
+        confidence = partial.get(
+            "confidence"
+        )
+        fresh_players = {
+            player["seat"]: player
+            for player in partial["players"]
+        }
+
+        # Retry unreadable opponent names once using only the failed
+        # physical-seat crops.
+        missing_name_cards = [
+            card
+            for card in changed_cards
+            if card["seat"] != "hero"
+            and not fresh_players[
+                card["seat"]
+            ].get("name")
+        ]
+
+        if missing_name_cards:
+            retry_content, retry_image_bytes = _build_content(
+                missing_name_cards,
+            )
+
+            retry_t0 = perf_counter()
+            retry_response = CLIENT.responses.create(
+                model="gpt-4.1-mini",
+                input=[{
+                    "role": "user",
+                    "content": retry_content,
+                }],
+            )
+            api_ms += (
+                perf_counter() - retry_t0
+            ) * 1000.0
+            image_bytes += retry_image_bytes
+
+            retry_data = _extract_json(
+                retry_response.output_text
+            )
+            retry_partial = _normalize_result(
+                retry_data,
+                missing_name_cards,
+                dealer,
+            )
+
+            print(
+                "[SNAPSHOT_NAME_RETRY]",
+                {
+                    player["seat"]: player.get("name")
+                    for player in retry_partial["players"]
+                },
+                flush=True,
+            )
+
+            for retry_player in retry_partial["players"]:
+                seat = retry_player["seat"]
+
+                if retry_player.get("name"):
+                    fresh_players[seat]["name"] = (
+                        retry_player["name"]
+                    )
+
+                if (
+                    fresh_players[seat].get("stack_bb") is None
+                    and retry_player.get("stack_bb") is not None
+                ):
+                    fresh_players[seat]["stack_bb"] = (
+                        retry_player["stack_bb"]
+                    )
+                    fresh_players[seat]["stack_text"] = (
+                        retry_player["stack_text"]
+                    )
+
+        for card in changed_cards:
+            player = fresh_players[
+                card["seat"]
+            ]
+
+            cache_payload = {
+                "stack_text": player["stack_text"],
+                "stack_bb": player["stack_bb"],
+            }
+
+            # Never persist an unreadable name. This guarantees another
+            # attempt on a future snapshot instead of preserving a blank.
+            if player.get("name"):
+                cache_payload["name"] = player["name"]
+
+            cache_update(
+                cache,
+                card["seat"],
+                _cache_fingerprint_image(card),
+                cache_payload,
+            )
+
+        save_cache(cache)
+        parse_ms = (
+            perf_counter() - parse_t0
+        ) * 1000.0
+
+    players = []
+
     stack_t0 = perf_counter()
     stack_readings = {}
-    cache_updates = []
 
     for card in cards:
         seat = card["seat"]
@@ -415,7 +598,7 @@ def _read_local_stacks(cards, cache_snapshot):
         stack_crop = card["image"][y1:y2, x1:x2]
 
         cached_stack = stack_lookup(
-            cache_snapshot,
+            cache,
             seat,
             stack_crop,
         )
@@ -455,17 +638,18 @@ def _read_local_stacks(cards, cache_snapshot):
         if trusted_stack:
             stack_readings[seat] = result
 
-            cache_updates.append({
-                "seat": seat,
-                "stack_crop": stack_crop,
-                "payload": {
+            stack_update(
+                cache,
+                seat,
+                stack_crop,
+                {
                     "stack_bb": result["stack_bb"],
                     "stack_text": result["stack_text"],
                     "confidence": result["confidence"],
                     "votes": result["votes"],
                     "mode": result["mode"],
                 },
-            })
+            )
         else:
             stack_readings[seat] = {
                 **result,
@@ -473,253 +657,11 @@ def _read_local_stacks(cards, cache_snapshot):
                 "stack_text": "",
             }
 
+    save_cache(cache)
+
     stack_ms = (
         perf_counter() - stack_t0
     ) * 1000.0
-
-    return (
-        stack_readings,
-        cache_updates,
-        stack_ms,
-    )
-
-
-def read_table_snapshot_v2(frame):
-    total_t0 = perf_counter()
-
-    frame_path = Path(
-        frame
-    ).expanduser().resolve()
-
-    if not frame_path.exists():
-        raise FileNotFoundError(
-            frame_path
-        )
-
-    prepare_t0 = perf_counter()
-    canonical, cards = _prepare(
-        frame_path
-    )
-    prepare_ms = (
-        perf_counter() - prepare_t0
-    ) * 1000.0
-
-    dealer_t0 = perf_counter()
-    dealer_result = detect_dealer_button(
-        canonical
-    )
-    dealer = (
-        dealer_result["dealer_button_seat"]
-        if dealer_result["found"]
-        else ""
-    )
-    dealer_ms = (
-        perf_counter() - dealer_t0
-    ) * 1000.0
-
-    cache = load_cache()
-    cached_players = {}
-    changed_cards = []
-
-    for card in cards:
-        fingerprint = _cache_fingerprint_image(card)
-
-        entry = cache_lookup(
-            cache,
-            card["seat"],
-            fingerprint,
-        )
-
-        # Preserve cached identity for stable "SITTING OUT" seats.
-        if entry is None:
-            try:
-                import cv2
-                import pytesseract
-
-                gray = cv2.cvtColor(
-                    fingerprint,
-                    cv2.COLOR_BGR2GRAY,
-                )
-
-                txt = pytesseract.image_to_string(gray).upper()
-
-                if (
-                    "SITTING" in txt
-                    and "OUT" in txt
-                ):
-                    cached = cache.get(card["seat"])
-                    if cached:
-                        entry = cached
-                        print(
-                            f"[SNAPSHOT_CACHE] "
-                            f"{card['seat']} "
-                            f"reused (SITTING OUT)",
-                            flush=True,
-                        )
-            except Exception:
-                pass
-
-        if entry is None:
-            changed_cards.append(card)
-        else:
-            cached_players[card["seat"]] = (
-                _cache_player(entry, card)
-            )
-
-    payload_t0 = perf_counter()
-
-    hit_seats = sorted(cached_players.keys())
-    miss_seats = sorted(card["seat"] for card in changed_cards)
-
-    print(
-        "[SNAPSHOT_CACHE]\n"
-        f"  hit={hit_seats}\n"
-        f"  miss={miss_seats}\n"
-        f"  changed={len(changed_cards)} "
-        f"cached={len(cached_players)} "
-        f"total={len(cards)}",
-        flush=True,
-    )
-
-    if changed_cards:
-        content, image_bytes = _build_content(
-            changed_cards,
-        )
-    else:
-        content = None
-        image_bytes = 0
-
-    payload_ms = (
-        perf_counter() - payload_t0
-    ) * 1000.0
-
-    # Local stack OCR is independent of the Vision API.
-    # Run it concurrently so its cost is hidden behind API latency.
-    stack_executor = ThreadPoolExecutor(max_workers=1)
-    stack_future = stack_executor.submit(
-        _read_local_stacks,
-        cards,
-        copy.deepcopy(cache),
-    )
-
-    api_ms = 0.0
-    parse_ms = 0.0
-    primary_api_ms = 0.0
-    primary_parse_ms = 0.0
-    retry_build_ms = 0.0
-    retry_api_ms = 0.0
-    retry_parse_ms = 0.0
-    retry_count = 0
-    retry_image_bytes = 0
-    confidence = None
-    fresh_players = {}
-
-    if changed_cards:
-        api_t0 = perf_counter()
-        response = CLIENT.responses.create(
-            model="gpt-4.1-mini",
-            input=[{
-                "role": "user",
-                "content": content,
-            }],
-        )
-        primary_api_ms = (
-            perf_counter() - api_t0
-        ) * 1000.0
-        api_ms = primary_api_ms
-
-        parse_t0 = perf_counter()
-        data = _extract_json(
-            response.output_text
-        )
-        partial = _normalize_result(
-            data,
-            changed_cards,
-            dealer,
-        )
-        primary_parse_ms = (
-            perf_counter() - parse_t0
-        ) * 1000.0
-        confidence = partial.get(
-            "confidence"
-        )
-        fresh_players = {
-            player["seat"]: player
-            for player in partial["players"]
-        }
-
-        # Retry unreadable opponent names once using only the failed
-        # physical-seat crops.
-        missing_name_cards = [
-            card
-            for card in changed_cards
-            if card["seat"] != "hero"
-            and not fresh_players[
-                card["seat"]
-            ].get("name")
-        ]
-
-        if missing_name_cards:
-            retry_count = len(missing_name_cards)
-
-            print(
-                "[SNAPSHOT_NAME_RETRY_SKIPPED]",
-                {
-                    "seats": [
-                        card["seat"]
-                        for card in missing_name_cards
-                    ],
-                    "reason": "hot_path_disabled",
-                },
-                flush=True,
-            )
-
-        for card in changed_cards:
-            player = fresh_players[
-                card["seat"]
-            ]
-
-            cache_payload = {
-                "stack_text": player["stack_text"],
-                "stack_bb": player["stack_bb"],
-            }
-
-            # Never persist an unreadable name. This guarantees another
-            # attempt on a future snapshot instead of preserving a blank.
-            if player.get("name"):
-                cache_payload["name"] = player["name"]
-
-            cache_update(
-                cache,
-                card["seat"],
-                _cache_fingerprint_image(card),
-                cache_payload,
-            )
-
-        save_cache(cache)
-        parse_ms = primary_parse_ms + retry_parse_ms
-
-    players = []
-
-    try:
-        (
-            stack_readings,
-            stack_cache_updates,
-            stack_ms,
-        ) = stack_future.result()
-    finally:
-        stack_executor.shutdown(wait=True)
-
-    # Apply stack-cache writes only on the main thread.
-    for update in stack_cache_updates:
-        stack_update(
-            cache,
-            update["seat"],
-            update["stack_crop"],
-            update["payload"],
-        )
-
-    save_cache(cache)
 
     for card in cards:
         seat = card["seat"]
@@ -777,13 +719,6 @@ def read_table_snapshot_v2(frame):
         "payload_ms": payload_ms,
         "api_ms": api_ms,
         "parse_ms": parse_ms,
-        "primary_api_ms": primary_api_ms,
-        "primary_parse_ms": primary_parse_ms,
-        "retry_build_ms": retry_build_ms,
-        "retry_api_ms": retry_api_ms,
-        "retry_parse_ms": retry_parse_ms,
-        "retry_count": retry_count,
-        "retry_image_bytes": retry_image_bytes,
         "stack_ms": stack_ms,
         "total_ms": (
             perf_counter() - total_t0

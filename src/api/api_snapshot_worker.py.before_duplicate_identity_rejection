@@ -11,11 +11,7 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from src.api.perception_latency import (
-    log as log_latency,
-    begin as latency_begin,
-    end as latency_end,
-)
+from src.api.perception_latency import log as log_latency
 from src.api.position_engine import assign_positions
 from src.api.table_snapshot_reader_core_v2 import read_table_snapshot_v2
 from src.api.canonical_frame import to_canonical_frame
@@ -29,7 +25,6 @@ from src.events.participant_evidence_store import (
 )
 
 EVENT_LOG = ROOT / "runtime/live/api_events.jsonl"
-LATENCY_LOG = ROOT / "runtime/live/snapshot_latency.jsonl"
 CAPTURE_DIR = ROOT / "runtime/window_captures"
 SNAPSHOT_READER = ROOT / "src/api/table_snapshot_api_reader.py"
 
@@ -192,13 +187,6 @@ def run_snapshot(frame):
         f"payload={timings['payload_ms']:.1f}ms "
         f"api={timings['api_ms']:.1f}ms "
         f"parse={timings['parse_ms']:.1f}ms "
-        f"primary_api={timings['primary_api_ms']:.1f}ms "
-        f"primary_parse={timings['primary_parse_ms']:.1f}ms "
-        f"retry_build={timings['retry_build_ms']:.1f}ms "
-        f"retry_api={timings['retry_api_ms']:.1f}ms "
-        f"retry_parse={timings['retry_parse_ms']:.1f}ms "
-        f"retry_count={timings['retry_count']} "
-        f"retry_kb={timings['retry_image_bytes'] / 1024:.1f} "
         f"images={timings['image_count']} "
         f"dealer={timings['dealer_ms']:.1f}ms "
         f"seat_cards={timings['seat_card_count']} "
@@ -206,32 +194,12 @@ def run_snapshot(frame):
         flush=True,
     )
 
-    record = {
-        "ts": time.time(),
-        "total_ms": round(elapsed_ms, 1),
-        "primary_api_ms": round(timings["primary_api_ms"], 1),
-        "retry_api_ms": round(timings["retry_api_ms"], 1),
-        "images": timings["image_count"],
-        "cached": 8 - timings["image_count"],
-        "changed": timings["image_count"],
-        "image_kb": round(
-            timings["image_bytes"] / 1024,
-            1,
-        ),
-        "retry_count": timings["retry_count"],
-    }
-
-    with LATENCY_LOG.open("a") as f:
-        f.write(json.dumps(record) + "\n")
-
     return snapshot, elapsed_ms
 
 
 def process_event(event, processed_hero_events):
-    if event.get("type") != "snapshot_request":
+    if event.get("type") != "hero_cards":
         return
-
-    print("[SNAPSHOT_TRIGGER] snapshot_request received", flush=True)
 
     event_ts = event.get("ts")
     event_key = str(event_ts)
@@ -282,14 +250,6 @@ def process_event(event, processed_hero_events):
         worker="snapshot",
         hand_token=hand_token,
         frame=str(frame),
-    )
-
-    print("[LATENCY_DEBUG] snapshot begin", flush=True)
-
-    latency_begin(
-        request_id,
-        "snapshot_pipeline",
-        hand_token=hand_token,
     )
 
     geometry = json.loads(
@@ -418,14 +378,6 @@ def process_event(event, processed_hero_events):
         snapshot["participant_diagnostic"] = participant_diagnostic
 
     if not snapshot:
-        latency_end(
-            request_id,
-            "snapshot_pipeline",
-            hand_token=hand_token,
-            ok=False,
-            elapsed_ms=elapsed_ms,
-        )
-
         log_latency(
             "worker_finished",
             request_id=request_id,
@@ -465,13 +417,10 @@ def process_event(event, processed_hero_events):
             seen_names[name] = seat
 
     if duplicate_identities:
-        print(
-            "[SNAPSHOT_REJECT] "
-            "duplicated player identity across seats: "
-            f"{duplicate_identities}",
-            flush=True,
+        raise RuntimeError(
+            "snapshot contains duplicated player identity across seats: "
+            f"{duplicate_identities}"
         )
-        return
 
     # A missing dealt-in seat must remain missing. Never compensate by
     # reusing or copying another player's identity into that seat.
@@ -536,17 +485,6 @@ def process_event(event, processed_hero_events):
         flush=True,
     )
     print("=====================================================\n", flush=True)
-
-    print("[LATENCY_DEBUG] snapshot end", flush=True)
-
-    latency_end(
-        request_id,
-        "snapshot_pipeline",
-        hand_token=hand_token,
-        ok=True,
-        elapsed_ms=elapsed_ms,
-        player_count=len(players),
-    )
 
     log_latency(
         "worker_finished",

@@ -1,0 +1,134 @@
+from pathlib import Path
+from collections import defaultdict
+import sys
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from src.api.table_snapshot_reader_core_v2 import (
+    _prepare,
+    load_cache,
+    cache_lookup,
+    _cache_fingerprint_image,
+)
+
+CAPTURE_DIR = ROOT / "runtime/window_captures"
+
+SAMPLE_EVERY = 10
+MAX_FRAMES = 200
+
+
+def main():
+
+    captures = sorted(
+        CAPTURE_DIR.glob("acr_table_*.png")
+    )
+
+    if not captures:
+        raise SystemExit("No captures")
+
+    captures = captures[::SAMPLE_EVERY][-MAX_FRAMES:]
+
+    print(f"Frames: {len(captures)}")
+    print()
+
+    cache = load_cache()
+
+    seat_hits = defaultdict(int)
+    seat_total = defaultdict(int)
+
+    total_hits = 0
+    total_total = 0
+
+    previous_name = {}
+    suspicious_reuse = []
+
+    for frame in captures:
+
+        _, cards = _prepare(frame)
+
+        for card in cards:
+
+            seat = card["seat"]
+
+            seat_total[seat] += 1
+            total_total += 1
+
+            entry = cache_lookup(
+                cache,
+                seat,
+                _cache_fingerprint_image(card),
+            )
+
+            if entry is not None:
+                seat_hits[seat] += 1
+                total_hits += 1
+
+                name = str(entry.get("name") or "").strip()
+
+                if (
+                    seat in previous_name
+                    and name
+                    and previous_name[seat]
+                    and previous_name[seat] != name
+                ):
+                    suspicious_reuse.append({
+                        "seat": seat,
+                        "previous": previous_name[seat],
+                        "current": name,
+                        "frame": frame.name,
+                    })
+
+                if name:
+                    previous_name[seat] = name
+
+    print("================ CACHE STABILITY ================")
+
+    for seat in sorted(seat_total):
+
+        hits = seat_hits[seat]
+        total = seat_total[seat]
+
+        pct = (
+            hits * 100.0 / total
+            if total
+            else 0
+        )
+
+        print(
+            f"{seat:18} "
+            f"{hits:4}/{total:<4} "
+            f"{pct:6.2f}%"
+        )
+
+    overall = (
+        total_hits * 100.0 / total_total
+        if total_total
+        else 0
+    )
+
+    print()
+    print("===============================================")
+    print(
+        f"Overall: "
+        f"{total_hits}/{total_total} "
+        f"({overall:.2f}%)"
+    )
+
+    print()
+
+    if suspicious_reuse:
+        print("Suspicious identity reuse:")
+        for item in suspicious_reuse:
+            print(
+                f"{item['seat']}: "
+                f"{item['previous']} -> "
+                f"{item['current']} "
+                f"({item['frame']})"
+            )
+    else:
+        print("Suspicious identity reuse: none detected")
+
+
+if __name__ == "__main__":
+    main()

@@ -7,7 +7,11 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from src.api.perception_latency import log as log_latency
+from src.api.perception_latency import (
+    log as log_latency,
+    begin as latency_begin,
+    end as latency_end,
+)
 from src.api.pot_api_reader import read_pot
 
 
@@ -73,6 +77,12 @@ def process_request(request):
         frame=str(frame),
     )
 
+    latency_begin(
+        request_id,
+        "pot_worker",
+        hand_token=hand_token,
+    )
+
     started = perf_counter()
 
     try:
@@ -89,6 +99,15 @@ def process_request(request):
             "elapsed_ms": round(elapsed_ms, 1),
             "ts": time.time(),
         })
+
+        latency_end(
+            request_id,
+            "pot_worker",
+            hand_token=hand_token,
+            ok=False,
+            error=f"{type(exc).__name__}: {exc}",
+            elapsed_ms=round(elapsed_ms,1),
+        )
 
         print(
             f"[POT_WORKER] failed request={request_id} "
@@ -112,6 +131,16 @@ def process_request(request):
             "elapsed_ms": round(elapsed_ms, 1),
             "ts": time.time(),
         })
+
+        latency_end(
+            request_id,
+            "pot_worker",
+            hand_token=hand_token,
+            ok=False,
+            error="invalid_pot_read",
+            elapsed_ms=round(elapsed_ms,1),
+        )
+
         return
 
     append_jsonl(RESULT_LOG, {
@@ -125,6 +154,15 @@ def process_request(request):
         "elapsed_ms": round(elapsed_ms, 1),
         "ts": time.time(),
     })
+
+    latency_end(
+        request_id,
+        "pot_worker",
+        hand_token=hand_token,
+        ok=True,
+        elapsed_ms=round(elapsed_ms,1),
+        pot_bb=float(pot_bb),
+    )
 
     log_latency(
         "worker_finished",

@@ -132,6 +132,11 @@ class StreetCommitmentTracker:
         aggressor,
         eligible_seats,
     ):
+        print("\n" + "=" * 60)
+        print("[OPEN_RESPONSE_QUEUE]")
+        print(f"street     : {street}")
+        print(f"aggressor  : {aggressor}")
+        print(f"eligible   : {list(eligible_seats or [])}")
         """
         Rebuild response obligations after a resolved BET or RAISE.
 
@@ -154,12 +159,20 @@ class StreetCommitmentTracker:
             + order[:index]
         )
 
+        print(f"street_order : {order}")
+        print(f"cyclic_order : {cyclic_after_aggressor}")
+
         state.needs_response_from = [
             seat
             for seat in cyclic_after_aggressor
             if seat in eligible
             and seat != aggressor
         ]
+
+        print(
+            f"response_queue : {state.needs_response_from}"
+        )
+        print("=" * 60)
 
         return list(state.needs_response_from)
 
@@ -200,6 +213,79 @@ class StreetCommitmentTracker:
         if betting_open is not None:
             state.betting_open = bool(betting_open)
 
+    def players_owing_action(self, street):
+        """
+        Return the authoritative outstanding action obligations.
+
+        When resolved aggression is open, the response queue is authoritative.
+        Otherwise, the canonical street traversal queue is authoritative.
+        """
+        state = self._state(street)
+
+        if state.betting_open:
+            return list(state.needs_response_from)
+
+        return list(state.pending_to_act)
+
+    def is_round_complete(self, street):
+        """
+        Determine whether the current betting round has completed.
+
+        Completion requires an initialized street order. An unopened round
+        completes only when the canonical traversal queue is empty. A round
+        containing resolved aggression completes only when every eligible
+        player has responded to that aggression.
+        """
+        state = self._state(street)
+
+        if not state.street_order:
+            return False
+
+        return not self.players_owing_action(street)
+
+    def round_status(self, street):
+        """
+        Return a structured explanation of the current betting-round state.
+        """
+        state = self._state(street)
+        owing = self.players_owing_action(street)
+        complete = self.is_round_complete(street)
+
+        if not state.street_order:
+            reason = "street action order is not initialized"
+        elif owing:
+            noun = "player" if len(owing) == 1 else "players"
+
+            if state.betting_open:
+                reason = (
+                    f"{len(owing)} {noun} still owe a response "
+                    "to the current aggression"
+                )
+            else:
+                reason = (
+                    f"{len(owing)} {noun} remain in the "
+                    "street action queue"
+                )
+        elif state.betting_open:
+            reason = "all required responses to aggression are complete"
+        else:
+            reason = "street action queue is complete"
+
+        return {
+            "street": state.street,
+            "complete": complete,
+            "reason": reason,
+            "betting_open": state.betting_open,
+            "current_price": state.current_price,
+            "last_aggressor": state.last_aggressor,
+            "players_owing_action": owing,
+            "pending_to_act": list(state.pending_to_act),
+            "needs_response_from": list(
+                state.needs_response_from
+            ),
+            "acted": sorted(state.acted),
+        }
+
     def has_player_committed(self, street, seat):
         return (
             seat
@@ -238,6 +324,11 @@ class StreetCommitmentTracker:
                 "last_aggressor": state.last_aggressor,
                 "current_price": state.current_price,
                 "betting_open": state.betting_open,
+                "round_complete": self.is_round_complete(street),
+                "players_owing_action": self.players_owing_action(
+                    street
+                ),
+                "round_status": self.round_status(street),
             }
             for street, state in self._states.items()
         }

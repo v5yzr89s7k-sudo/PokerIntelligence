@@ -37,6 +37,7 @@ def reset_runtime():
         "api_event_coordinator_state.json",
         "current_action_episodes.json",
         "current_inferred_actions.json",
+        "pending_episode_scheduler.json",
         "current_observation_timeline.json",
         "current_observation_correlator.json",
         "local_observations.jsonl",

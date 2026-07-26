@@ -522,42 +522,11 @@ def read_table_snapshot_v2(frame):
     changed_cards = []
 
     for card in cards:
-        fingerprint = _cache_fingerprint_image(card)
-
         entry = cache_lookup(
             cache,
             card["seat"],
-            fingerprint,
+            _cache_fingerprint_image(card),
         )
-
-        # Preserve cached identity for stable "SITTING OUT" seats.
-        if entry is None:
-            try:
-                import cv2
-                import pytesseract
-
-                gray = cv2.cvtColor(
-                    fingerprint,
-                    cv2.COLOR_BGR2GRAY,
-                )
-
-                txt = pytesseract.image_to_string(gray).upper()
-
-                if (
-                    "SITTING" in txt
-                    and "OUT" in txt
-                ):
-                    cached = cache.get(card["seat"])
-                    if cached:
-                        entry = cached
-                        print(
-                            f"[SNAPSHOT_CACHE] "
-                            f"{card['seat']} "
-                            f"reused (SITTING OUT)",
-                            flush=True,
-                        )
-            except Exception:
-                pass
 
         if entry is None:
             changed_cards.append(card)
@@ -567,19 +536,6 @@ def read_table_snapshot_v2(frame):
             )
 
     payload_t0 = perf_counter()
-
-    hit_seats = sorted(cached_players.keys())
-    miss_seats = sorted(card["seat"] for card in changed_cards)
-
-    print(
-        "[SNAPSHOT_CACHE]\n"
-        f"  hit={hit_seats}\n"
-        f"  miss={miss_seats}\n"
-        f"  changed={len(changed_cards)} "
-        f"cached={len(cached_players)} "
-        f"total={len(cards)}",
-        flush=True,
-    )
 
     if changed_cards:
         content, image_bytes = _build_content(
@@ -604,13 +560,6 @@ def read_table_snapshot_v2(frame):
 
     api_ms = 0.0
     parse_ms = 0.0
-    primary_api_ms = 0.0
-    primary_parse_ms = 0.0
-    retry_build_ms = 0.0
-    retry_api_ms = 0.0
-    retry_parse_ms = 0.0
-    retry_count = 0
-    retry_image_bytes = 0
     confidence = None
     fresh_players = {}
 
@@ -623,10 +572,9 @@ def read_table_snapshot_v2(frame):
                 "content": content,
             }],
         )
-        primary_api_ms = (
+        api_ms = (
             perf_counter() - api_t0
         ) * 1000.0
-        api_ms = primary_api_ms
 
         parse_t0 = perf_counter()
         data = _extract_json(
@@ -637,9 +585,6 @@ def read_table_snapshot_v2(frame):
             changed_cards,
             dealer,
         )
-        primary_parse_ms = (
-            perf_counter() - parse_t0
-        ) * 1000.0
         confidence = partial.get(
             "confidence"
         )
@@ -660,19 +605,59 @@ def read_table_snapshot_v2(frame):
         ]
 
         if missing_name_cards:
-            retry_count = len(missing_name_cards)
+            retry_content, retry_image_bytes = _build_content(
+                missing_name_cards,
+            )
+
+            retry_t0 = perf_counter()
+            retry_response = CLIENT.responses.create(
+                model="gpt-4.1-mini",
+                input=[{
+                    "role": "user",
+                    "content": retry_content,
+                }],
+            )
+            api_ms += (
+                perf_counter() - retry_t0
+            ) * 1000.0
+            image_bytes += retry_image_bytes
+
+            retry_data = _extract_json(
+                retry_response.output_text
+            )
+            retry_partial = _normalize_result(
+                retry_data,
+                missing_name_cards,
+                dealer,
+            )
 
             print(
-                "[SNAPSHOT_NAME_RETRY_SKIPPED]",
+                "[SNAPSHOT_NAME_RETRY]",
                 {
-                    "seats": [
-                        card["seat"]
-                        for card in missing_name_cards
-                    ],
-                    "reason": "hot_path_disabled",
+                    player["seat"]: player.get("name")
+                    for player in retry_partial["players"]
                 },
                 flush=True,
             )
+
+            for retry_player in retry_partial["players"]:
+                seat = retry_player["seat"]
+
+                if retry_player.get("name"):
+                    fresh_players[seat]["name"] = (
+                        retry_player["name"]
+                    )
+
+                if (
+                    fresh_players[seat].get("stack_bb") is None
+                    and retry_player.get("stack_bb") is not None
+                ):
+                    fresh_players[seat]["stack_bb"] = (
+                        retry_player["stack_bb"]
+                    )
+                    fresh_players[seat]["stack_text"] = (
+                        retry_player["stack_text"]
+                    )
 
         for card in changed_cards:
             player = fresh_players[
@@ -697,7 +682,9 @@ def read_table_snapshot_v2(frame):
             )
 
         save_cache(cache)
-        parse_ms = primary_parse_ms + retry_parse_ms
+        parse_ms = (
+            perf_counter() - parse_t0
+        ) * 1000.0
 
     players = []
 
@@ -777,13 +764,6 @@ def read_table_snapshot_v2(frame):
         "payload_ms": payload_ms,
         "api_ms": api_ms,
         "parse_ms": parse_ms,
-        "primary_api_ms": primary_api_ms,
-        "primary_parse_ms": primary_parse_ms,
-        "retry_build_ms": retry_build_ms,
-        "retry_api_ms": retry_api_ms,
-        "retry_parse_ms": retry_parse_ms,
-        "retry_count": retry_count,
-        "retry_image_bytes": retry_image_bytes,
         "stack_ms": stack_ms,
         "total_ms": (
             perf_counter() - total_t0

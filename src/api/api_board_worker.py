@@ -8,7 +8,11 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from src.api.perception_latency import log as log_latency
+from src.api.perception_latency import (
+    log as log_latency,
+    begin as latency_begin,
+    end as latency_end,
+)
 from src.api.board_reader_core import read_board
 
 BOARD_READER = ROOT / "src/api/board_api_reader.py"
@@ -115,6 +119,7 @@ def process_request(request):
             "error": "invalid_expected_len",
             "ts": time.time(),
         })
+
         return
 
     if not frame_text:
@@ -127,6 +132,7 @@ def process_request(request):
             "error": "missing_frame",
             "ts": time.time(),
         })
+
         return
 
     frame = Path(frame_text)
@@ -141,6 +147,7 @@ def process_request(request):
             "frame": str(frame),
             "ts": time.time(),
         })
+
         return
 
     print(
@@ -158,6 +165,12 @@ def process_request(request):
         frame=str(frame),
     )
 
+    latency_begin(
+        request_id,
+        "board_worker",
+        hand_token=hand_token,
+    )
+
     data, elapsed_ms = run_board_reader(frame)
 
     if not data:
@@ -171,6 +184,16 @@ def process_request(request):
             "elapsed_ms": elapsed_ms,
             "ts": time.time(),
         })
+
+        latency_end(
+            request_id,
+            "board_worker",
+            hand_token=hand_token,
+            ok=False,
+            error="reader_failed",
+            elapsed_ms=elapsed_ms,
+        )
+
         return
 
     board = data.get("board") or []
@@ -188,6 +211,17 @@ def process_request(request):
             "elapsed_ms": elapsed_ms,
             "ts": time.time(),
         })
+
+        latency_end(
+            request_id,
+            "board_worker",
+            hand_token=hand_token,
+            ok=False,
+            error="board_too_short",
+            elapsed_ms=elapsed_ms,
+            board=board,
+        )
+
         return
 
     accepted = board[:expected_len]
@@ -211,6 +245,17 @@ def process_request(request):
             "elapsed_ms": elapsed_ms,
             "ts": time.time(),
         })
+
+        latency_end(
+            request_id,
+            "board_worker",
+            hand_token=hand_token,
+            ok=False,
+            error=reason,
+            elapsed_ms=elapsed_ms,
+            board=accepted,
+        )
+
         return
 
     write_result({
@@ -225,6 +270,15 @@ def process_request(request):
         "elapsed_ms": elapsed_ms,
         "ts": time.time(),
     })
+
+    latency_end(
+        request_id,
+        "board_worker",
+        hand_token=hand_token,
+        ok=True,
+        elapsed_ms=elapsed_ms,
+        board=accepted,
+    )
 
     print(
         f"[BOARD_WORKER] completed request={request_id} "

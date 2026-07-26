@@ -9,6 +9,9 @@ sys.path.insert(0, str(ROOT))
 EVENT_LOG = ROOT / "runtime/live/api_events.jsonl"
 CURSOR = ROOT / "runtime/live/api_event_state_machine_cursor.txt"
 STATE_PATH = ROOT / "runtime/live/api_event_state_machine_state.json"
+BETTING_ROUND_STATUS_PATH = (
+    ROOT / "runtime/live/betting_round_status.json"
+)
 
 from src.api.position_engine import assign_positions
 from src.state.canonical_hand import CanonicalHand
@@ -20,6 +23,69 @@ from src.api.participant_validation_recorder import (
 
 
 CANONICAL_STORE = CanonicalHandStore()
+
+# One BettingRoundTracker lives for exactly one hand.
+_ACTIVE_TRACKER = None
+_ACTIVE_HAND_ID = None
+
+
+def tracker_for_hand(canonical):
+    global _ACTIVE_TRACKER
+    global _ACTIVE_HAND_ID
+
+    hand_id = canonical.hand_id or "__unknown__"
+
+    if (
+        _ACTIVE_TRACKER is None
+        or _ACTIVE_HAND_ID != hand_id
+    ):
+        _ACTIVE_TRACKER = BettingRoundTracker(canonical)
+        _ACTIVE_HAND_ID = hand_id
+
+        print(
+            f"[TRACKER] initialized hand={hand_id}",
+            flush=True,
+        )
+
+    else:
+        # Always point the tracker at the latest CanonicalHand
+        # loaded from disk.
+        _ACTIVE_TRACKER.hand = canonical
+
+    return _ACTIVE_TRACKER
+
+
+def reset_tracker():
+    global _ACTIVE_TRACKER
+    global _ACTIVE_HAND_ID
+
+    _ACTIVE_TRACKER = None
+    _ACTIVE_HAND_ID = None
+
+    print("[TRACKER] reset", flush=True)
+
+
+def write_betting_round_status(tracker, canonical):
+    status = tracker.commitment_tracker.round_status(
+        canonical.current_street
+    )
+    status["hand_id"] = canonical.hand_id
+    status["canonical_players_to_act"] = list(
+        canonical.players_to_act or []
+    )
+    status["processed_episode_count"] = len(
+        tracker.processed_episode_ids
+    )
+
+    BETTING_ROUND_STATUS_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    BETTING_ROUND_STATUS_PATH.write_text(
+        json.dumps(status, indent=2) + "\n"
+    )
+
+    return status
 
 
 def canonical_load():
@@ -43,6 +109,7 @@ def save_cursor(n):
 def default_state():
     return {
         "phase": "WAITING",
+        "snapshot_cached": False,
         "hero_cards": [],
         "board": [],
         "hero_position": "unknown",
@@ -715,8 +782,20 @@ def handle_inferred_action(state, event):
         return state
 
     canonical = canonical_load()
-    tracker = BettingRoundTracker(canonical)
+    tracker = tracker_for_hand(canonical)
     added = tracker.ingest(event)
+
+    status = write_betting_round_status(
+        tracker,
+        canonical,
+    )
+
+    print(
+        f"[BETTING_STATUS] street={status['street']} "
+        f"complete={status['complete']} "
+        f"owing={status['players_owing_action']}",
+        flush=True,
+    )
 
     decision = tracker.decisions[-1] if tracker.decisions else None
 
@@ -895,6 +974,7 @@ def handle_hand_complete(state, event):
 
     result = event.get("result") or "Hand complete"
     state["phase"] = "COMPLETE"
+    state["snapshot_cached"] = False
     state["hand_complete"] = True
     state["result"] = result
 
@@ -914,6 +994,11 @@ def handle_hand_complete(state, event):
 
     print(f"[ARCHIVE] {archived}")
     print("[STATE] -> COMPLETE", result)
+
+    reset_tracker()
+
+    if BETTING_ROUND_STATUS_PATH.exists():
+        BETTING_ROUND_STATUS_PATH.unlink()
 
     return default_state()
 

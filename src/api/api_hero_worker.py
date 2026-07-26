@@ -8,7 +8,11 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from src.api.perception_latency import log as log_latency
+from src.api.perception_latency import (
+    log as log_latency,
+    begin as latency_begin,
+    end as latency_end,
+)
 from src.api.hero_cards_reader_core import read_hero_cards
 
 HERO_READER = ROOT / "src/api/hero_cards_api_reader.py"
@@ -104,6 +108,12 @@ def process_request(request):
         frame=str(frame),
     )
 
+    latency_begin(
+        request_id,
+        "hero_worker",
+        hand_token=hand_token,
+    )
+
     data, elapsed_ms = run_hero_reader(frame)
 
     if not data:
@@ -145,6 +155,15 @@ def process_request(request):
         "elapsed_ms": elapsed_ms,
         "ts": time.time(),
     })
+
+    latency_end(
+        request_id,
+        "hero_worker",
+        hand_token=hand_token,
+        ok=True,
+        elapsed_ms=elapsed_ms,
+        hero_cards=cards,
+    )
 
     log_latency(
         "worker_finished",

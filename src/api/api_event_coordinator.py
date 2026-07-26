@@ -22,6 +22,10 @@ from src.observer.action_episode_manager import (
     ActionEpisodeManager,
     LATE_STACK_ATTACH_SECONDS,
 )
+
+from src.observer.street_episode_scheduler import (
+    StreetEpisodeScheduler,
+)
 from src.api.perception_latency import log as log_latency
 from src.observer.action_inference_engine import ActionInferenceEngine
 from src.state.street_commitment_tracker import (
@@ -95,6 +99,10 @@ TIMELINE_JSON = ROOT / "runtime/live/current_observation_timeline.json"
 CORRELATOR_JSON = ROOT / "runtime/live/current_observation_correlator.json"
 EPISODES_JSON = ROOT / "runtime/live/current_action_episodes.json"
 INFERRED_ACTIONS_JSON = ROOT / "runtime/live/current_inferred_actions.json"
+EPISODE_SCHEDULER_JSON = (
+    ROOT / "runtime/live/pending_episode_scheduler.json"
+)
+
 BOARD_REQUESTS = ROOT / "runtime/live/board_requests.jsonl"
 BOARD_RESULTS = ROOT / "runtime/live/board_results.jsonl"
 HERO_REQUESTS = ROOT / "runtime/live/hero_requests.jsonl"
@@ -313,16 +321,47 @@ def enrich_stack_change_measurements(
             ) + 1
             entry["baseline_wait_attempts"] = wait_attempts
 
+            if entry.get("baseline_wait_started_ts") is None:
+                entry["baseline_wait_started_ts"] = now
+
             # Avoid flooding the terminal while the snapshot worker runs.
             if wait_attempts == 1 or wait_attempts % 10 == 0:
+                waited_ms = (
+                    now
+                    - float(entry["baseline_wait_started_ts"])
+                ) * 1000.0
+
                 print(
                     f"[STACK_SETTLE_WAIT] seat={seat} "
                     f"reason=canonical_baseline_not_ready "
-                    f"attempt={wait_attempts}",
+                    f"attempt={wait_attempts} "
+                    f"waited={waited_ms:.1f}ms",
                     flush=True,
                 )
 
             continue
+
+        baseline_wait_started_ts = entry.pop(
+            "baseline_wait_started_ts",
+            None,
+        )
+        baseline_wait_attempts = int(
+            entry.pop("baseline_wait_attempts", 0)
+            or 0
+        )
+
+        if baseline_wait_started_ts is not None:
+            waited_ms = (
+                now
+                - float(baseline_wait_started_ts)
+            ) * 1000.0
+
+            print(
+                f"[STACK_BASELINE_READY] seat={seat} "
+                f"waited={waited_ms:.1f}ms "
+                f"attempts={baseline_wait_attempts}",
+                flush=True,
+            )
 
         region = (
             GEOM.get("stack_regions", {})
@@ -1227,6 +1266,16 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
             "level": level,
         })
 
+        if not state.get("snapshot_cached"):
+            emit({
+                "type": "snapshot_request",
+                "source_request_id": pending_id,
+                "hand_token": request_token,
+                "canonical_frame": result.get("canonical_frame"),
+            })
+            state["snapshot_cached"] = True
+
+
         log_latency(
             "event_emitted",
             request_id=pending_id,
@@ -1782,6 +1831,7 @@ def main():
     timeline = ObservationTimeline()
     correlator = ObservationCorrelator()
     episode_manager = ActionEpisodeManager()
+    episode_scheduler = StreetEpisodeScheduler()
     inference_engine = ActionInferenceEngine()
     commitment_tracker = StreetCommitmentTracker()
     commitment_street = "WAITING"
@@ -2003,35 +2053,69 @@ def main():
                 json.dumps(episode_manager.summary(), indent=2)
             )
 
-            ready_closed = [
-                episode
-                for episode in episode_manager.closed
-                if episode_ready_for_inference(episode)
-            ]
+            scheduler_status = episode_scheduler.status(
+                episode_manager.closed,
+                ready_for_inference=episode_ready_for_inference,
+                processed_episode_ids=(
+                    inference_engine.processed_episode_ids
+                ),
+            )
+
+            released_closed = episode_scheduler.release(
+                episode_manager.closed,
+                ready_for_inference=episode_ready_for_inference,
+                processed_episode_ids=(
+                    inference_engine.processed_episode_ids
+                ),
+            )
+
+            EPISODE_SCHEDULER_JSON.write_text(
+                json.dumps(
+                    scheduler_status,
+                    indent=2,
+                )
+                + "\n"
+            )
 
             deferred_count = (
-                len(episode_manager.closed)
-                - len(ready_closed)
+                len(scheduler_status.get("waiting") or [])
+                + len(scheduler_status.get("blocked") or [])
             )
 
             if deferred_count != last_deferred_count:
                 if deferred_count:
+                    waiting_ids = [
+                        item.get("episode_id")
+                        for item in (
+                            scheduler_status.get("waiting")
+                            or []
+                        )
+                    ]
+                    blocked_ids = [
+                        item.get("episode_id")
+                        for item in (
+                            scheduler_status.get("blocked")
+                            or []
+                        )
+                    ]
+
                     print(
-                        f"[INFERENCE] deferred preflop episodes="
-                        f"{deferred_count} waiting_for_positions",
+                        "[SCHEDULER] "
+                        f"waiting={waiting_ids} "
+                        f"blocked={blocked_ids} "
+                        "reason=older_episode_barrier",
                         flush=True,
                     )
                 elif last_deferred_count:
                     print(
-                        "[INFERENCE] deferred preflop "
-                        "episodes resolved",
+                        "[SCHEDULER] chronology barrier resolved",
                         flush=True,
                     )
 
                 last_deferred_count = deferred_count
 
             new_actions = inference_engine.ingest_closed(
-                ready_closed
+                released_closed
             )
 
             if new_actions:

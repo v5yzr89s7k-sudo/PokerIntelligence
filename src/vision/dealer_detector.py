@@ -49,71 +49,123 @@ def detect_dealer_button(image_or_path):
 
     results = []
 
-    for seat, zone in geometry["dealer_button_zones"].items():
-        x = int(zone["x"])
-        y = int(zone["y"])
-        w = int(zone["width"])
-        h = int(zone["height"])
+    for seat, zone_value in geometry["dealer_button_zones"].items():
+        # Backward-compatible schema:
+        #
+        # Old:
+        #   "seat_top": {"x": ..., "y": ..., ...}
+        #
+        # New:
+        #   "seat_top": [
+        #       {"x": ..., "y": ..., ...},
+        #       {"x": ..., "y": ..., ...},
+        #   ]
+        zones = (
+            zone_value
+            if isinstance(zone_value, list)
+            else [zone_value]
+        )
 
-        crop = image[y:y + h, x:x + w].copy()
+        seat_results = []
 
-        if crop.shape[0] < th or crop.shape[1] < tw:
-            raise ValueError(
-                f"Dealer zone for {seat} is smaller than template: "
-                f"zone={crop.shape[1]}x{crop.shape[0]} "
-                f"template={tw}x{th}"
+        for zone_index, zone in enumerate(zones):
+            x = int(zone["x"])
+            y = int(zone["y"])
+            w = int(zone["width"])
+            h = int(zone["height"])
+
+            crop = image[y:y + h, x:x + w].copy()
+
+            if crop.shape[0] < th or crop.shape[1] < tw:
+                raise ValueError(
+                    f"Dealer zone for {seat}[{zone_index}] "
+                    f"is smaller than template: "
+                    f"zone={crop.shape[1]}x{crop.shape[0]} "
+                    f"template={tw}x{th}"
+                )
+
+            crop_gray = normalize_patch(crop)
+
+            response = cv2.matchTemplate(
+                crop_gray,
+                template_gray,
+                cv2.TM_CCOEFF_NORMED,
             )
 
-        crop_gray = normalize_patch(crop)
+            _, confidence, _, location = cv2.minMaxLoc(
+                response
+            )
 
-        response = cv2.matchTemplate(
-            crop_gray,
-            template_gray,
-            cv2.TM_CCOEFF_NORMED,
-        )
+            match_center_x = location[0] + tw / 2.0
+            match_center_y = location[1] + th / 2.0
+            zone_center_x = w / 2.0
+            zone_center_y = h / 2.0
 
-        _, confidence, _, location = cv2.minMaxLoc(response)
+            center_distance = np.hypot(
+                match_center_x - zone_center_x,
+                match_center_y - zone_center_y,
+            )
 
-        match_center_x = location[0] + tw / 2.0
-        match_center_y = location[1] + th / 2.0
-        zone_center_x = w / 2.0
-        zone_center_y = h / 2.0
+            max_distance = np.hypot(
+                zone_center_x,
+                zone_center_y,
+            )
 
-        center_distance = np.hypot(
-            match_center_x - zone_center_x,
-            match_center_y - zone_center_y,
-        )
+            center_score = max(
+                0.0,
+                1.0 - center_distance / max_distance,
+            )
 
-        max_distance = np.hypot(zone_center_x, zone_center_y)
-        center_score = max(0.0, 1.0 - center_distance / max_distance)
+            score = float(
+                confidence * 0.85
+                + center_score * 0.15
+            )
 
-        # Template similarity is primary; expected-center proximity breaks ties.
-        score = float(confidence * 0.85 + center_score * 0.15)
+            annotated = crop.copy()
+            mx, my = location
 
-        annotated = crop.copy()
-        mx, my = location
+            cv2.rectangle(
+                annotated,
+                (mx, my),
+                (mx + tw, my + th),
+                (0, 255, 255),
+                1,
+            )
 
-        cv2.rectangle(
-            annotated,
-            (mx, my),
-            (mx + tw, my + th),
-            (0, 255, 255),
-            1,
-        )
+            cv2.imwrite(
+                str(
+                    DEBUG_DIR
+                    / f"{seat}_zone_{zone_index}.png"
+                ),
+                annotated,
+            )
 
-        cv2.imwrite(
-            str(DEBUG_DIR / f"{seat}.png"),
-            annotated,
-        )
+            seat_results.append({
+                "seat": seat,
+                "zone_index": zone_index,
+                "confidence": round(
+                    float(confidence),
+                    4,
+                ),
+                "center_score": round(
+                    float(center_score),
+                    4,
+                ),
+                "score": round(score, 4),
+                "match_x": int(x + mx),
+                "match_y": int(y + my),
+            })
 
-        results.append({
-            "seat": seat,
-            "confidence": round(float(confidence), 4),
-            "center_score": round(float(center_score), 4),
-            "score": round(score, 4),
-            "match_x": int(x + mx),
-            "match_y": int(y + my),
-        })
+        # One seat may have several legitimate render positions.
+        # Publish only that seat's strongest zone so each seat remains
+        # represented once in the final ranking.
+        if seat_results:
+            results.append(
+                max(
+                    seat_results,
+                    key=lambda item: item["score"],
+                )
+            )
 
     results.sort(key=lambda item: item["score"], reverse=True)
 
