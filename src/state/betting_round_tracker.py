@@ -242,60 +242,13 @@ class BettingRoundTracker:
         self.decisions.append(decision)
         return decision
 
-    def ingest(self, inferred_action: Any) -> Optional[CanonicalAction]:
-        self._sync_street()
-        item = self._action_dict(inferred_action)
-
-        episode_id = int(item.get("episode_id") or 0)
-        seat = item.get("seat") or "unknown"
-        action = (item.get("action") or UNKNOWN).upper()
-        action_street = (
-            item.get("street")
-            or self.hand.current_street
-            or "unknown"
-        ).upper()
-
-        if episode_id <= 0:
-            self._record_decision(
-                episode_id,
-                action_street,
-                seat,
-                action,
-                None,
-                False,
-                "missing or invalid episode id",
-            )
-            return None
-
-        if episode_id in self.processed_episode_ids:
-            return None
-
-        self.processed_episode_ids.add(episode_id)
-
-        if action_street != self.hand.current_street:
-            self._record_decision(
-                episode_id,
-                action_street,
-                seat,
-                action,
-                None,
-                False,
-                "action street does not match canonical hand street",
-            )
-            return None
-
-        if seat in ("", "unknown", "table"):
-            self._record_decision(
-                episode_id,
-                action_street,
-                seat,
-                action,
-                None,
-                False,
-                "action has no attributable player seat",
-            )
-            return None
-
+    def _classify_inferred_action(
+        self,
+        episode_id: int,
+        action_street: str,
+        seat: str,
+        action: str,
+    ):
         if action == POST_SMALL_BLIND:
             if action_street != "PREFLOP":
                 self._record_decision(
@@ -398,6 +351,75 @@ class BettingRoundTracker:
                 f"unsupported inferred action: {action}",
             )
             return None
+
+
+        return canonical_action, reason
+
+    def ingest(self, inferred_action: Any) -> Optional[CanonicalAction]:
+        self._sync_street()
+        item = self._action_dict(inferred_action)
+
+        episode_id = int(item.get("episode_id") or 0)
+        seat = item.get("seat") or "unknown"
+        action = (item.get("action") or UNKNOWN).upper()
+        action_street = (
+            item.get("street")
+            or self.hand.current_street
+            or "unknown"
+        ).upper()
+
+        if episode_id <= 0:
+            self._record_decision(
+                episode_id,
+                action_street,
+                seat,
+                action,
+                None,
+                False,
+                "missing or invalid episode id",
+            )
+            return None
+
+        if episode_id in self.processed_episode_ids:
+            return None
+
+        self.processed_episode_ids.add(episode_id)
+
+        if action_street != self.hand.current_street:
+            self._record_decision(
+                episode_id,
+                action_street,
+                seat,
+                action,
+                None,
+                False,
+                "action street does not match canonical hand street",
+            )
+            return None
+
+        if seat in ("", "unknown", "table"):
+            self._record_decision(
+                episode_id,
+                action_street,
+                seat,
+                action,
+                None,
+                False,
+                "action has no attributable player seat",
+            )
+            return None
+
+        classification = self._classify_inferred_action(
+            episode_id=episode_id,
+            action_street=action_street,
+            seat=seat,
+            action=action,
+        )
+
+        if classification is None:
+            return None
+
+        canonical_action, reason = classification
 
         measurements = item.get("measurements") or {}
         stack_change = measurements.get("stack_change") or {}
