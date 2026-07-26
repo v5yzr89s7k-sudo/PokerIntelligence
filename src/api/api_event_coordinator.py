@@ -1240,22 +1240,31 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
             PARTICIPANT_COLLECTOR.snapshot()
         )
 
-        emit({
-            "type": "table_context",
-            "hand_token": request_token,
-            "participant_frame_count": int(
-                participant_evidence.get("frame_count")
-                or 0
-            ),
-            "dealer_button_seat": dealer["dealer_button_seat"],
-            "dealt_in_seats": frozen_participants,
-            "positions": positions,
-            "hero_position": positions.get(
-                "hero",
-                "unknown",
-            ),
-            "players": local_players,
-        })
+        if frozen_participants:
+            emit({
+                "type": "table_context",
+                "hand_token": request_token,
+                "participant_frame_count": int(
+                    participant_evidence.get("frame_count")
+                    or 0
+                ),
+                "dealer_button_seat": dealer["dealer_button_seat"],
+                "dealt_in_seats": frozen_participants,
+                "positions": positions,
+                "hero_position": positions.get(
+                    "hero",
+                    "unknown",
+                ),
+                "players": local_players,
+            })
+        else:
+            print(
+                "[TABLE_CONTEXT_DEFER] "
+                f"hand_token={request_token} "
+                f"participant_frames={int(participant_evidence.get('frame_count') or 0)} "
+                "reason=participant_roster_not_frozen",
+                flush=True,
+            )
 
         emit({
             "type": "hero_cards",
