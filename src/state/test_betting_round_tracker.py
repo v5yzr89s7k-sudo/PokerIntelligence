@@ -1,6 +1,7 @@
 from src.observer.action_inference_engine import (
     InferredAction,
     BET_OR_RAISE,
+    CALL_OR_RAISE,
     CALL,
     FOLD_OR_RESOLVED,
     POST_SMALL_BLIND,
@@ -475,3 +476,110 @@ if __name__ == "__main__":
         print("PASS", test.__name__)
 
     print("ALL BETTING ROUND TRACKER TESTS PASSED")
+
+
+
+def test_bet_or_raise_becomes_bet_when_no_live_price():
+    hand = make_hand()
+    hand.set_board(["Ah", "7c", "2d"])
+    hand.current_bet_bb = 0.0
+
+    tracker = BettingRoundTracker(hand)
+
+    action = inferred(
+        100,
+        "seat_top",
+        BET_OR_RAISE,
+        street="FLOP",
+    )
+    action.measurements = {
+        "stack_change": {
+            "delta_bb": 3.0,
+        }
+    }
+
+    result = tracker.ingest(action)
+
+    assert result is not None
+    assert result.action == "BET"
+    assert result.amount_bb == 3.0
+
+
+def test_call_or_raise_becomes_call_when_matching_price():
+    hand = make_hand()
+    hand.set_board(["Ah", "7c", "2d"])
+    hand.current_bet_bb = 3.0
+
+    tracker = BettingRoundTracker(hand)
+
+    action = inferred(
+        101,
+        "hero",
+        CALL_OR_RAISE,
+        street="FLOP",
+    )
+    action.measurements = {
+        "stack_change": {
+            "delta_bb": 3.0,
+        }
+    }
+
+    result = tracker.ingest(action)
+
+    assert result is not None
+    assert result.action == "CALL"
+    assert result.amount_bb == 3.0
+
+
+def test_call_or_raise_becomes_raise_when_exceeding_price():
+    hand = make_hand()
+    hand.set_board(["Ah", "7c", "2d"])
+    hand.current_bet_bb = 3.0
+
+    hand.players["hero"].committed_by_street["FLOP"] = 2.0
+
+    tracker = BettingRoundTracker(hand)
+
+    action = inferred(
+        102,
+        "hero",
+        CALL_OR_RAISE,
+        street="FLOP",
+    )
+
+    action.measurements = {
+        "stack_change": {
+            "delta_bb": 3.0,
+        }
+    }
+
+    result = tracker.ingest(action)
+
+    assert result is not None
+    assert result.action == "RAISE"
+
+
+def test_bet_or_raise_becomes_raise_when_price_already_open():
+    hand = make_hand()
+    hand.set_board(["Ah", "7c", "2d"])
+    hand.current_bet_bb = 4.0
+
+    tracker = BettingRoundTracker(hand)
+
+    action = inferred(
+        103,
+        "seat_upper_right",
+        BET_OR_RAISE,
+        street="FLOP",
+    )
+
+    action.measurements = {
+        "stack_change": {
+            "delta_bb": 5.0,
+        }
+    }
+
+    result = tracker.ingest(action)
+
+    assert result is not None
+    assert result.action == "RAISE"
