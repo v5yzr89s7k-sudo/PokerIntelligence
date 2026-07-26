@@ -24,7 +24,38 @@ def _player_label(action: CanonicalAction) -> str:
     return position
 
 
-def format_action(action: CanonicalAction) -> str:
+def _raise_verb(
+    action: CanonicalAction,
+    aggression_index: Optional[int],
+) -> str:
+    """
+    Return poker-native raise language when street context is available.
+
+    Preflop:
+      first aggression  -> opens
+      second aggression -> 3-bets
+      third aggression  -> 4-bets
+
+    Postflop and context-free calls retain the generic "raises" wording.
+    """
+    if (
+        action.street != "PREFLOP"
+        or aggression_index is None
+        or aggression_index <= 0
+    ):
+        return "raises"
+
+    if aggression_index == 1:
+        return "opens"
+
+    return f"{aggression_index + 1}-bets"
+
+
+def format_action(
+    action: CanonicalAction,
+    *,
+    aggression_index: Optional[int] = None,
+) -> str:
     player = _player_label(action)
     kind = action.action.upper()
 
@@ -76,7 +107,10 @@ def format_action(action: CanonicalAction) -> str:
         if kind == "BET_OR_RAISE":
             verb = "bets or raises"
         else:
-            verb = "raises"
+            verb = _raise_verb(
+                action,
+                aggression_index,
+            )
 
         return f"{player} {verb}{suffix}" + (
             f" to {amount}" if amount else ""
@@ -185,7 +219,22 @@ def render_canonical_hand(hand: CanonicalHand) -> str:
     )
 
     preflop = actions_by_street["PREFLOP"]
-    lines.extend(format_action(item) for item in preflop)
+    preflop_aggression_index = 0
+
+    for item in preflop:
+        aggression_index = None
+
+        if item.action.upper() in {"BET", "RAISE"}:
+            preflop_aggression_index += 1
+            aggression_index = preflop_aggression_index
+
+        lines.append(
+            format_action(
+                item,
+                aggression_index=aggression_index,
+            )
+        )
+
     if not preflop:
         lines.append("")
 

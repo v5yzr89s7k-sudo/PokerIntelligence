@@ -94,7 +94,7 @@ assert "Starting Pot: 3.4 BB" in text
 assert "Ending Pot: 8.4 BB" in text
 
 assert "CO (Alice) folds" in text
-assert "BTN (Bob) raises to 2.2 BB" in text
+assert "BTN (Bob) opens to 2.2 BB" in text
 assert "BB (Hero) calls 1.2 BB" in text
 assert "FLOP: Ah 7c 2d" in text
 assert "BTN (Bob) bets 2.5 BB" in text
@@ -106,3 +106,60 @@ assert "Hero wins main pot" in text
 
 print(text)
 print("CanonicalHand renderer smoke test passed.")
+
+
+def test_preflop_raise_language():
+    language_hand = CanonicalHand().start_hand(
+        hand_id="raise-language",
+        players=[
+            {
+                "seat": "seat_top",
+                "name": "Alice",
+                "stack_bb": 50,
+            },
+            {
+                "seat": "seat_upper_right",
+                "name": "Bob",
+                "stack_bb": 50,
+            },
+            {
+                "seat": "hero",
+                "name": "Hero",
+                "stack_bb": 50,
+                "is_hero": True,
+            },
+        ],
+        hero_cards=["As", "Kd"],
+        hero_position="BTN",
+        positions={
+            "seat_top": "CO",
+            "seat_upper_right": "SB",
+            "hero": "BTN",
+        },
+        started_ts=200.0,
+    )
+
+    language_hand.add_action(
+        "seat_top",
+        "RAISE",
+        raise_to_bb=2.5,
+        ts=201.0,
+    )
+    language_hand.add_action(
+        "hero",
+        "RAISE",
+        raise_to_bb=8.0,
+        ts=202.0,
+    )
+    language_hand.add_action(
+        "seat_upper_right",
+        "RAISE",
+        raise_to_bb=22.0,
+        ts=203.0,
+    )
+
+    rendered = render_canonical_hand(language_hand)
+
+    assert "CO (Alice) opens to 2.5 BB" in rendered
+    assert "BTN (Hero) 3-bets to 8 BB" in rendered
+    assert "SB (Bob) 4-bets to 22 BB" in rendered

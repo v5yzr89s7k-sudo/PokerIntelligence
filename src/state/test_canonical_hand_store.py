@@ -76,7 +76,7 @@ with TemporaryDirectory() as tmp:
 
     rendered = store.text_path.read_text()
 
-    assert "BTN (Alice) raises to 2.2 BB" in rendered
+    assert "BTN (Alice) opens to 2.2 BB" in rendered
     assert "BB (Hero) calls 1.2 BB" in rendered
 
     print(rendered)
