@@ -1,6 +1,6 @@
 from pathlib import Path
 from time import perf_counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 import base64
 import copy
 import json
@@ -284,6 +284,197 @@ def _build_content(cards):
         })
 
     return content, image_bytes
+
+
+def _request_cards_api(cards, dealer):
+    content, image_bytes = _build_content(cards)
+
+    api_started = perf_counter()
+
+    response = CLIENT.responses.create(
+        model="gpt-4.1-mini",
+        input=[{
+            "role": "user",
+            "content": content,
+        }],
+    )
+
+    api_ms = (
+        perf_counter() - api_started
+    ) * 1000.0
+
+    parse_started = perf_counter()
+
+    data = _extract_json(
+        response.output_text
+    )
+
+    normalized = _normalize_result(
+        data,
+        cards,
+        dealer,
+    )
+
+    parse_ms = (
+        perf_counter() - parse_started
+    ) * 1000.0
+
+    return {
+        "api_ms": api_ms,
+        "parse_ms": parse_ms,
+        "image_bytes": image_bytes,
+        "players": normalized.get("players") or [],
+        "confidence": normalized.get("confidence"),
+    }
+
+
+def _request_cards_parallel(cards, dealer):
+    if not cards:
+        return {
+            "api_ms": 0.0,
+            "parse_ms": 0.0,
+            "image_bytes": 0,
+            "players": [],
+            "confidence": None,
+            "seat_api_ms": {},
+            "failures": {},
+        }
+
+    wall_started = perf_counter()
+
+    players_by_seat = {}
+    confidences = []
+    seat_api_ms = {}
+    failures = {}
+    total_parse_ms = 0.0
+    total_image_bytes = 0
+
+    worker_count = min(
+        8,
+        len(cards),
+    )
+
+    executor = ThreadPoolExecutor(
+        max_workers=worker_count,
+    )
+
+    futures = {
+        executor.submit(
+            _request_cards_api,
+            [card],
+            dealer,
+        ): card
+        for card in cards
+    }
+
+    done, pending = wait(
+        futures,
+        timeout=8.0,
+    )
+
+    for future in done:
+        card = futures[future]
+        seat = card["seat"]
+
+        try:
+            result = future.result()
+        except Exception as exc:
+            failures[seat] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+            continue
+
+        seat_api_ms[seat] = round(
+            float(result.get("api_ms") or 0.0),
+            1,
+        )
+
+        total_parse_ms += float(
+            result.get("parse_ms") or 0.0
+        )
+        total_image_bytes += int(
+            result.get("image_bytes") or 0
+        )
+
+        confidence = result.get("confidence")
+        if isinstance(confidence, (int, float)):
+            confidences.append(float(confidence))
+
+        for player in result.get("players") or []:
+            player_seat = player.get("seat")
+            if player_seat == seat:
+                players_by_seat[seat] = player
+                break
+
+    for future in pending:
+        card = futures[future]
+        seat = card["seat"]
+
+        failures[seat] = "parallel_timeout"
+        future.cancel()
+
+    executor.shutdown(
+        wait=False,
+        cancel_futures=True,
+    )
+
+    wall_ms = (
+        perf_counter() - wall_started
+    ) * 1000.0
+
+    # Preserve deterministic topology even if one seat request fails.
+    # Failed seats normalize to blank OCR fields and will not persist a
+    # blank identity in the cache.
+    players = []
+
+    for card in cards:
+        seat = card["seat"]
+
+        player = players_by_seat.get(seat)
+
+        if player is None:
+            player = {
+                "seat": seat,
+                "name": "",
+                "stack_text": "",
+                "stack_bb": None,
+                "is_hero": seat == "hero",
+                "is_active": True,
+            }
+
+        players.append(player)
+
+    confidence = (
+        sum(confidences) / len(confidences)
+        if confidences
+        else None
+    )
+
+    print(
+        "[SNAPSHOT_PARALLEL] "
+        f"seats={len(cards)} "
+        f"workers={worker_count} "
+        f"wall={wall_ms:.1f}ms "
+        f"failures={len(failures)} "
+        f"seat_api_ms={seat_api_ms}",
+        flush=True,
+    )
+
+    if failures:
+        print(
+            f"[SNAPSHOT_PARALLEL_FAILURES] {failures}",
+            flush=True,
+        )
+
+    return {
+        "api_ms": wall_ms,
+        "parse_ms": total_parse_ms,
+        "image_bytes": total_image_bytes,
+        "players": players,
+        "confidence": confidence,
+        "seat_api_ms": seat_api_ms,
+        "failures": failures,
+    }
 
 
 def _normalize_result(data, cards, dealer):
@@ -615,37 +806,38 @@ def read_table_snapshot_v2(frame):
     fresh_players = {}
 
     if changed_cards:
-        api_t0 = perf_counter()
-        response = CLIENT.responses.create(
-            model="gpt-4.1-mini",
-            input=[{
-                "role": "user",
-                "content": content,
-            }],
-        )
-        primary_api_ms = (
-            perf_counter() - api_t0
-        ) * 1000.0
-        api_ms = primary_api_ms
-
-        parse_t0 = perf_counter()
-        data = _extract_json(
-            response.output_text
-        )
-        partial = _normalize_result(
-            data,
+        parallel_result = _request_cards_parallel(
             changed_cards,
             dealer,
         )
-        primary_parse_ms = (
-            perf_counter() - parse_t0
-        ) * 1000.0
-        confidence = partial.get(
+
+        primary_api_ms = float(
+            parallel_result.get("api_ms")
+            or 0.0
+        )
+        api_ms = primary_api_ms
+
+        primary_parse_ms = float(
+            parallel_result.get("parse_ms")
+            or 0.0
+        )
+
+        # Use the actual sum of per-seat JPEG payloads.
+        image_bytes = int(
+            parallel_result.get("image_bytes")
+            or image_bytes
+        )
+
+        confidence = parallel_result.get(
             "confidence"
         )
+
         fresh_players = {
             player["seat"]: player
-            for player in partial["players"]
+            for player in (
+                parallel_result.get("players")
+                or []
+            )
         }
 
         # Retry unreadable opponent names once using only the failed

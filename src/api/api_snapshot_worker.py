@@ -284,8 +284,6 @@ def process_event(event, processed_hero_events):
         frame=str(frame),
     )
 
-    print("[LATENCY_DEBUG] snapshot begin", flush=True)
-
     latency_begin(
         request_id,
         "snapshot_pipeline",
@@ -536,8 +534,6 @@ def process_event(event, processed_hero_events):
         flush=True,
     )
     print("=====================================================\n", flush=True)
-
-    print("[LATENCY_DEBUG] snapshot end", flush=True)
 
     latency_end(
         request_id,

@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import math
 import statistics
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -69,7 +70,12 @@ for stage, vals in groups.items():
     if len(vals) == 1:
         p95 = vals[0]
     else:
-        idx = int(0.95 * (len(vals)-1))
+        # Nearest-rank percentile: P95 cannot fall below the
+        # highest observation in a very small sample.
+        idx = max(
+            0,
+            math.ceil(0.95 * len(vals)) - 1,
+        )
         p95 = vals[idx]
 
     mx = max(vals)
