@@ -126,6 +126,9 @@ def default_state():
         "hand_token": "",
         "participant_frame_count": 0,
         "participant_validation_recorded": False,
+        "canonical_snapshot_ready": False,
+        "pending_board_events": [],
+        "pending_inferred_actions": [],
         "timeline": [],
     }
 
@@ -397,44 +400,54 @@ def handle_table_snapshot(state, event):
         state["canonical_snapshot_ready"] = True
         canonical_save(canonical)
 
-        pending = list(state.get("pending_board_events") or [])
+        pending_events = []
+
+        for pending_event in list(
+            state.get("pending_board_events") or []
+        ):
+            pending_events.append(
+                ("board", dict(pending_event))
+            )
+
+        for pending_event in list(
+            state.get("pending_inferred_actions") or []
+        ):
+            pending_events.append(
+                ("inferred_action", dict(pending_event))
+            )
+
         state["pending_board_events"] = []
+        state["pending_inferred_actions"] = []
 
-        for pending_event in pending:
-            pending_board = normalize_cards(
-                pending_event.get("board") or []
+        pending_events.sort(
+            key=lambda item: float(
+                item[1].get("ts") or 0.0
             )
+        )
 
-            if len(pending_board) not in (3, 4, 5):
-                continue
-
-            if len(pending_board) <= len(state.get("board") or []):
-                continue
-
-            next_phase = transition_for_board_len(
-                len(pending_board)
-            )
-
-            state["phase"] = next_phase
-            state["board"] = pending_board
-
-            canonical.set_board(
-                pending_board,
-                ts=pending_event.get("ts") or time.time(),
-            )
-
-            state = record_timeline(
-                state,
-                f"board {next_phase} {' '.join(pending_board)}",
-            )
-
-            print(
-                f"[STATE] replayed buffered board -> "
-                f"{next_phase} {pending_board}",
-                flush=True,
-            )
-
-        canonical_save(canonical)
+        for event_type, pending_event in pending_events:
+            if event_type == "board":
+                state = handle_board(
+                    state,
+                    pending_event,
+                )
+                print(
+                    "[STATE] replayed buffered board "
+                    f"{pending_event.get('board') or []}",
+                    flush=True,
+                )
+            else:
+                state = handle_inferred_action(
+                    state,
+                    pending_event,
+                )
+                print(
+                    "[STATE] replayed buffered inferred_action "
+                    f"{pending_event.get('street')} "
+                    f"{pending_event.get('seat')} "
+                    f"{pending_event.get('action')}",
+                    flush=True,
+                )
 
     print("[STATE] table_snapshot", hero_position, f"players={len(players)}")
     return state
@@ -530,6 +543,7 @@ def handle_hero_cards(state, event):
         and state.get("positions")
     )
     state["pending_board_events"] = []
+    state["pending_inferred_actions"] = []
 
     canonical = CanonicalHand().start_hand(
         hand_id=f"live-{int(state['hand_started_at'] * 1000)}",
@@ -779,6 +793,25 @@ def handle_hero_fold(state, event):
 def handle_inferred_action(state, event):
     if state.get("phase") == "WAITING":
         print("[SKIP] inferred_action while waiting", event)
+        return state
+
+    if not state.get("canonical_snapshot_ready"):
+        pending = list(
+            state.get("pending_inferred_actions") or []
+        )
+        pending.append(dict(event))
+        pending.sort(
+            key=lambda item: float(item.get("ts") or 0.0)
+        )
+        state["pending_inferred_actions"] = pending
+
+        print(
+            "[BUFFER] inferred_action until table_snapshot "
+            f"street={event.get('street')} "
+            f"seat={event.get('seat')} "
+            f"action={event.get('action')}",
+            flush=True,
+        )
         return state
 
     canonical = canonical_load()
