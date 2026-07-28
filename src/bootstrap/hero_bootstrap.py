@@ -71,3 +71,21 @@ def validate_hero_result(result):
         return None, f"invalid_cards:{cards!r}"
 
     return list(cards), None
+
+
+def freeze_participants(
+    participant_collector,
+    *,
+    hand_token,
+    frozen_ts,
+):
+    """
+    Produce the authoritative frozen participant roster.
+
+    This remains a behavior-preserving wrapper while participant
+    initialization ownership migrates out of the coordinator.
+    """
+    return participant_collector.freeze(
+        hand_token=hand_token,
+        frozen_ts=frozen_ts,
+    )

@@ -38,7 +38,10 @@ from src.vision.action_sequence_recorder import ActionSequenceRecorder
 from src.vision.stack_reader import read_stack
 from src.vision.dealer_detector import detect_dealer_button
 from src.api.position_engine import assign_positions
-from src.bootstrap.hero_bootstrap import validate_hero_result
+from src.bootstrap.hero_bootstrap import (
+    freeze_participants,
+    validate_hero_result,
+)
 from src.api.stack_transition_validator import (
     ACCEPT as STACK_ACCEPT,
     REJECT as STACK_REJECT,
@@ -1129,7 +1132,8 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
                 flush=True,
             )
 
-        frozen_participants = PARTICIPANT_COLLECTOR.freeze(
+        frozen_participants = freeze_participants(
+            PARTICIPANT_COLLECTOR,
             hand_token=request_token,
             frozen_ts=time.time(),
         )
