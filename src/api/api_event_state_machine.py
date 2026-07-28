@@ -574,11 +574,18 @@ def handle_table_snapshot(state, event):
 
 def handle_table_context(state, event):
     """
-    Accept the coordinator-owned immutable roster and position context.
+    Temporary diagnostic event.
 
-    The asynchronous table snapshot may later enrich names and starting
-    stacks, but it may not redefine the current hand's participants,
-    dealer, positions, or Hero position.
+    The initial table snapshot is now the authoritative source for:
+      - roster
+      - dealt-in seats
+      - dealer
+      - positions
+      - Hero position
+      - starting stacks
+
+    table_context remains only to support participant validation during
+    the migration and will be removed after validation is complete.
     """
     dealt_in_seats = list(event.get("dealt_in_seats") or [])
     positions = dict(event.get("positions") or {})
@@ -612,18 +619,15 @@ def handle_table_context(state, event):
             "is_active": True,
         })
 
-    state["players"] = players
-    state["dealt_in_seats"] = dealt_in_seats
-    state["hand_token"] = str(
-        event.get("hand_token") or ""
-    )
+    # Snapshot is now the authoritative source for roster,
+    # positions, dealer, and dealt-in seats.
+    #
+    # table_context is retained temporarily for diagnostics and
+    # participant validation only.
     state["participant_frame_count"] = int(
         event.get("participant_frame_count") or 0
     )
     state["participant_validation_recorded"] = False
-    state["dealer_button_seat"] = dealer_button_seat
-    state["positions"] = positions
-    state["hero_position"] = hero_position
 
     print(
         f"[STATE] table_context "
