@@ -187,7 +187,7 @@ def _normalize_name(value):
     return name
 
 
-def _prepare(frame_path):
+def _prepare(frame_path, dealt_in_seats=None):
     image = cv2.imread(
         str(frame_path)
     )
@@ -211,12 +211,25 @@ def _prepare(frame_path):
         occupied_only=False,
     )
 
-    selected_cards = [
-        card
-        for card in all_cards
-        if card["occupied"]
-        or card["seat"] == "hero"
-    ]
+    authoritative = {
+        seat
+        for seat in (dealt_in_seats or [])
+        if seat
+    }
+
+    if authoritative:
+        selected_cards = [
+            card
+            for card in all_cards
+            if card["seat"] in authoritative
+        ]
+    else:
+        selected_cards = [
+            card
+            for card in all_cards
+            if card["occupied"]
+            or card["seat"] == "hero"
+        ]
 
     if not selected_cards:
         raise RuntimeError(
@@ -341,6 +354,7 @@ def _request_cards_parallel(cards, dealer):
         }
 
     wall_started = perf_counter()
+    max_workers = min(8, len(cards))
 
     players_by_seat = {}
     confidences = []
@@ -349,87 +363,61 @@ def _request_cards_parallel(cards, dealer):
     total_parse_ms = 0.0
     total_image_bytes = 0
 
-    worker_count = min(
-        8,
-        len(cards),
-    )
+    with ThreadPoolExecutor(
+        max_workers=max_workers
+    ) as executor:
+        futures = {
+            executor.submit(
+                _request_cards_api,
+                [card],
+                dealer,
+            ): card["seat"]
+            for card in cards
+        }
 
-    executor = ThreadPoolExecutor(
-        max_workers=worker_count,
-    )
+        # All futures are already running concurrently. Iterating here
+        # only collects their completed results.
+        for future, seat in futures.items():
+            try:
+                result = future.result()
+            except Exception as exc:
+                failures[seat] = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
 
-    futures = {
-        executor.submit(
-            _request_cards_api,
-            [card],
-            dealer,
-        ): card
-        for card in cards
-    }
-
-    done, pending = wait(
-        futures,
-        timeout=8.0,
-    )
-
-    for future in done:
-        card = futures[future]
-        seat = card["seat"]
-
-        try:
-            result = future.result()
-        except Exception as exc:
-            failures[seat] = (
-                f"{type(exc).__name__}: {exc}"
+            seat_api_ms[seat] = round(
+                float(result.get("api_ms") or 0.0),
+                1,
             )
-            continue
 
-        seat_api_ms[seat] = round(
-            float(result.get("api_ms") or 0.0),
-            1,
-        )
+            total_parse_ms += float(
+                result.get("parse_ms") or 0.0
+            )
+            total_image_bytes += int(
+                result.get("image_bytes") or 0
+            )
 
-        total_parse_ms += float(
-            result.get("parse_ms") or 0.0
-        )
-        total_image_bytes += int(
-            result.get("image_bytes") or 0
-        )
+            confidence = result.get("confidence")
+            if isinstance(confidence, (int, float)):
+                confidences.append(float(confidence))
 
-        confidence = result.get("confidence")
-        if isinstance(confidence, (int, float)):
-            confidences.append(float(confidence))
+            for player in result.get("players") or []:
+                player_seat = player.get("seat")
 
-        for player in result.get("players") or []:
-            player_seat = player.get("seat")
-            if player_seat == seat:
-                players_by_seat[seat] = player
-                break
-
-    for future in pending:
-        card = futures[future]
-        seat = card["seat"]
-
-        failures[seat] = "parallel_timeout"
-        future.cancel()
-
-    executor.shutdown(
-        wait=False,
-        cancel_futures=True,
-    )
+                if player_seat == seat:
+                    players_by_seat[seat] = player
+                    break
 
     wall_ms = (
         perf_counter() - wall_started
     ) * 1000.0
 
-    # Preserve deterministic topology even if one seat request fails.
-    # Failed seats normalize to blank OCR fields and will not persist a
-    # blank identity in the cache.
+    # Preserve deterministic seat topology even when one request fails.
     players = []
 
     for card in cards:
         seat = card["seat"]
-
         player = players_by_seat.get(seat)
 
         if player is None:
@@ -453,7 +441,7 @@ def _request_cards_parallel(cards, dealer):
     print(
         "[SNAPSHOT_PARALLEL] "
         f"seats={len(cards)} "
-        f"workers={worker_count} "
+        f"workers={max_workers} "
         f"wall={wall_ms:.1f}ms "
         f"failures={len(failures)} "
         f"seat_api_ms={seat_api_ms}",
@@ -467,6 +455,7 @@ def _request_cards_parallel(cards, dealer):
         )
 
     return {
+        # Wall time is the actual latency paid by the snapshot.
         "api_ms": wall_ms,
         "parse_ms": total_parse_ms,
         "image_bytes": total_image_bytes,
@@ -475,7 +464,6 @@ def _request_cards_parallel(cards, dealer):
         "seat_api_ms": seat_api_ms,
         "failures": failures,
     }
-
 
 def _normalize_result(data, cards, dealer):
     allowed = {
@@ -559,12 +547,17 @@ def _normalize_result(data, cards, dealer):
 def _cache_fingerprint_image(card):
     seat = card["seat"]
     seat_rect = GEOMETRY["seat_regions"][seat]
+    stack_rect = GEOMETRY["stack_regions"][seat]
     bounds = card["bounds"]
 
     x1 = int(seat_rect["x"]) - bounds["x1"]
     y1 = int(seat_rect["y"]) - bounds["y1"]
     x2 = x1 + int(seat_rect["width"])
-    y2 = y1 + int(seat_rect["height"])
+
+    # Identity fingerprint excludes the changing stack line.
+    stack_start_y = int(stack_rect["y"]) - int(seat_rect["y"])
+    fingerprint_height = max(1, stack_start_y - 2)
+    y2 = y1 + fingerprint_height
 
     return card["image"][y1:y2, x1:x2]
 
@@ -675,7 +668,7 @@ def _read_local_stacks(cards, cache_snapshot):
     )
 
 
-def read_table_snapshot_v2(frame):
+def read_table_snapshot_v2(frame, dealt_in_seats=None):
     total_t0 = perf_counter()
 
     frame_path = Path(
@@ -689,7 +682,8 @@ def read_table_snapshot_v2(frame):
 
     prepare_t0 = perf_counter()
     canonical, cards = _prepare(
-        frame_path
+        frame_path,
+        dealt_in_seats=dealt_in_seats,
     )
     prepare_ms = (
         perf_counter() - prepare_t0
@@ -852,17 +846,54 @@ def read_table_snapshot_v2(frame):
         ]
 
         if missing_name_cards:
-            retry_count = len(missing_name_cards)
+            recovered_from_cache = []
+            still_blank = []
+
+            for card in missing_name_cards:
+                seat = card["seat"]
+                player = fresh_players.get(seat) or {}
+                cached = cache.get(seat) or {}
+                cached_name = cached.get("name")
+
+                if cached_name:
+                    player["name"] = cached_name
+                    fresh_players[seat] = player
+                    recovered_from_cache.append(seat)
+                else:
+                    still_blank.append(seat)
 
             print(
-                "[SNAPSHOT_NAME_RETRY_SKIPPED]",
+                "[SNAPSHOT_NAME_CACHE_FALLBACK]",
                 {
-                    "seats": [
+                    "requested": [
                         card["seat"]
                         for card in missing_name_cards
                     ],
-                    "reason": "hot_path_disabled",
+                    "recovered": sorted(
+                        recovered_from_cache
+                    ),
+                    "still_blank": sorted(
+                        still_blank
+                    ),
                 },
+                flush=True,
+            )
+
+        # Hero identity is stable across hands. A changing visual fingerprint
+        # must not erase a previously confirmed Hero name.
+        hero_player = fresh_players.get("hero")
+        hero_cached = cache.get("hero") or {}
+
+        if (
+            hero_player is not None
+            and not hero_player.get("name")
+            and hero_cached.get("name")
+        ):
+            hero_player["name"] = hero_cached["name"]
+
+            print(
+                "[SNAPSHOT_HERO_NAME_FALLBACK] "
+                f"name={hero_cached['name']!r}",
                 flush=True,
             )
 

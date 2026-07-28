@@ -160,12 +160,13 @@ def emit(event):
         f.flush()
 
 
-def run_snapshot(frame):
+def run_snapshot(frame, dealt_in_seats=None):
     t0 = perf_counter()
 
     try:
         snapshot, timings = read_table_snapshot_v2(
             frame,
+            dealt_in_seats=dealt_in_seats,
         )
     except Exception as exc:
         elapsed_ms = (perf_counter() - t0) * 1000.0
@@ -301,52 +302,11 @@ def process_event(event, processed_hero_events):
     # Hero-card recognition can complete before six temporal
     # participant frames have accumulated. Wait briefly for the
     # coordinator's shared evidence instead of failing immediately.
-    shared_evidence = {}
-    participant_wait_started = time.time()
-    participant_wait_timeout = 3.0
-
-    while True:
-        candidate_evidence = read_evidence(
-            PARTICIPANT_EVIDENCE_PATH
-        )
-
-        candidate_token = str(
-            candidate_evidence.get("hand_token") or ""
-        )
-        candidate_frames = int(
-            candidate_evidence.get("frame_count") or 0
-        )
-
-        if (
-            candidate_token == expected_token
-            and candidate_frames >= 6
-        ):
-            shared_evidence = candidate_evidence
-            wait_ms = (
-                time.time() - participant_wait_started
-            ) * 1000.0
-            print(
-                "[PARTICIPANT_EVIDENCE_READY] "
-                f"frames={candidate_frames} "
-                f"wait_ms={wait_ms:.1f}",
-                flush=True,
-            )
-            break
-
-        if (
-            time.time() - participant_wait_started
-            >= participant_wait_timeout
-        ):
-            shared_evidence = candidate_evidence
-            print(
-                "[PARTICIPANT_EVIDENCE_TIMEOUT] "
-                f"frames={candidate_frames} "
-                f"token_match={candidate_token == expected_token}",
-                flush=True,
-            )
-            break
-
-        time.sleep(0.10)
+    # Do not block the opening snapshot waiting for participant evidence.
+    # Use whatever evidence already exists immediately.
+    shared_evidence = read_evidence(
+        PARTICIPANT_EVIDENCE_PATH
+    )
 
     shared_token = str(
         shared_evidence.get("hand_token") or ""
@@ -409,7 +369,10 @@ def process_event(event, processed_hero_events):
     )
 
 
-    snapshot, elapsed_ms = run_snapshot(frame)
+    snapshot, elapsed_ms = run_snapshot(
+        frame,
+        dealt_in_seats=dealt_in_seats,
+    )
 
     if snapshot:
         snapshot["dealt_in_seats"] = dealt_in_seats
@@ -557,6 +520,9 @@ def process_event(event, processed_hero_events):
     emit({
         "type": "table_snapshot",
         "players": players,
+        "dealer_button_seat": dealer_button_seat,
+        "positions": positions,
+        "hero_position": hero_position,
         "dealt_in_seats": list(
             snapshot.get("dealt_in_seats") or []
         ),

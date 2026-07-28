@@ -129,6 +129,9 @@ def default_state():
         "canonical_snapshot_ready": False,
         "pending_board_events": [],
         "pending_inferred_actions": [],
+        "pending_stack_updates": [],
+        "pending_pot_updates": [],
+        "pending_terminal_events": [],
         "timeline": [],
     }
 
@@ -306,9 +309,15 @@ def seed_forced_blinds(state, canonical):
 
 def handle_table_snapshot(state, event):
     players = event.get("players") or []
-    dealt_in_seats = state.get("dealt_in_seats") or []
+    prior_dealt_in_seats = list(
+        state.get("dealt_in_seats") or []
+    )
     snapshot_dealt_in_seats = list(
         event.get("dealt_in_seats") or []
+    )
+    dealt_in_seats = (
+        snapshot_dealt_in_seats
+        or prior_dealt_in_seats
     )
 
     event_hand_token = str(
@@ -330,7 +339,7 @@ def handle_table_snapshot(state, event):
     ):
         validation = record_participant_comparison(
             hand_token=event_hand_token,
-            local_dealt_in=dealt_in_seats,
+            local_dealt_in=prior_dealt_in_seats,
             snapshot_dealt_in=snapshot_dealt_in_seats,
             local_frame_count=state.get(
                 "participant_frame_count"
@@ -375,14 +384,49 @@ def handle_table_snapshot(state, event):
             flush=True,
         )
 
-    dealer_button_seat = state.get("dealer_button_seat") or ""
-    positions = state.get("positions") or {}
-    hero_position = state.get("hero_position") or "unknown"
+    dealer_button_seat = (
+        event.get("dealer_button_seat")
+        or state.get("dealer_button_seat")
+        or ""
+    )
+    positions = dict(
+        event.get("positions")
+        or state.get("positions")
+        or {}
+    )
+    hero_position = (
+        event.get("hero_position")
+        or positions.get("hero")
+        or state.get("hero_position")
+        or "unknown"
+    )
 
     state["players"] = players
+    state["dealt_in_seats"] = list(dealt_in_seats)
+    state["dealer_button_seat"] = dealer_button_seat
+    state["positions"] = positions
+    state["hero_position"] = hero_position
+
+    if event_hand_token:
+        state["hand_token"] = event_hand_token
 
     if state.get("phase") != "WAITING":
-        canonical = canonical_load()
+
+        if state.get("canonical_snapshot_ready"):
+            canonical = canonical_load()
+        else:
+            canonical = CanonicalHand().start_hand(
+                hand_id=f"live-{int(state['hand_started_at'] * 1000)}",
+                players=players,
+                hero_cards=state.get("hero_cards", []),
+                hero_position=hero_position,
+                positions=positions,
+                started_ts=state["hand_started_at"],
+            )
+
+            canonical.dealt_in_seats = list(
+                dealt_in_seats
+            )
 
         canonical.update_table_snapshot(
             players=players,
@@ -403,6 +447,20 @@ def handle_table_snapshot(state, event):
         pending_events = []
 
         for pending_event in list(
+            state.get("pending_stack_updates") or []
+        ):
+            pending_events.append(
+                ("stack_update", dict(pending_event))
+            )
+
+        for pending_event in list(
+            state.get("pending_pot_updates") or []
+        ):
+            pending_events.append(
+                ("pot_update", dict(pending_event))
+            )
+
+        for pending_event in list(
             state.get("pending_board_events") or []
         ):
             pending_events.append(
@@ -416,8 +474,24 @@ def handle_table_snapshot(state, event):
                 ("inferred_action", dict(pending_event))
             )
 
+        for pending_event in list(
+            state.get("pending_terminal_events") or []
+        ):
+            event_type = pending_event.get("type")
+
+            if event_type in (
+                "hero_fold",
+                "hand_complete",
+            ):
+                pending_events.append(
+                    (event_type, dict(pending_event))
+                )
+
         state["pending_board_events"] = []
         state["pending_inferred_actions"] = []
+        state["pending_stack_updates"] = []
+        state["pending_pot_updates"] = []
+        state["pending_terminal_events"] = []
 
         pending_events.sort(
             key=lambda item: float(
@@ -426,7 +500,29 @@ def handle_table_snapshot(state, event):
         )
 
         for event_type, pending_event in pending_events:
-            if event_type == "board":
+            if event_type == "stack_update":
+                state = handle_stack_update(
+                    state,
+                    pending_event,
+                )
+                print(
+                    "[STATE] replayed buffered stack_update "
+                    f"{pending_event.get('seat')}",
+                    flush=True,
+                )
+
+            elif event_type == "pot_update":
+                state = handle_pot_update(
+                    state,
+                    pending_event,
+                )
+                print(
+                    "[STATE] replayed buffered pot_update "
+                    f"{pending_event.get('pot_bb')}",
+                    flush=True,
+                )
+
+            elif event_type == "board":
                 state = handle_board(
                     state,
                     pending_event,
@@ -436,7 +532,8 @@ def handle_table_snapshot(state, event):
                     f"{pending_event.get('board') or []}",
                     flush=True,
                 )
-            else:
+
+            elif event_type == "inferred_action":
                 state = handle_inferred_action(
                     state,
                     pending_event,
@@ -448,6 +545,27 @@ def handle_table_snapshot(state, event):
                     f"{pending_event.get('action')}",
                     flush=True,
                 )
+
+            elif event_type == "hero_fold":
+                state = handle_hero_fold(
+                    state,
+                    pending_event,
+                )
+                print(
+                    "[STATE] replayed buffered hero_fold",
+                    flush=True,
+                )
+
+            elif event_type == "hand_complete":
+                state = handle_hand_complete(
+                    state,
+                    pending_event,
+                )
+                print(
+                    "[STATE] replayed buffered hand_complete",
+                    flush=True,
+                )
+                break
 
     print("[STATE] table_snapshot", hero_position, f"players={len(players)}")
     return state
@@ -536,30 +654,19 @@ def handle_hero_cards(state, event):
     state["result"] = None
     state["forced_blinds_seeded"] = False
     state["level"] = dict(event.get("level") or {})
-    # table_context is the authoritative prerequisite for live poker state.
-    # Snapshot OCR is enrichment only and must not delay the hand.
-    state["canonical_snapshot_ready"] = bool(
-        state.get("dealt_in_seats")
-        and state.get("positions")
-    )
+    # The initial table snapshot is the authoritative source for
+    # roster, positions, dealer, and starting stacks.
+    state["canonical_snapshot_ready"] = False
     state["pending_board_events"] = []
     state["pending_inferred_actions"] = []
+    state["pending_stack_updates"] = []
+    state["pending_pot_updates"] = []
+    state["pending_terminal_events"] = []
 
-    canonical = CanonicalHand().start_hand(
-        hand_id=f"live-{int(state['hand_started_at'] * 1000)}",
-        players=state.get("players", []),
-        hero_cards=cards,
-        hero_position=state.get("hero_position", "unknown"),
-        positions=state.get("positions", {}),
-        started_ts=state["hand_started_at"],
+    print(
+        "[CANONICAL_INIT] deferred until table snapshot",
+        flush=True,
     )
-
-    canonical.dealt_in_seats = list(
-        state.get("dealt_in_seats") or []
-    )
-
-    seed_forced_blinds(state, canonical)
-    canonical_save(canonical)
 
     state = record_timeline(state, f"hero_cards {' '.join(cards)}")
     print("[STATE] WAITING -> PREFLOP", cards)
@@ -577,6 +684,23 @@ def handle_stack_update(state, event):
 
     if not seat or current_stack_bb is None:
         print("[SKIP] invalid stack_update", event)
+        return state
+
+    if not state.get("canonical_snapshot_ready"):
+        pending = list(
+            state.get("pending_stack_updates") or []
+        )
+        pending.append(dict(event))
+        pending.sort(
+            key=lambda item: float(item.get("ts") or 0.0)
+        )
+        state["pending_stack_updates"] = pending
+
+        print(
+            f"[BUFFER] stack_update until table_snapshot "
+            f"seat={seat}",
+            flush=True,
+        )
         return state
 
     canonical = canonical_load()
@@ -628,6 +752,23 @@ def handle_pot_update(state, event):
 
     if not 0.1 <= observed <= 1000.0:
         print(f"[SKIP] out-of-range pot_update pot={observed}")
+        return state
+
+    if not state.get("canonical_snapshot_ready"):
+        pending = list(
+            state.get("pending_pot_updates") or []
+        )
+        pending.append(dict(event))
+        pending.sort(
+            key=lambda item: float(item.get("ts") or 0.0)
+        )
+        state["pending_pot_updates"] = pending
+
+        print(
+            f"[BUFFER] pot_update until table_snapshot "
+            f"pot={observed:.2f}",
+            flush=True,
+        )
         return state
 
     canonical = canonical_load()
@@ -752,6 +893,25 @@ def handle_hero_action_complete(state, event):
 
 def handle_hero_fold(state, event):
     if state.get("phase") == "WAITING":
+        return state
+
+    if not state.get("canonical_snapshot_ready"):
+        pending = list(
+            state.get("pending_terminal_events") or []
+        )
+        pending.append({
+            **dict(event),
+            "type": "hero_fold",
+        })
+        pending.sort(
+            key=lambda item: float(item.get("ts") or 0.0)
+        )
+        state["pending_terminal_events"] = pending
+
+        print(
+            "[BUFFER] hero_fold until table_snapshot",
+            flush=True,
+        )
         return state
 
     canonical = canonical_load()
@@ -1003,6 +1163,25 @@ def write_validation_summary(canonical, archived):
 
 def handle_hand_complete(state, event):
     if state["phase"] == "WAITING":
+        return state
+
+    if not state.get("canonical_snapshot_ready"):
+        pending = list(
+            state.get("pending_terminal_events") or []
+        )
+        pending.append({
+            **dict(event),
+            "type": "hand_complete",
+        })
+        pending.sort(
+            key=lambda item: float(item.get("ts") or 0.0)
+        )
+        state["pending_terminal_events"] = pending
+
+        print(
+            "[BUFFER] hand_complete until table_snapshot",
+            flush=True,
+        )
         return state
 
     result = event.get("result") or "Hand complete"

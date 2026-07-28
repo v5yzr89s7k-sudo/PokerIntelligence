@@ -6,6 +6,7 @@ import subprocess
 import cv2
 import sys
 import uuid
+from collections import deque
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -325,11 +326,16 @@ def enrich_stack_change_measurements(
                 entry["baseline_wait_started_ts"] = now
 
             # Avoid flooding the terminal while the snapshot worker runs.
+            waited_seconds = (
+                now
+                - float(entry["baseline_wait_started_ts"])
+            )
+
+            # Canonical initialization is snapshot-driven and may take
+            # longer than the normal stack OCR settlement window. Preserve
+            # the transition until the authoritative baseline is available.
             if wait_attempts == 1 or wait_attempts % 10 == 0:
-                waited_ms = (
-                    now
-                    - float(entry["baseline_wait_started_ts"])
-                ) * 1000.0
+                waited_ms = waited_seconds * 1000.0
 
                 print(
                     f"[STACK_SETTLE_WAIT] seat={seat} "
@@ -355,6 +361,11 @@ def enrich_stack_change_measurements(
                 now
                 - float(baseline_wait_started_ts)
             ) * 1000.0
+
+            # Baseline waiting must not consume the independent OCR retry
+            # budget. Begin that budget only after CanonicalHand is ready.
+            entry["first_change_ts"] = now
+            entry["ocr_attempts"] = 0
 
             print(
                 f"[STACK_BASELINE_READY] seat={seat} "
@@ -1847,6 +1858,12 @@ def main():
     last_deferred_count = None
     previous_occupied_bet_regions = set()
 
+    # Preserve the captures immediately preceding local Hero-card detection.
+    # A fast early-position fold may occur before HAND_START_LOCAL creates the
+    # hand token. Replaying this short buffer lets participant evidence retain
+    # players who were dealt in but folded before the trigger frame.
+    participant_frame_buffer = deque(maxlen=8)
+
 
     INFERRED_ACTIONS_JSON.write_text(
         json.dumps(inference_engine.to_dict(), indent=2)
@@ -1871,6 +1888,13 @@ def main():
             continue
 
         img = cv2.resize(img, (934, 696))
+
+        participant_frame_buffer.append(
+            (
+                img.copy(),
+                str(frame or ""),
+            )
+        )
 
         # Continuously accumulate hand-start participant evidence while
         # the coordinator is already processing live frames. This is
@@ -1915,11 +1939,25 @@ def main():
                 flush=True,
             )
 
-            # Include the same frame that triggered local hand start.
-            collect_participant_evidence(
-                img,
-                frame,
-                state,
+            # Replay the short pre-hand capture window. This includes the
+            # trigger frame and preceding frames where a fast UTG/SB fold may
+            # still have shown both card backs.
+            replayed_frames = 0
+
+            for buffered_img, buffered_path in list(
+                participant_frame_buffer
+            ):
+                collect_participant_evidence(
+                    buffered_img,
+                    buffered_path,
+                    state,
+                )
+                replayed_frames += 1
+
+            print(
+                "[PARTICIPANT_PREBUFFER] "
+                f"frames={replayed_frames}",
+                flush=True,
             )
 
         current_stack_street = str(

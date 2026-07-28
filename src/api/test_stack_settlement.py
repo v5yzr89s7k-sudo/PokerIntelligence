@@ -132,13 +132,44 @@ def test_positive_jump_does_not_mutate_baseline():
     assert "hero" not in state["pending_stack_reads"]
 
 
+def test_missing_canonical_baseline_times_out():
+    state = make_state()
+    state["pending_stack_reads"]["seat_lower_right"] = {
+        "first_change_ts": time.time() - 5.0,
+        "last_change_ts": time.time() - 4.0,
+        "baseline_wait_started_ts": time.time() - 3.0,
+        "baseline_wait_attempts": 10,
+        "max_mean_diff": 4.0,
+        "origin_street": "PREFLOP",
+    }
+    state["pending_stack_reads"].pop("hero", None)
+
+    changes = make_changes()
+    image = np.zeros((696, 934, 3), dtype=np.uint8)
+
+    with patch(
+        "src.api.api_event_coordinator._canonical_stack_values",
+        return_value={},
+    ):
+        enrich_stack_change_measurements(
+            changes,
+            image,
+            state,
+        )
+
+    assert changes.stack_changed_seats == []
+    assert changes.stack_change_details == {}
+    assert "seat_lower_right" not in state["pending_stack_reads"]
+
 def main():
     test_zero_stack_is_retried_without_all_in_confirmation()
     test_single_vote_is_retried_without_mutating_baseline()
     test_trusted_decrease_is_accepted()
     test_positive_jump_does_not_mutate_baseline()
+    test_missing_canonical_baseline_times_out()
 
     print("stack settlement safety tests passed")
+
 
 
 if __name__ == "__main__":
