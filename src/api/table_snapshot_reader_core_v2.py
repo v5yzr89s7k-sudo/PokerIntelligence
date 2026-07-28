@@ -1,6 +1,6 @@
 from pathlib import Path
 from time import perf_counter
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 import base64
 import copy
 import json
@@ -355,6 +355,7 @@ def _request_cards_parallel(cards, dealer):
 
     wall_started = perf_counter()
     max_workers = min(8, len(cards))
+    deadline_seconds = 3.5
 
     players_by_seat = {}
     confidences = []
@@ -363,21 +364,26 @@ def _request_cards_parallel(cards, dealer):
     total_parse_ms = 0.0
     total_image_bytes = 0
 
-    with ThreadPoolExecutor(
+    executor = ThreadPoolExecutor(
         max_workers=max_workers
-    ) as executor:
-        futures = {
-            executor.submit(
-                _request_cards_api,
-                [card],
-                dealer,
-            ): card["seat"]
-            for card in cards
-        }
+    )
 
-        # All futures are already running concurrently. Iterating here
-        # only collects their completed results.
-        for future, seat in futures.items():
+    futures = {
+        executor.submit(
+            _request_cards_api,
+            [card],
+            dealer,
+        ): card["seat"]
+        for card in cards
+    }
+
+    try:
+        for future in as_completed(
+            futures,
+            timeout=deadline_seconds,
+        ):
+            seat = futures[future]
+
             try:
                 result = future.result()
             except Exception as exc:
@@ -409,11 +415,32 @@ def _request_cards_parallel(cards, dealer):
                     players_by_seat[seat] = player
                     break
 
+    except TimeoutError:
+        pass
+
+    finally:
+        for future, seat in futures.items():
+            if future.done():
+                continue
+
+            failures[seat] = (
+                f"snapshot_deadline_exceeded:"
+                f"{deadline_seconds:.1f}s"
+            )
+            future.cancel()
+
+        # Do not block snapshot publication on API stragglers.
+        executor.shutdown(
+            wait=False,
+            cancel_futures=True,
+        )
+
     wall_ms = (
         perf_counter() - wall_started
     ) * 1000.0
 
-    # Preserve deterministic seat topology even when one request fails.
+    # Preserve deterministic seat topology when a request fails or times out.
+    # Later cache/local-stack fallback can enrich incomplete seats.
     players = []
 
     for card in cards:
@@ -442,6 +469,7 @@ def _request_cards_parallel(cards, dealer):
         "[SNAPSHOT_PARALLEL] "
         f"seats={len(cards)} "
         f"workers={max_workers} "
+        f"deadline={deadline_seconds:.1f}s "
         f"wall={wall_ms:.1f}ms "
         f"failures={len(failures)} "
         f"seat_api_ms={seat_api_ms}",
@@ -455,7 +483,6 @@ def _request_cards_parallel(cards, dealer):
         )
 
     return {
-        # Wall time is the actual latency paid by the snapshot.
         "api_ms": wall_ms,
         "parse_ms": total_parse_ms,
         "image_bytes": total_image_bytes,
