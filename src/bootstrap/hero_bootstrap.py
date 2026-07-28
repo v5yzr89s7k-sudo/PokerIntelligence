@@ -178,3 +178,97 @@ class HeroBootstrap:
             "dealer": dealer,
             "positions": positions,
         }
+
+
+def bootstrap_local_stacks(
+    *,
+    canonical_image,
+    frozen_participants,
+    geometry,
+    crop_geometry_region,
+    stack_reader,
+):
+    """
+    Build the initial local player list from stack OCR.
+
+    Returns:
+        local_players
+    """
+    local_players = []
+
+    for seat in frozen_participants:
+        stack_result = {
+            "stack_bb": None,
+            "stack_text": "",
+            "confidence": 0.0,
+            "mode": "unavailable",
+        }
+
+        region = (
+            (geometry.get("stack_regions") or {})
+            .get(seat)
+        )
+
+        if canonical_image is not None and region:
+            stack_crop = crop_geometry_region(
+                canonical_image,
+                region,
+            )
+
+            if stack_crop is not None and stack_crop.size:
+                try:
+                    stack_result = stack_reader(stack_crop)
+                except Exception as exc:
+                    print(
+                        f"[LOCAL_STACK] seat={seat} "
+                        f"failed={type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+
+        stack_bb = stack_result.get("stack_bb")
+        confidence = float(
+            stack_result.get("confidence") or 0.0
+        )
+        votes = int(
+            stack_result.get("votes") or 0
+        )
+
+        trusted = (
+            stack_bb is not None
+            and float(stack_bb) > 0.0
+            and confidence >= 0.95
+            and votes >= 2
+        )
+
+        local_players.append({
+            "seat": seat,
+            "name": "",
+            "stack_bb": (
+                float(stack_bb)
+                if trusted
+                else None
+            ),
+            "stack_text": (
+                str(stack_result.get("stack_text") or "")
+                if trusted
+                else ""
+            ),
+            "stack_confidence": confidence,
+            "stack_read_mode": stack_result.get(
+                "mode",
+                "unknown",
+            ),
+            "is_hero": seat == "hero",
+            "is_active": True,
+        })
+
+        print(
+            f"[LOCAL_STACK] seat={seat} "
+            f"stack={stack_bb if trusted else None} "
+            f"confidence={confidence:.2f} "
+            f"votes={votes} "
+            f"trusted={trusted}",
+            flush=True,
+        )
+
+    return local_players

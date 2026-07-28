@@ -36,7 +36,10 @@ from src.vision.window_capture import find_acr_table_window, capture_window_crop
 from src.api.canonical_frame import to_canonical_frame
 from src.vision.action_sequence_recorder import ActionSequenceRecorder
 from src.vision.stack_reader import read_stack
-from src.bootstrap.hero_bootstrap import HeroBootstrap
+from src.bootstrap.hero_bootstrap import (
+    HeroBootstrap,
+    bootstrap_local_stacks,
+)
 from src.api.stack_transition_validator import (
     ACCEPT as STACK_ACCEPT,
     REJECT as STACK_REJECT,
@@ -1148,7 +1151,6 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
 
         # Seed the fast table context with local stack OCR from the same
         # canonical Hero-card frame. GPT remains deferred name enrichment.
-        local_players = []
         canonical_frame_path = result.get("canonical_frame")
         canonical_image = (
             cv2.imread(str(canonical_frame_path))
@@ -1162,77 +1164,13 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
                 (934, 696),
             )
 
-        for seat in frozen_participants:
-            stack_result = {
-                "stack_bb": None,
-                "stack_text": "",
-                "confidence": 0.0,
-                "mode": "unavailable",
-            }
-
-            region = (GEOM.get("stack_regions") or {}).get(seat)
-
-            if canonical_image is not None and region:
-                stack_crop = _crop_geometry_region(
-                    canonical_image,
-                    region,
-                )
-
-                if stack_crop is not None and stack_crop.size:
-                    try:
-                        stack_result = read_stack(stack_crop)
-                    except Exception as exc:
-                        print(
-                            f"[LOCAL_STACK] seat={seat} "
-                            f"failed={type(exc).__name__}: {exc}",
-                            flush=True,
-                        )
-
-            stack_bb = stack_result.get("stack_bb")
-            confidence = float(
-                stack_result.get("confidence") or 0.0
-            )
-            votes = int(
-                stack_result.get("votes") or 0
-            )
-
-            trusted = (
-                stack_bb is not None
-                and float(stack_bb) > 0.0
-                and confidence >= 0.95
-                and votes >= 2
-            )
-
-            local_players.append({
-                "seat": seat,
-                "name": "",
-                "stack_bb": (
-                    float(stack_bb)
-                    if trusted
-                    else None
-                ),
-                "stack_text": (
-                    str(stack_result.get("stack_text") or "")
-                    if trusted
-                    else ""
-                ),
-                "stack_confidence": confidence,
-                "stack_read_mode": stack_result.get(
-                    "mode",
-                    "unknown",
-                ),
-                "is_hero": seat == "hero",
-                "is_active": True,
-            })
-
-            print(
-                f"[LOCAL_STACK] seat={seat} "
-                f"stack={stack_bb if trusted else None} "
-                f"confidence={confidence:.2f} "
-                f"votes={votes} "
-                f"trusted={trusted}",
-                flush=True,
-            )
+        local_players = bootstrap_local_stacks(
+            canonical_image=canonical_image,
+            frozen_participants=frozen_participants,
+            geometry=GEOM,
+            crop_geometry_region=_crop_geometry_region,
+            stack_reader=read_stack,
+        )
 
         participant_evidence = (
             PARTICIPANT_COLLECTOR.snapshot()
