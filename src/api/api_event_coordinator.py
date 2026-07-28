@@ -38,6 +38,7 @@ from src.vision.action_sequence_recorder import ActionSequenceRecorder
 from src.vision.stack_reader import read_stack
 from src.vision.dealer_detector import detect_dealer_button
 from src.api.position_engine import assign_positions
+from src.bootstrap.hero_bootstrap import validate_hero_result
 from src.api.stack_transition_validator import (
     ACCEPT as STACK_ACCEPT,
     REJECT as STACK_REJECT,
@@ -1082,18 +1083,13 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
             state["hero_visible_seen"] = 0
             return state
 
-        if not result.get("ok"):
+        cards, validation_error = validate_hero_result(result)
+
+        if validation_error:
             print(
-                f"[HERO] worker result failed "
-                f"error={result.get('error') or 'unknown'}"
+                f"[HERO] rejected worker result "
+                f"reason={validation_error}"
             )
-            state["hero_visible_seen"] = 0
-            return state
-
-        cards = result.get("hero_cards") or []
-
-        if len(cards) != 2 or not all(cards):
-            print(f"[HERO] invalid worker cards={cards}")
             state["hero_visible_seen"] = 0
             return state
 
