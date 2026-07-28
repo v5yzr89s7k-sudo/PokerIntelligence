@@ -36,12 +36,7 @@ from src.vision.window_capture import find_acr_table_window, capture_window_crop
 from src.api.canonical_frame import to_canonical_frame
 from src.vision.action_sequence_recorder import ActionSequenceRecorder
 from src.vision.stack_reader import read_stack
-from src.vision.dealer_detector import detect_dealer_button
-from src.api.position_engine import assign_positions
-from src.bootstrap.hero_bootstrap import (
-    HeroBootstrap,
-    freeze_participants,
-)
+from src.bootstrap.hero_bootstrap import HeroBootstrap
 from src.api.stack_transition_validator import (
     ACCEPT as STACK_ACCEPT,
     REJECT as STACK_REJECT,
@@ -1088,7 +1083,9 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
 
         bootstrap = HeroBootstrap.initialize_hand(
             result=result,
+            participant_collector=PARTICIPANT_COLLECTOR,
             hand_token=request_token,
+            frozen_ts=time.time(),
         )
 
         cards = bootstrap["hero_cards"]
@@ -1138,31 +1135,15 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
                 flush=True,
             )
 
-        frozen_participants = freeze_participants(
-            PARTICIPANT_COLLECTOR,
-            hand_token=request_token,
-            frozen_ts=time.time(),
-        )
+        frozen_participants = bootstrap["frozen_participants"]
+        dealer = bootstrap["dealer"]
+        positions = bootstrap["positions"]
 
         print(
             f"[PARTICIPANT_FREEZE_PUBLISH] "
             f"count={len(frozen_participants)} "
             f"seats={frozen_participants}",
             flush=True,
-        )
-
-        dealer = detect_dealer_button(
-            result["canonical_frame"]
-        )
-
-        position_players = [
-            {"seat": seat}
-            for seat in frozen_participants
-        ]
-
-        positions = assign_positions(
-            position_players,
-            dealer["dealer_button_seat"],
         )
 
         # Seed the fast table context with local stack OCR from the same

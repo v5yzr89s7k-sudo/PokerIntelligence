@@ -42,6 +42,9 @@ Behavior must remain identical while functionality is migrated
 incrementally.
 """
 
+from src.api.position_engine import assign_positions
+from src.vision.dealer_detector import detect_dealer_button
+
 
 def validate_hero_result(result):
     """
@@ -122,21 +125,56 @@ class HeroBootstrap:
     def initialize_hand(
         *,
         result,
-        **kwargs,
+        participant_collector,
+        hand_token,
+        frozen_ts,
     ):
         """
         Begin hand initialization from a completed Hero worker result.
 
         Current ownership:
             validate Hero worker result
-
-        Remaining responsibilities stay in the coordinator until moved
-        here in later, behavior-preserving steps.
+            freeze participants
+            detect dealer
+            assign positions
         """
         cards, validation_error = validate_hero_result(result)
 
+        if validation_error:
+            return {
+                "hand_token": hand_token,
+                "hero_cards": None,
+                "validation_error": validation_error,
+                "frozen_participants": [],
+                "dealer": None,
+                "positions": {},
+            }
+
+        frozen_participants = freeze_participants(
+            participant_collector,
+            hand_token=hand_token,
+            frozen_ts=frozen_ts,
+        )
+
+        dealer = detect_dealer_button(
+            result["canonical_frame"]
+        )
+
+        position_players = [
+            {"seat": seat}
+            for seat in frozen_participants
+        ]
+
+        positions = assign_positions(
+            position_players,
+            dealer["dealer_button_seat"],
+        )
+
         return {
-            **kwargs,
+            "hand_token": hand_token,
             "hero_cards": cards,
-            "validation_error": validation_error,
+            "validation_error": None,
+            "frozen_participants": frozen_participants,
+            "dealer": dealer,
+            "positions": positions,
         }
