@@ -39,8 +39,8 @@ from src.vision.stack_reader import read_stack
 from src.vision.dealer_detector import detect_dealer_button
 from src.api.position_engine import assign_positions
 from src.bootstrap.hero_bootstrap import (
+    HeroBootstrap,
     freeze_participants,
-    validate_hero_result,
 )
 from src.api.stack_transition_validator import (
     ACCEPT as STACK_ACCEPT,
@@ -1086,7 +1086,13 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
             state["hero_visible_seen"] = 0
             return state
 
-        cards, validation_error = validate_hero_result(result)
+        bootstrap = HeroBootstrap.initialize_hand(
+            result=result,
+            hand_token=request_token,
+        )
+
+        cards = bootstrap["hero_cards"]
+        validation_error = bootstrap["validation_error"]
 
         if validation_error:
             print(

@@ -89,3 +89,54 @@ def freeze_participants(
         hand_token=hand_token,
         frozen_ts=frozen_ts,
     )
+
+
+class HeroBootstrap:
+    """
+    Owns hand initialization after a successful Hero-card read.
+
+    Migration plan
+    --------------
+
+    Phase 1 (complete)
+        ✓ validate_hero_result()
+
+    Phase 2 (complete)
+        ✓ freeze_participants()
+
+    Phase 3
+        initialize_hand()
+
+    Future responsibilities:
+
+        dealer detection
+        position assignment
+        local stack bootstrap
+        participant snapshot
+        table_context construction
+        hero_cards emission
+        snapshot_request emission
+    """
+
+    @staticmethod
+    def initialize_hand(
+        *,
+        result,
+        **kwargs,
+    ):
+        """
+        Begin hand initialization from a completed Hero worker result.
+
+        Current ownership:
+            validate Hero worker result
+
+        Remaining responsibilities stay in the coordinator until moved
+        here in later, behavior-preserving steps.
+        """
+        cards, validation_error = validate_hero_result(result)
+
+        return {
+            **kwargs,
+            "hero_cards": cards,
+            "validation_error": validation_error,
+        }
