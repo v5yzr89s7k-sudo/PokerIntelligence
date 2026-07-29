@@ -255,6 +255,60 @@ class ParticipantFreezer:
         )
         return freezer.restore(evidence)
 
+    def identity_frames(self):
+        """
+        Return the strongest available hand-start frame for each dealt-in
+        opponent seat.
+
+        Participant evidence already records the frame that produced each
+        seat's strongest card-back score. Exposing one deterministic frame per
+        seat lets downstream identity readers avoid later frames containing
+        transient action labels.
+
+        Hero is excluded because Hero identity is session-stable and does not
+        use visual fingerprint invalidation.
+        """
+        frames = {}
+
+        for seat in self._dealt_in_seats:
+            if seat == "hero":
+                continue
+
+            seat_scores = self.max_scores.get(seat) or {}
+            seat_frames = self.max_frames.get(seat) or {}
+
+            candidates = [
+                (
+                    float(seat_scores.get("card_1") or 0.0),
+                    str(seat_frames.get("card_1") or ""),
+                ),
+                (
+                    float(seat_scores.get("card_2") or 0.0),
+                    str(seat_frames.get("card_2") or ""),
+                ),
+            ]
+
+            # Prefer the frame with the strongest calibrated card-back score.
+            # In an exact tie, preserve deterministic card_1 precedence.
+            candidates.sort(
+                key=lambda item: item[0],
+                reverse=True,
+            )
+
+            frame_path = next(
+                (
+                    frame
+                    for _, frame in candidates
+                    if frame
+                ),
+                "",
+            )
+
+            if frame_path:
+                frames[seat] = frame_path
+
+        return frames
+
     def snapshot(self):
         return {
             "started_ts": self.started_ts,
@@ -266,6 +320,7 @@ class ParticipantFreezer:
             "stable_dealt_in_seats": (
                 self.stable_dealt_in_seats()
             ),
+            "identity_frames": self.identity_frames(),
             "max_scores": deepcopy(self.max_scores),
             "max_frames": deepcopy(self.max_frames),
             "positive_frames": deepcopy(
