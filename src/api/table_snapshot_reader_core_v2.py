@@ -26,6 +26,7 @@ from src.api.snapshot_cache import (
     stack_lookup,
     stack_update,
 )
+from src.identity.identity_manager import IdentityManager
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -62,6 +63,9 @@ INVALID_PLAYER_NAMES = {
     "SEAT_MID_LEFT",
     "SEAT_UPPER_LEFT",
 }
+
+IDENTITY_MANAGER = IdentityManager()
+
 
 PROMPT_HEADER = """
 Read this ACR poker table using the deterministic seat information supplied below.
@@ -743,7 +747,18 @@ def read_table_snapshot_v2(frame, dealt_in_seats=None):
         # Preserve the cached Hero identity instead of treating these
         # temporary UI states as a player change.
         if card["seat"] == "hero":
-            entry = cache.get("hero")
+            cached_entry = cache.get("hero")
+
+            identity = IDENTITY_MANAGER.resolve_hero(
+                seat="hero",
+                cached_entry=cached_entry,
+            )
+
+            entry = (
+                cached_entry
+                if identity.resolved
+                else None
+            )
         else:
             entry = cache_lookup(
                 cache,
