@@ -222,24 +222,44 @@ class HeroBootstrap:
         }
 
 
-def bootstrap_local_stacks(
+def build_local_players(*, frozen_participants):
+    """
+    Build the initial local player records without performing OCR.
+    """
+    return [
+        {
+            "seat": seat,
+            "name": "",
+            "stack_bb": None,
+            "stack_text": "",
+            "stack_confidence": 0.0,
+            "stack_read_mode": "unavailable",
+            "is_hero": seat == "hero",
+            "is_active": True,
+        }
+        for seat in frozen_participants
+    ]
+
+
+def populate_local_stacks(
     *,
+    local_players,
     canonical_image,
-    frozen_participants,
     geometry,
     crop_geometry_region,
     stack_reader,
 ):
     """
-    Build the initial local player list from stack OCR.
-
-    Returns:
-        local_players
+    Populate existing local player records using stack OCR.
     """
     total_started = time.perf_counter()
-    local_players = []
 
-    for seat in frozen_participants:
+    players_by_seat = {
+        player["seat"]: player
+        for player in local_players
+    }
+
+    for seat, player in players_by_seat.items():
         stack_result = {
             "stack_bb": None,
             "stack_text": "",
@@ -283,9 +303,7 @@ def bootstrap_local_stacks(
             and votes >= 2
         )
 
-        local_players.append({
-            "seat": seat,
-            "name": "",
+        player.update({
             "stack_bb": (
                 float(stack_bb)
                 if trusted
@@ -301,8 +319,6 @@ def bootstrap_local_stacks(
                 "mode",
                 "unknown",
             ),
-            "is_hero": seat == "hero",
-            "is_active": True,
         })
 
         print(
@@ -321,8 +337,32 @@ def bootstrap_local_stacks(
     print(
         "[LATENCY_WATERFALL] "
         f"local_stack_bootstrap={total_ms:.1f}ms "
-        f"seats={len(frozen_participants)}",
+        f"seats={len(local_players)}",
         flush=True,
     )
 
     return local_players
+
+
+def bootstrap_local_stacks(
+    *,
+    canonical_image,
+    frozen_participants,
+    geometry,
+    crop_geometry_region,
+    stack_reader,
+):
+    """
+    Preserve the existing stack-bootstrap behavior through the split API.
+    """
+    local_players = build_local_players(
+        frozen_participants=frozen_participants,
+    )
+
+    return populate_local_stacks(
+        local_players=local_players,
+        canonical_image=canonical_image,
+        geometry=geometry,
+        crop_geometry_region=crop_geometry_region,
+        stack_reader=stack_reader,
+    )
