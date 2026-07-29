@@ -736,11 +736,20 @@ def read_table_snapshot_v2(frame, dealt_in_seats=None):
     for card in cards:
         fingerprint = _cache_fingerprint_image(card)
 
-        entry = cache_lookup(
-            cache,
-            card["seat"],
-            fingerprint,
-        )
+        # Hero identity is session-stable. The nameplate is frequently
+        # replaced by transient labels such as POST BB, ANTE, FOLD, CALL,
+        # CHECK, and RAISE, making visual fingerprint matching unreliable.
+        #
+        # Preserve the cached Hero identity instead of treating these
+        # temporary UI states as a player change.
+        if card["seat"] == "hero":
+            entry = cache.get("hero")
+        else:
+            entry = cache_lookup(
+                cache,
+                card["seat"],
+                fingerprint,
+            )
 
         # Preserve cached identity for stable "SITTING OUT" seats.
         if entry is None:
