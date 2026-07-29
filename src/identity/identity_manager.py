@@ -41,15 +41,15 @@ class IdentityManager:
 
     def resolve_cached_opponent(self, *, seat, cached_entry=None):
         """
-        Convert an already validated cache entry into an identity record.
+        Resolve an already validated opponent cache entry.
 
-        Fingerprint validation remains in the existing snapshot reader during
-        this extraction phase. Moving that decision behind this interface is
-        a later behavior-preserving commit.
+        Returns:
+            (IdentityRecord, cache_entry_or_none)
         """
+
         entry = dict(cached_entry or {})
 
-        return IdentityRecord(
+        identity = IdentityRecord(
             seat=seat,
             name=entry.get("name") or "",
             source=(
@@ -59,6 +59,11 @@ class IdentityManager:
             ),
             confidence=entry.get("confidence"),
             changed=False,
+        )
+
+        return (
+            identity,
+            entry if identity.resolved else None,
         )
 
     def unresolved(self, *, seat):

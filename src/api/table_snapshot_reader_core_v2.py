@@ -760,10 +760,15 @@ def read_table_snapshot_v2(frame, dealt_in_seats=None):
                 else None
             )
         else:
-            entry = cache_lookup(
-                cache,
-                card["seat"],
-                fingerprint,
+            identity, entry = (
+                IDENTITY_MANAGER.resolve_cached_opponent(
+                    seat=card["seat"],
+                    cached_entry=cache_lookup(
+                        cache,
+                        card["seat"],
+                        fingerprint,
+                    ),
+                )
             )
 
         # Preserve cached identity for stable "SITTING OUT" seats.

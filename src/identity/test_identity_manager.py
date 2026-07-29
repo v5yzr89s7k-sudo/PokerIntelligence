@@ -53,7 +53,7 @@ def test_unresolved_hero():
 def test_cached_opponent():
     manager = IdentityManager()
 
-    record = manager.resolve_cached_opponent(
+    record, entry = manager.resolve_cached_opponent(
         seat="seat_upper_right",
         cached_entry={
             "name": "OpponentOne",
@@ -64,6 +64,10 @@ def test_cached_opponent():
     assert record.name == "OpponentOne"
     assert record.source == "cache"
     assert record.confidence == 0.91
+    assert entry == {
+        "name": "OpponentOne",
+        "confidence": 0.91,
+    }
 
 
 def main():
