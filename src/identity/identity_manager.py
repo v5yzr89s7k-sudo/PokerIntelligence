@@ -66,6 +66,32 @@ class IdentityManager:
             entry if identity.resolved else None,
         )
 
+
+    def cache_lookup(
+        self,
+        *,
+        cache,
+        seat,
+        fingerprint,
+        lookup_fn,
+    ):
+        """
+        Resolve a cached opponent identity.
+
+        During the migration phase, the actual fingerprint comparison
+        is delegated to the existing lookup function. This preserves
+        behavior while moving cache ownership behind IdentityManager.
+        """
+
+        return self.resolve_cached_opponent(
+            seat=seat,
+            cached_entry=lookup_fn(
+                cache,
+                seat,
+                fingerprint,
+            ),
+        )
+
     def unresolved(self, *, seat):
         return IdentityRecord(
             seat=seat,

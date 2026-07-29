@@ -761,13 +761,11 @@ def read_table_snapshot_v2(frame, dealt_in_seats=None):
             )
         else:
             identity, entry = (
-                IDENTITY_MANAGER.resolve_cached_opponent(
+                IDENTITY_MANAGER.cache_lookup(
+                    cache=cache,
                     seat=card["seat"],
-                    cached_entry=cache_lookup(
-                        cache,
-                        card["seat"],
-                        fingerprint,
-                    ),
+                    fingerprint=fingerprint,
+                    lookup_fn=cache_lookup,
                 )
             )
 
