@@ -316,8 +316,9 @@ def enrich_stack_change_measurements(
         previous = canonical_values.get(seat)
         if previous is None:
             # The asynchronous table snapshot may still be initializing the
-            # canonical hand. Preserve this pending transition and retry on a
-            # later frame instead of permanently discarding it.
+            # canonical hand. Wait briefly for the authoritative starting
+            # stack, but do not block forever if this seat never receives one.
+
             wait_attempts = int(
                 entry.get("baseline_wait_attempts")
                 or 0
@@ -327,25 +328,28 @@ def enrich_stack_change_measurements(
             if entry.get("baseline_wait_started_ts") is None:
                 entry["baseline_wait_started_ts"] = now
 
-            # Avoid flooding the terminal while the snapshot worker runs.
             waited_seconds = (
                 now
                 - float(entry["baseline_wait_started_ts"])
             )
 
-            # Canonical initialization is snapshot-driven and may take
-            # longer than the normal stack OCR settlement window. Preserve
-            # the transition until the authoritative baseline is available.
             if wait_attempts == 1 or wait_attempts % 10 == 0:
-                waited_ms = waited_seconds * 1000.0
-
                 print(
                     f"[STACK_SETTLE_WAIT] seat={seat} "
                     f"reason=canonical_baseline_not_ready "
                     f"attempt={wait_attempts} "
-                    f"waited={waited_ms:.1f}ms",
+                    f"waited={waited_seconds * 1000.0:.1f}ms",
                     flush=True,
                 )
+
+            if waited_seconds >= maximum_pending_seconds:
+                print(
+                    f"[STACK_BASELINE_TIMEOUT] "
+                    f"seat={seat} "
+                    f"waited={waited_seconds * 1000.0:.1f}ms",
+                    flush=True,
+                )
+                pending.pop(seat, None)
 
             continue
 
