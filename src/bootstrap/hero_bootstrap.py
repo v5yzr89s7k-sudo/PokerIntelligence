@@ -42,6 +42,8 @@ Behavior must remain identical while functionality is migrated
 incrementally.
 """
 
+import time
+
 from src.api.position_engine import assign_positions
 from src.vision.dealer_detector import detect_dealer_button
 
@@ -138,9 +140,19 @@ class HeroBootstrap:
             detect dealer
             assign positions
         """
+        total_started = time.perf_counter()
+
+        stage_started = time.perf_counter()
         cards, validation_error = validate_hero_result(result)
+        validation_ms = (
+            time.perf_counter() - stage_started
+        ) * 1000.0
 
         if validation_error:
+            total_ms = (
+                time.perf_counter() - total_started
+            ) * 1000.0
+
             return {
                 "hand_token": hand_token,
                 "hero_cards": None,
@@ -148,27 +160,50 @@ class HeroBootstrap:
                 "frozen_participants": [],
                 "dealer": None,
                 "positions": {},
+                "timings_ms": {
+                    "validation": validation_ms,
+                    "participant_freeze": 0.0,
+                    "dealer_detection": 0.0,
+                    "position_assignment": 0.0,
+                    "total": total_ms,
+                },
             }
 
+        stage_started = time.perf_counter()
         frozen_participants = freeze_participants(
             participant_collector,
             hand_token=hand_token,
             frozen_ts=frozen_ts,
         )
+        participant_freeze_ms = (
+            time.perf_counter() - stage_started
+        ) * 1000.0
 
+        stage_started = time.perf_counter()
         dealer = detect_dealer_button(
             result["canonical_frame"]
         )
+        dealer_detection_ms = (
+            time.perf_counter() - stage_started
+        ) * 1000.0
 
         position_players = [
             {"seat": seat}
             for seat in frozen_participants
         ]
 
+        stage_started = time.perf_counter()
         positions = assign_positions(
             position_players,
             dealer["dealer_button_seat"],
         )
+        position_assignment_ms = (
+            time.perf_counter() - stage_started
+        ) * 1000.0
+
+        total_ms = (
+            time.perf_counter() - total_started
+        ) * 1000.0
 
         return {
             "hand_token": hand_token,
@@ -177,6 +212,13 @@ class HeroBootstrap:
             "frozen_participants": frozen_participants,
             "dealer": dealer,
             "positions": positions,
+            "timings_ms": {
+                "validation": validation_ms,
+                "participant_freeze": participant_freeze_ms,
+                "dealer_detection": dealer_detection_ms,
+                "position_assignment": position_assignment_ms,
+                "total": total_ms,
+            },
         }
 
 
@@ -194,6 +236,7 @@ def bootstrap_local_stacks(
     Returns:
         local_players
     """
+    total_started = time.perf_counter()
     local_players = []
 
     for seat in frozen_participants:
@@ -270,5 +313,16 @@ def bootstrap_local_stacks(
             f"trusted={trusted}",
             flush=True,
         )
+
+    total_ms = (
+        time.perf_counter() - total_started
+    ) * 1000.0
+
+    print(
+        "[LATENCY_WATERFALL] "
+        f"local_stack_bootstrap={total_ms:.1f}ms "
+        f"seats={len(frozen_participants)}",
+        flush=True,
+    )
 
     return local_players
