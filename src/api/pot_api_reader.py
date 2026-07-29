@@ -91,7 +91,7 @@ def read_pot(frame):
 
     raw = pytesseract.image_to_string(
         processed,
-        config="--psm 7",
+        config="--psm 6",
     ).strip()
 
     pot = parse_pot(raw)
