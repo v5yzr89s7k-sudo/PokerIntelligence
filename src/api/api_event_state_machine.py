@@ -778,40 +778,27 @@ def handle_pot_update(state, event):
     canonical = canonical_load()
     expected = canonical.expected_pot_bb
 
-    # Without a canonical commitment total, preserve the observation only in
-    # logs. Do not publish an unvalidated OCR value into current_hand.txt.
+    # A validated table-pot observation is authoritative. The reconstructed
+    # expected pot is derived from inferred actions and may be incomplete.
+    # Keep the expected value for diagnostics and fallback only; never use it
+    # to reject an otherwise valid observed pot.
     if expected is None:
-        print(
-            f"[POT_REJECTED] observed={observed:.2f} "
-            "expected=unknown reason=no_canonical_commitment_total",
-            flush=True,
-        )
-        return state
-
-    expected = round(float(expected), 2)
-    difference = round(observed - expected, 2)
-
-    # Allow only small OCR/rounding variance. Materially conflicting readings
-    # remain diagnostic observations and cannot mutate CanonicalHand.
-    tolerance_bb = 0.25
-
-    if abs(difference) > tolerance_bb:
-        print(
-            f"[POT_REJECTED] observed={observed:.2f} "
-            f"expected={expected:.2f} "
-            f"difference={difference:.2f} "
-            "reason=inconsistent_with_canonical_commitments",
-            flush=True,
-        )
-        return state
+        expected_text = "unknown"
+        difference_text = "unknown"
+    else:
+        expected = round(float(expected), 2)
+        difference = round(observed - expected, 2)
+        expected_text = f"{expected:.2f}"
+        difference_text = f"{difference:.2f}"
 
     accepted = canonical.set_observed_pot(observed)
     canonical_save(canonical)
 
     print(
         f"[CANONICAL_POT] accepted={accepted:.2f} "
-        f"expected={expected:.2f} "
-        f"difference={difference:.2f}",
+        f"expected={expected_text} "
+        f"difference={difference_text} "
+        "source=observed_table_pot",
         flush=True,
     )
 
@@ -979,6 +966,27 @@ def handle_inferred_action(state, event):
         return state
 
     canonical = canonical_load()
+
+    seat = event.get("seat")
+    player = canonical.players.get(seat)
+
+    if (
+        player is not None
+        and (
+            player.folded
+            or not player.active
+        )
+    ):
+        print(
+            f"[CANONICAL_SKIP] "
+            f"{event.get('street')} "
+            f"{seat} "
+            f"{event.get('action')} "
+            "reason=player_already_folded_or_inactive",
+            flush=True,
+        )
+        return state
+
     tracker = tracker_for_hand(canonical)
     added = tracker.ingest(event)
 

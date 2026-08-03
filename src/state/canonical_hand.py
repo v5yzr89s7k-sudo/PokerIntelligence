@@ -396,6 +396,33 @@ class CanonicalHand:
         else:
             self.players_to_act = []
 
+    def ante_committed_bb(
+        self,
+        seat: str,
+        street: Optional[str] = None,
+    ) -> float:
+        """
+        Return dead-money ante committed by one player on one street.
+
+        Antes contribute to the pot, but they do not count toward the live
+        betting price used to distinguish calls from raises.
+        """
+        target_street = (
+            street
+            or self.current_street
+            or "PREFLOP"
+        ).upper()
+
+        total = sum(
+            float(action.amount_bb or 0.0)
+            for action in self.actions
+            if action.seat == seat
+            and action.street == target_street
+            and action.action == "POST_ANTE"
+        )
+
+        return round(total, 2)
+
     def add_action(
         self,
         seat: str,
@@ -409,6 +436,27 @@ class CanonicalHand:
         ts: Optional[float] = None,
     ) -> CanonicalAction:
         player = self.players.get(seat)
+        normalized_action = str(action or "").upper()
+
+        # A folded or inactive player can never take another voluntary action.
+        # Forced historical posts remain valid because they are seeded before
+        # any fold transition.
+        if (
+            player is not None
+            and (
+                player.folded
+                or not player.active
+            )
+            and normalized_action not in {
+                "POST_ANTE",
+                "POST_SMALL_BLIND",
+                "POST_BIG_BLIND",
+            }
+        ):
+            raise ValueError(
+                f"player_already_folded_or_inactive: "
+                f"seat={seat} action={normalized_action}"
+            )
 
         position = player.position if player else "unknown"
         player_name = player.name if player else seat
@@ -453,10 +501,23 @@ class CanonicalHand:
                     self.last_aggressor_seat = seat
 
             if raise_to_bb is not None:
-                committed = float(raise_to_bb)
+                # raise_to_bb is the live street commitment, excluding ante
+                # dead money. Preserve the ante in total pot accounting while
+                # publishing the conventional poker raise-to amount.
+                live_raise_to = float(raise_to_bb)
+                ante_committed = self.ante_committed_bb(
+                    seat,
+                    self.current_street,
+                )
+
+                committed = (
+                    ante_committed
+                    + live_raise_to
+                )
+
                 self.current_bet_bb = max(
                     self.current_bet_bb,
-                    committed,
+                    live_raise_to,
                 )
                 self.last_aggressor_seat = seat
 
@@ -488,7 +549,13 @@ class CanonicalHand:
         # pot at an earlier value after new actions are recorded.
         summary = self.street_summaries.get(self.current_street)
 
-        if summary is not None:
+        # A directly observed table pot is authoritative for this street.
+        # Continue maintaining expected_pot_bb for diagnostics and fallback,
+        # but do not overwrite an observed street pot with inferred arithmetic.
+        if (
+            summary is not None
+            and not summary.pot_observed
+        ):
             summary.ending_pot_bb = self.expected_pot_bb
 
 

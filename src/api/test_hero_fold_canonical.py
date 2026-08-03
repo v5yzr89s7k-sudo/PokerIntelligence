@@ -53,6 +53,7 @@ with TemporaryDirectory() as tmp:
         state = state_machine.default_state()
         state["phase"] = "FLOP"
         state["hero_to_act"] = False
+        state["canonical_snapshot_ready"] = True
 
         updated = state_machine.handle_hero_fold(
             state,

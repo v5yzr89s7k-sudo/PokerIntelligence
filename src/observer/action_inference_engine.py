@@ -109,9 +109,77 @@ class ActionInferenceEngine:
         seat = item.get("seat") or "unknown"
         street = item.get("street") or "unknown"
         evidence = self._evidence(item)
+        observations = sorted(
+            item.get("observations") or [],
+            key=lambda o: float(o.get("ts") or 0.0),
+        )
+
+        timeline_start_ts = (
+            float(observations[0].get("ts") or 0.0)
+            if observations
+            else 0.0
+        )
+
+        timeline = []
+
+        for observation in observations:
+            event = dict(observation)
+            event_ts = float(event.get("ts") or timeline_start_ts)
+
+            event["offset_ms"] = round(
+                (event_ts - timeline_start_ts) * 1000.0,
+                1,
+            )
+
+            timeline.append(event)
+
         measurements = self._measurements(item)
         kinds = set(evidence)
         episode_confidence = float(item.get("confidence") or 0.0)
+
+        timeline_types = [
+            event.get("type")
+            for event in timeline
+            if event.get("type")
+        ]
+
+        def first_event(event_type):
+            return next(
+                (
+                    event
+                    for event in timeline
+                    if event.get("type") == event_type
+                ),
+                None,
+            )
+
+        bet_event = first_event(BET_REGION_OCCUPIED)
+        stack_event = first_event(STACK_CHANGED)
+
+        commitment_sequence = False
+        stack_lead_ms = None
+
+        if bet_event is not None and stack_event is not None:
+            bet_offset_ms = float(
+                bet_event.get("offset_ms") or 0.0
+            )
+            stack_offset_ms = float(
+                stack_event.get("offset_ms") or 0.0
+            )
+
+            stack_lead_ms = round(
+                bet_offset_ms - stack_offset_ms,
+                1,
+            )
+
+            commitment_sequence = bool(
+                # Normal sequence: chips appear, then settled stack OCR.
+                bet_offset_ms <= stack_offset_ms
+
+                # Pending-stack sequence: visual stack movement was captured
+                # shortly before the bet region appeared.
+                or 0.0 < stack_lead_ms <= 750.0
+            )
 
         table_context = item.get("table_context") or {}
         positions = table_context.get("positions") or {}
@@ -198,6 +266,10 @@ class ActionInferenceEngine:
             STACK_CHANGED in kinds
             and BET_REGION_OCCUPIED in kinds
             and prior_committed
+            and (
+                not timeline
+                or commitment_sequence
+            )
         ):
             action = CALL_OR_RAISE
             confidence = min(
@@ -209,7 +281,14 @@ class ActionInferenceEngine:
                 "prior voluntary commitment"
             )
 
-        elif STACK_CHANGED in kinds and BET_REGION_OCCUPIED in kinds:
+        elif (
+            STACK_CHANGED in kinds
+            and BET_REGION_OCCUPIED in kinds
+            and (
+                not timeline
+                or commitment_sequence
+            )
+        ):
             action = BET_OR_RAISE
             confidence = min(max(episode_confidence, 0.75), 0.98)
             reason = (
@@ -243,7 +322,22 @@ class ActionInferenceEngine:
             confidence=round(confidence, 2),
             evidence=evidence,
             reason=reason,
-            measurements=measurements,
+            measurements={
+                **measurements,
+                "timeline": timeline,
+                "timeline_types": [
+                    event.get("type")
+                    for event in timeline
+                    if event.get("type")
+                ],
+                "timeline_duration_ms": (
+                    timeline[-1]["offset_ms"]
+                    if timeline
+                    else 0.0
+                ),
+                "commitment_sequence": commitment_sequence,
+                "stack_lead_ms": stack_lead_ms,
+            },
         )
 
     def ingest_closed(self, episodes: Iterable[Any]) -> List[InferredAction]:

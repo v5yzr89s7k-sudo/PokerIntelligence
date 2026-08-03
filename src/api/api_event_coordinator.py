@@ -141,6 +141,7 @@ def fresh_state():
         "last_local_board_count": 0,
         "last_local_hero_visible": False,
         "pending_stack_reads": {},
+        "bootstrap_occupancy_diagnosed": False,
     }
 
 
@@ -520,6 +521,28 @@ def enrich_stack_change_measurements(
             if not retrying:
                 pending.pop(seat, None)
 
+
+            # Persist failed Hero OCR crops for inspection.
+            if seat == "hero":
+                out = ROOT / "runtime" / "stack_debug"
+                out.mkdir(parents=True, exist_ok=True)
+
+                ts = int(time.time() * 1000)
+
+                cv2.imwrite(
+                    str(out / f"{ts}_hero_stack.png"),
+                    crop,
+                )
+
+            print(
+                "[STACK_PIPELINE]",
+                f"seat={seat}",
+                "movement=yes",
+                "validation=ocr_failed",
+                "emitted=no",
+                flush=True,
+            )
+
             print(
                 f"[STACK_SETTLE_SKIP] seat={seat} "
                 f"reason=untrusted_read "
@@ -570,6 +593,15 @@ def enrich_stack_change_measurements(
                 pending.pop(seat, None)
 
             print(
+                "[STACK_PIPELINE]",
+                f"seat={seat}",
+                f"movement=yes",
+                f"validation={validation.reason}",
+                "emitted=no",
+                flush=True,
+            )
+
+            print(
                 f"[STACK_VALIDATE] seat={seat} "
                 f"decision={validation.decision} "
                 f"reason={validation.reason} "
@@ -589,6 +621,15 @@ def enrich_stack_change_measurements(
         # returning to the stack or an OCR disagreement, not a wager.
         if delta < minimum_delta_bb:
             pending.pop(seat, None)
+
+            print(
+                "[STACK_PIPELINE]",
+                f"seat={seat}",
+                "movement=yes",
+                "validation=ocr_failed",
+                "emitted=no",
+                flush=True,
+            )
 
             print(
                 f"[STACK_SETTLE_SKIP] seat={seat} "
@@ -629,6 +670,21 @@ def enrich_stack_change_measurements(
         settled_details[seat] = measurement
         settled_seats.append(seat)
         pending.pop(seat, None)
+
+        print(
+            "[STACK_PIPELINE]",
+            f"seat={seat}",
+            f"movement=yes",
+            f"previous={previous:.2f}",
+            f"current={current:.2f}",
+            f"delta={delta:.2f}",
+            f"confidence={confidence:.2f}",
+            f"mode={reading.get('stack_read_mode')}",
+            "validation=PASS",
+            "emitted=yes",
+            flush=True,
+        )
+
 
         emit({
             "type": "stack_update",
@@ -1153,6 +1209,36 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
             flush=True,
         )
 
+        # Publish Hero cards immediately and start the asynchronous snapshot
+        # pipeline before serial local stack OCR. Stack enrichment continues
+        # below while the snapshot worker runs in parallel.
+        emit({
+            "type": "hero_cards",
+            "hero_cards": cards,
+            "source_request_id": pending_id,
+            "hand_token": request_token,
+            "canonical_frame": result.get("canonical_frame"),
+            "level": level,
+        })
+
+
+        log_latency(
+            "event_emitted",
+            request_id=pending_id,
+            worker="hero",
+            event_type="hero_cards",
+            hero_cards=cards,
+        )
+
+        if not state.get("snapshot_cached"):
+            emit({
+                "type": "snapshot_request",
+                "source_request_id": pending_id,
+                "hand_token": request_token,
+                "canonical_frame": result.get("canonical_frame"),
+            })
+            state["snapshot_cached"] = True
+
         # Seed the fast table context with local stack OCR from the same
         # canonical Hero-card frame. GPT remains deferred name enrichment.
         canonical_frame_path = result.get("canonical_frame")
@@ -1206,32 +1292,6 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
                 flush=True,
             )
 
-        emit({
-            "type": "hero_cards",
-            "hero_cards": cards,
-            "source_request_id": pending_id,
-            "hand_token": request_token,
-            "canonical_frame": result.get("canonical_frame"),
-            "level": level,
-        })
-
-        if not state.get("snapshot_cached"):
-            emit({
-                "type": "snapshot_request",
-                "source_request_id": pending_id,
-                "hand_token": request_token,
-                "canonical_frame": result.get("canonical_frame"),
-            })
-            state["snapshot_cached"] = True
-
-
-        log_latency(
-            "event_emitted",
-            request_id=pending_id,
-            worker="hero",
-            event_type="hero_cards",
-            hero_cards=cards,
-        )
 
         return state
 
@@ -2012,6 +2072,67 @@ def main():
                 table_context
             )
             episode_manager.ingest(observations)
+
+            # Diagnostic-only bootstrap analysis.
+            #
+            # Bet-region occupancy present before the detector baseline cannot
+            # produce an "appeared" transition. Once the authoritative
+            # preflop positions are available, identify occupied non-blind
+            # seats that have not already produced a voluntary commitment.
+            if (
+                current_commitment_street == "PREFLOP"
+                and state_machine_state.get(
+                    "canonical_snapshot_ready"
+                )
+                and not state.get(
+                    "bootstrap_occupancy_diagnosed"
+                )
+            ):
+                positions = dict(
+                    table_context.get("positions") or {}
+                )
+                occupied = set(
+                    getattr(
+                        changes,
+                        "occupied_bet_regions",
+                        [],
+                    )
+                    or []
+                )
+                committed = set(
+                    table_context.get(
+                        "prior_voluntary_commitment_seats"
+                    )
+                    or []
+                )
+
+                forced = {
+                    seat
+                    for seat, position in positions.items()
+                    if str(position or "").upper()
+                    in {"SB", "BB"}
+                }
+
+                candidates = sorted(
+                    seat
+                    for seat in occupied
+                    if seat not in forced
+                    and seat not in committed
+                    and seat in positions
+                )
+
+                print(
+                    "[BOOTSTRAP_OCCUPANCY] "
+                    f"occupied={sorted(occupied)} "
+                    f"forced={sorted(forced)} "
+                    f"committed={sorted(committed)} "
+                    f"candidates={candidates}",
+                    flush=True,
+                )
+
+                state[
+                    "bootstrap_occupancy_diagnosed"
+                ] = True
 
             backfilled = episode_manager.backfill_table_context(
                 table_context
