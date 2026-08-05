@@ -1795,8 +1795,12 @@ def episode_ready_for_inference(episode):
         return True
 
     # Quantitative stack OCR may arrive after the visual episode closes.
-    # Do not permanently process a voluntary bet-only episode until the
-    # coordinator's 2.5-second stack retry window has elapsed.
+    #
+    # Preflop initialization is comparatively noisy, so preserve the full
+    # late-stack attachment window there. Postflop, the settled stack reader
+    # normally resolves within the 0.45-0.75 second local pipeline window.
+    # Do not let one weak visual-only episode block every later chronological
+    # action for 2.75 seconds.
     if (
         "bet_region_occupied" in evidence
         and "stack_changed" not in evidence
@@ -1806,9 +1810,15 @@ def episode_ready_for_inference(episode):
         if ended_ts is None:
             return False
 
+        wait_seconds = (
+            LATE_STACK_ATTACH_SECONDS
+            if street == "PREFLOP"
+            else 0.85
+        )
+
         return (
             time.time() - float(ended_ts)
-            >= LATE_STACK_ATTACH_SECONDS
+            >= wait_seconds
         )
 
     return True

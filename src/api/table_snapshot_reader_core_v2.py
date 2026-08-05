@@ -68,41 +68,26 @@ IDENTITY_MANAGER = IdentityManager()
 
 
 PROMPT_HEADER = """
-Read this ACR poker table using the deterministic seat information supplied below.
+Read the visible player name from this single ACR physical-seat crop.
 
 Return RAW JSON ONLY:
 
 {
-  "readings": [
-    {
-      "seat": "",
-      "name": "",
-      "stack_text": "",
-      "stack_bb": null
-    }
-  ],
-  "confidence": 0.0
+  "name": ""
 }
 
 Rules:
 
-- Every image is one immutable physical-seat crop.
-- The text immediately before each crop gives its authoritative seat label.
-- Never change, infer, compress, rotate, or shift a supplied seat label.
-- Read only the player name and visible stack from each supplied seat crop.
-- Do not decide whether a seat is occupied. Local vision already determined that.
-- Return exactly one reading for every supplied occupied seat.
-- Hero is the physical bottom-center seat labeled hero.
-- A folded player still occupies the seat.
+- Read only the player name.
+- The caller already knows the authoritative physical seat.
+- Do not return or infer a seat label.
+- Ignore stack text, chip counts, bets, buttons, dealer markers, board cards,
+  hole cards, and all other table information.
 - Ignore transient action text such as CHECK, FOLD, CALL, BET, RAISE,
-  ALL IN, POST SB, POST BB, ANTE, MUCK, and SHOW.
+  ALL IN, POST SB, POST BB, ANTE, MUCK, SHOW, SITTING OUT, and SIT OUT.
 - Never use transient action text as a player name.
-- stack_text must preserve the visible text.
-- stack_bb must be numeric only when clearly shown in big blinds.
-- Use "" or null when text cannot be read confidently.
-- Do not read board cards.
-- Do not read hole cards.
-- Do not infer hidden information.
+- Use an empty string when the name cannot be read confidently.
+- Do not infer hidden or partially obscured text.
 """
 
 
@@ -304,6 +289,19 @@ def _build_content(cards):
 
 
 def _request_cards_api(cards, dealer):
+    """
+    Snapshot V3: read one player name from one authoritative seat crop.
+
+    The caller owns seat identity. Local OCR owns stack values.
+    """
+    if len(cards) != 1:
+        raise ValueError(
+            "Snapshot V3 requires exactly one seat card per API request"
+        )
+
+    card = cards[0]
+    seat = card["seat"]
+
     content, image_bytes = _build_content(cards)
 
     api_started = perf_counter()
@@ -326,11 +324,22 @@ def _request_cards_api(cards, dealer):
         response.output_text
     )
 
-    normalized = _normalize_result(
-        data,
-        cards,
-        dealer,
+    name = _normalize_name(
+        data.get("name")
     )
+
+    player = {
+        "seat": seat,
+        "name": name,
+        "stack_text": "",
+        "stack_bb": None,
+        "is_hero": seat == "hero",
+        "is_active": True,
+        "occupancy_confidence": float(
+            card.get("occupancy_confidence")
+            or 0.0
+        ),
+    }
 
     parse_ms = (
         perf_counter() - parse_started
@@ -340,8 +349,12 @@ def _request_cards_api(cards, dealer):
         "api_ms": api_ms,
         "parse_ms": parse_ms,
         "image_bytes": image_bytes,
-        "players": normalized.get("players") or [],
-        "confidence": normalized.get("confidence"),
+        "players": [player],
+        "confidence": (
+            1.0
+            if name
+            else None
+        ),
     }
 
 
@@ -605,6 +618,31 @@ def _cache_player(entry, card):
     }
 
 
+def preserve_unresolved_opponent_names(
+    fresh_players,
+    missing_name_cards,
+):
+    """
+    Leave unresolved opponent names blank.
+
+    Physical seat alone is not identity evidence because players can move
+    between hands and tables.
+    """
+    unresolved = []
+
+    for card in missing_name_cards:
+        seat = card["seat"]
+        player = fresh_players.get(seat)
+
+        if player is None:
+            continue
+
+        player["name"] = ""
+        unresolved.append(seat)
+
+    return sorted(unresolved)
+
+
 
 def _read_local_stacks(cards, cache_snapshot):
     """
@@ -760,43 +798,14 @@ def read_table_snapshot_v2(frame, dealt_in_seats=None):
                 else None
             )
         else:
-            identity, entry = (
-                IDENTITY_MANAGER.cache_lookup(
-                    cache=cache,
-                    seat=card["seat"],
-                    fingerprint=fingerprint,
-                    lookup_fn=cache_lookup,
-                )
+            # Stabilization policy: opponent identity must come from the
+            # current snapshot. The existing perceptual fingerprint has not
+            # demonstrated discrimination between different players, so it
+            # cannot safely authorize cached-name reuse.
+            identity = IDENTITY_MANAGER.unresolved(
+                seat=card["seat"],
             )
-
-        # Preserve cached identity for stable "SITTING OUT" seats.
-        if entry is None:
-            try:
-                import cv2
-                import pytesseract
-
-                gray = cv2.cvtColor(
-                    fingerprint,
-                    cv2.COLOR_BGR2GRAY,
-                )
-
-                txt = pytesseract.image_to_string(gray).upper()
-
-                if (
-                    "SITTING" in txt
-                    and "OUT" in txt
-                ):
-                    cached = cache.get(card["seat"])
-                    if cached:
-                        entry = cached
-                        print(
-                            f"[SNAPSHOT_CACHE] "
-                            f"{card['seat']} "
-                            f"reused (SITTING OUT)",
-                            flush=True,
-                        )
-            except Exception:
-                pass
+            entry = None
 
         if entry is None:
             changed_cards.append(card)
@@ -900,35 +909,16 @@ def read_table_snapshot_v2(frame, dealt_in_seats=None):
         ]
 
         if missing_name_cards:
-            recovered_from_cache = []
-            still_blank = []
-
-            for card in missing_name_cards:
-                seat = card["seat"]
-                player = fresh_players.get(seat) or {}
-                cached = cache.get(seat) or {}
-                cached_name = cached.get("name")
-
-                if cached_name:
-                    player["name"] = cached_name
-                    fresh_players[seat] = player
-                    recovered_from_cache.append(seat)
-                else:
-                    still_blank.append(seat)
+            still_blank = preserve_unresolved_opponent_names(
+                fresh_players,
+                missing_name_cards,
+            )
 
             print(
-                "[SNAPSHOT_NAME_CACHE_FALLBACK]",
+                "[SNAPSHOT_NAME_UNRESOLVED]",
                 {
-                    "requested": [
-                        card["seat"]
-                        for card in missing_name_cards
-                    ],
-                    "recovered": sorted(
-                        recovered_from_cache
-                    ),
-                    "still_blank": sorted(
-                        still_blank
-                    ),
+                    "requested": still_blank,
+                    "policy": "leave_blank_without_verified_fingerprint",
                 },
                 flush=True,
             )

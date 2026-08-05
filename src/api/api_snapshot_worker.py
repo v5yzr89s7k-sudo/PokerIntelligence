@@ -427,12 +427,28 @@ def process_event(event, processed_hero_events):
 
     if duplicate_identities:
         print(
-            "[SNAPSHOT_REJECT] "
+            "[SNAPSHOT_WARNING] "
             "duplicated player identity across seats: "
             f"{duplicate_identities}",
             flush=True,
         )
-        return
+
+        # Keep the first occurrence of a player identity and blank later
+        # duplicates instead of aborting the entire snapshot.
+        seen = set()
+
+        for player in players:
+            name = str(player.get("name") or "").strip()
+
+            if not name:
+                continue
+
+            if name in seen:
+                player["name"] = ""
+                player["identity_conflict"] = True
+                continue
+
+            seen.add(name)
 
     # A missing dealt-in seat must remain missing. Never compensate by
     # reusing or copying another player's identity into that seat.

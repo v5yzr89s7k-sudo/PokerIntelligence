@@ -186,9 +186,8 @@ def _resolve(readings):
     """
     Resolve disagreement between green, plain, and Otsu OCR variants.
 
-    Green-mask OCR is the primary ACR stack reader. Plain and Otsu are
-    correlated fallback variants and can make the same leading-digit error,
-    so their 2-to-1 vote is not trusted when the disagreement is large.
+    Exact majority agreement is authoritative. A single conflicting OCR
+    variant must not override two matching readings.
     """
     by_variant = {
         reading.get("variant"): reading.get("stack_bb")
@@ -212,32 +211,8 @@ def _resolve(readings):
     counts = Counter(numeric)
     majority_value, majority_votes = counts.most_common(1)[0]
 
-    # Plain and Otsu are derived from the same grayscale source and can make
-    # the same truncation/substitution error. In observed failures they agreed
-    # on values such as 32.29 or 24.97 while green correctly read 82.29 or
-    # 94.97. Prefer green when that correlated majority differs by >20 BB.
-    if (
-        green is not None
-        and plain is not None
-        and otsu is not None
-        and plain == otsu
-        and green != plain
-    ):
-        green_digits = str(int(round(green)))
-        plain_digits = str(int(round(plain)))
-
-        # Reject obvious digit-merging OCR failures such as:
-        # 64.1  -> 641
-        # 82.3  -> 823
-        # 111.0 -> 11101
-        if (
-            len(green_digits) >= len(plain_digits) + 1
-            and green_digits.startswith(plain_digits)
-        ):
-            return plain, 2
-
-        if abs(green - plain) > 20.0:
-            return green, 1
+    # Exact majority agreement wins.
+    # Do not override two agreeing variants with one conflicting read.
 
     return majority_value, majority_votes
 

@@ -10,11 +10,10 @@ ROOT = Path(__file__).resolve().parents[2]
 GEOMETRY = ROOT / "config/geometry.json"
 
 
-def preprocess(img):
+def preprocess_variants(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # Preserve anti-aliased white text instead of hard-thresholding it.
-    gray = cv2.resize(
+    enlarged = cv2.resize(
         gray,
         None,
         fx=4,
@@ -22,15 +21,29 @@ def preprocess(img):
         interpolation=cv2.INTER_CUBIC,
     )
 
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    blurred = cv2.GaussianBlur(
+        enlarged,
+        (3, 3),
+        0,
+    )
 
-    gray = cv2.convertScaleAbs(
-        gray,
+    contrast = cv2.convertScaleAbs(
+        blurred,
         alpha=1.8,
         beta=8,
     )
 
-    return gray
+    _, otsu = cv2.threshold(
+        enlarged,
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+    )
+
+    return {
+        "contrast": contrast,
+        "otsu": otsu,
+    }
 
 
 def parse_pot(text):
@@ -80,29 +93,122 @@ def read_pot(frame):
     w = int(region["width"])
     h = int(region["height"])
 
-    crop = img[y:y+h, x:x+w]
-    processed = preprocess(crop)
+    crops = {
+        "current": img[y:y+h, x:x+w],
+        "padded": img[
+            max(0, y - 12):min(img.shape[0], y + h + 12),
+            max(0, x - 20):min(img.shape[1], x + w + 20),
+        ],
+    }
 
     debug_dir = ROOT / "runtime" / "pot_debug"
     debug_dir.mkdir(parents=True, exist_ok=True)
 
-    cv2.imwrite(str(debug_dir / "pot_crop.png"), crop)
-    cv2.imwrite(str(debug_dir / "pot_processed.png"), processed)
+    reads = []
+    candidates = []
 
-    raw = pytesseract.image_to_string(
-        processed,
-        config="--psm 6",
-    ).strip()
+    for crop_name, crop in crops.items():
+        cv2.imwrite(
+            str(debug_dir / f"pot_{crop_name}_crop.png"),
+            crop,
+        )
 
-    pot = parse_pot(raw)
+        for variant_name, processed in preprocess_variants(crop).items():
+            cv2.imwrite(
+                str(
+                    debug_dir
+                    / f"pot_{crop_name}_{variant_name}.png"
+                ),
+                processed,
+            )
 
-    if pot is not None and not 0.1 <= pot <= 1000.0:
-        pot = None
+            for psm in (6, 7, 13):
+                raw = pytesseract.image_to_string(
+                    processed,
+                    config=f"--psm {psm}",
+                ).strip()
+
+                value = parse_pot(raw)
+
+                reads.append({
+                    "crop": crop_name,
+                    "variant": variant_name,
+                    "psm": psm,
+                    "raw": raw,
+                    "pot_bb": value,
+                })
+
+                if (
+                    value is not None
+                    and 0.1 <= value <= 1000.0
+                ):
+                    candidates.append({
+                        "value": round(float(value), 2),
+                        "raw": raw,
+                        "crop": crop_name,
+                        "variant": variant_name,
+                        "psm": psm,
+                    })
+
+    selected = None
+
+    if candidates:
+        support = {}
+
+        for candidate in candidates:
+            value = candidate["value"]
+            support[value] = support.get(value, 0) + 1
+
+        best_value = max(
+            support,
+            key=lambda value: (
+                support[value],
+                -candidates.index(
+                    next(
+                        item
+                        for item in candidates
+                        if item["value"] == value
+                    )
+                ),
+            ),
+        )
+
+        selected = next(
+            candidate
+            for candidate in candidates
+            if candidate["value"] == best_value
+        )
+
+        selected["support"] = support[best_value]
+
+    if selected is None:
+        raw_text = next(
+            (
+                read["raw"]
+                for read in reads
+                if read["raw"]
+            ),
+            "",
+        )
+
+        return {
+            "ok": False,
+            "pot_bb": None,
+            "raw_text": raw_text,
+            "reads": reads,
+        }
 
     return {
-        "ok": pot is not None,
-        "pot_bb": pot,
-        "raw_text": raw,
+        "ok": True,
+        "pot_bb": selected["value"],
+        "raw_text": selected["raw"],
+        "read_mode": (
+            f"{selected['crop']}:"
+            f"{selected['variant']}:"
+            f"psm{selected['psm']}"
+        ),
+        "support": selected["support"],
+        "reads": reads,
     }
 
 
