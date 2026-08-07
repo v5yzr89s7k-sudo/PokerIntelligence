@@ -274,15 +274,9 @@ def test_order_is_preserved():
     ]
 
 
-def test_action_consumes_queue_through_actor():
+def test_later_actor_with_unresolved_preflop_gap_preserves_queue():
     hand = make_hand()
-
-    assert hand.players_to_act == [
-        "seat_top",
-        "seat_upper_right",
-        "hero",
-    ]
-
+    original_queue = list(hand.players_to_act)
     tracker = BettingRoundTracker(hand)
 
     result = tracker.ingest(
@@ -293,30 +287,15 @@ def test_action_consumes_queue_through_actor():
         )
     )
 
-    assert result is not None
+    assert result is None
+    assert hand.players_to_act == original_queue
+    assert hand.actions == []
 
-    # seat_top was skipped before the first voluntary preflop action and
-    # is therefore recorded as a conservatively inferred fold.
-    assert hand.players_to_act == [
-        "hero",
-    ]
+    assert hand.players["seat_top"].folded is False
+    assert hand.players["seat_top"].active is True
 
-    assert [
-        (action.seat, action.action)
-        for action in hand.actions
-    ] == [
-        ("seat_top", "FOLD"),
-        ("seat_upper_right", BET_OR_RAISE),
-    ]
-
-    inferred_fold = hand.actions[0]
-
-    assert inferred_fold.source == "action_order_inference"
-    assert inferred_fold.confidence == 0.90
-    assert inferred_fold.evidence == [
-        "seat_skipped_before_observed_actor",
-        "action_required_but_no_commitment_observed",
-    ]
+    assert tracker.decisions[-1].accepted is False
+    assert tracker.decisions[-1].canonical_action is None
 
 
 def test_first_actor_consumes_only_itself():
@@ -384,7 +363,7 @@ def test_postflop_skipped_seat_is_not_inferred_as_fold():
     assert hand.players["seat_top"].active is True
 
 
-def test_later_preflop_gap_is_inferred_as_fold():
+def test_later_preflop_gap_remains_unresolved():
     hand = make_hand()
     tracker = BettingRoundTracker(hand)
 
@@ -396,6 +375,10 @@ def test_later_preflop_gap_is_inferred_as_fold():
         )
     )
 
+    queue_before_second = list(
+        hand.players_to_act
+    )
+
     second = tracker.ingest(
         inferred(
             2,
@@ -405,27 +388,22 @@ def test_later_preflop_gap_is_inferred_as_fold():
     )
 
     assert first is not None
-    assert second is not None
+
+    # The unresolved seat before Hero must not be fabricated as a fold.
+    assert second is None
 
     assert [
         (action.seat, action.action)
         for action in hand.actions
     ] == [
         ("seat_top", BET_OR_RAISE),
-        ("seat_upper_right", "FOLD"),
-        ("hero", "CALL"),
     ]
 
-    inferred_fold = hand.actions[1]
-    assert inferred_fold.source == "action_order_inference"
-    assert inferred_fold.confidence == 0.90
-    assert inferred_fold.evidence == [
-        "seat_skipped_before_observed_actor",
-        "action_required_but_no_commitment_observed",
-    ]
+    assert hand.players["seat_upper_right"].folded is False
+    assert hand.players["seat_upper_right"].active is True
 
-    assert hand.players["seat_upper_right"].folded is True
-    assert hand.players["seat_upper_right"].active is False
+    # Rejecting/defering the action must not consume the queue.
+    assert hand.players_to_act == queue_before_second
 
 
 def test_forced_blinds_do_not_consume_preflop_queue():
@@ -463,11 +441,11 @@ if __name__ == "__main__":
         test_street_change_resets_aggression,
         test_stale_street_action_is_rejected,
         test_order_is_preserved,
-        test_action_consumes_queue_through_actor,
+        test_later_actor_with_unresolved_preflop_gap_preserves_queue,
         test_first_actor_consumes_only_itself,
         test_actor_outside_queue_does_not_corrupt_queue,
         test_postflop_skipped_seat_is_not_inferred_as_fold,
-        test_later_preflop_gap_is_not_inferred_without_more_context,
+        test_later_preflop_gap_remains_unresolved,
         test_forced_blinds_do_not_consume_preflop_queue,
     ]
 

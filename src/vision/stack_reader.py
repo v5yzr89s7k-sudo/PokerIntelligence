@@ -15,9 +15,13 @@ OCR_CONFIG = "--psm 7"
 def _parse_value(raw: str) -> Optional[float]:
     text = str(raw or "").strip()
 
-    # Best case: OCR included the BB suffix.
+    # When OCR includes the BB suffix, accept only a syntactically valid
+    # numeric token immediately before BB. Never salvage a partial number
+    # from malformed text such as "95./2 BB" or "99./2 BB".
     match = re.search(
-        r"(\d+(?:\.\d+)?)\s*BB\b",
+        r"(?<![\d./])"
+        r"(\d+(?:\.\d+)?)"
+        r"\s*BB\b",
         text,
         re.IGNORECASE,
     )
@@ -27,6 +31,9 @@ def _parse_value(raw: str) -> Optional[float]:
             return float(match.group(1))
         except ValueError:
             return None
+
+    if re.search(r"\bBB\b", text, re.IGNORECASE):
+        return None
 
     numbers = re.findall(
         r"\d+(?:\.\d+)?",

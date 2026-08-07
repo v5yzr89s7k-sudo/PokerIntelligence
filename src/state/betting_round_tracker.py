@@ -179,6 +179,16 @@ class BettingRoundTracker:
             ):
                 continue
 
+            print(
+                "[SKIPPED_ACTION]",
+                f"street={street}",
+                f"seat={skipped_seat}",
+                f"inferred={passive_action}",
+                f"open_bet={self.has_open_bet}",
+                f"trigger=observed_actor_skip",
+                flush=True,
+            )
+
             inferred.append(
                 self.hand.add_action(
                     seat=skipped_seat,
@@ -447,12 +457,28 @@ class BettingRoundTracker:
                     or 0.0
                 )
 
+            ante_committed = self.hand.ante_committed_bb(
+                seat,
+                self.hand.current_street,
+            )
+
+            # Total canonical commitment contains ante dead money. Calls and
+            # raises must instead be classified against the live commitment,
+            # which excludes the ante.
+            prior_live_committed = round(
+                max(
+                    0.0,
+                    prior_committed - ante_committed,
+                ),
+                2,
+            )
+
             current_price = round(
                 float(self.hand.current_bet_bb or 0.0),
                 2,
             )
             target_commitment = round(
-                prior_committed + delta_bb,
+                prior_live_committed + delta_bb,
                 2,
             )
             tolerance = 0.05
@@ -494,13 +520,57 @@ class BettingRoundTracker:
             }:
                 amount_bb = delta_bb
 
-        # Advance the queue before recording the observed action so inferred
-        # opening folds preserve correct chronological order.
-        if canonical_action not in {
+        # Never manufacture missing preflop action merely because a later
+        # voluntary actor was observed.
+        #
+        # If seats still precede this actor in the canonical queue, their
+        # actions are unresolved. Publishing this actor now could establish
+        # the wrong live price/aggressor and corrupt every later action.
+        #
+        # Preserve the queue and leave this episode diagnostics-only until
+        # earlier action context is available.
+        forced_actions = {
             CANONICAL_POST_ANTE,
             CANONICAL_POST_SMALL_BLIND,
             CANONICAL_POST_BIG_BLIND,
-        }:
+        }
+
+        if canonical_action not in forced_actions:
+            queue = list(self.hand.players_to_act or [])
+            skipped_seats = []
+
+            if seat in queue:
+                actor_index = queue.index(seat)
+                skipped_seats = queue[:actor_index]
+
+            if (
+                action_street == "PREFLOP"
+                and skipped_seats
+            ):
+                self._record_decision(
+                    episode_id,
+                    action_street,
+                    seat,
+                    action,
+                    None,
+                    False,
+                    (
+                        "unresolved earlier preflop actors; "
+                        "action deferred without queue mutation"
+                    ),
+                )
+
+                print(
+                    "[PREFLOP_UNRESOLVED_GAP]",
+                    f"seat={seat}",
+                    f"skipped={skipped_seats}",
+                    f"raw_action={action}",
+                    f"canonical_candidate={canonical_action}",
+                    flush=True,
+                )
+
+                return None
+
             skipped_seats = self._consume_action_queue(seat)
 
             self._infer_skipped_actions(
@@ -533,6 +603,22 @@ class BettingRoundTracker:
                     "forced blind already present",
                 )
                 return None
+
+        print(
+            "[ACTION_ACCOUNTING] "
+            f"seat={seat} "
+            f"raw_action={action} "
+            f"canonical={canonical_action} "
+            f"delta={delta_bb} "
+            f"prior_total={prior_committed if delta_bb is not None else None} "
+            f"ante={ante_committed if delta_bb is not None else None} "
+            f"prior_live={prior_live_committed if delta_bb is not None else None} "
+            f"current_price={current_price if delta_bb is not None else None} "
+            f"target_live={target_commitment if delta_bb is not None else None} "
+            f"amount_bb={amount_bb} "
+            f"raise_to_bb={raise_to_bb}",
+            flush=True,
+        )
 
         canonical = self.hand.add_action(
             seat=seat,

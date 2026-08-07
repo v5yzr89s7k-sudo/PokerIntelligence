@@ -607,11 +607,17 @@ def _cache_fingerprint_image(card):
 
 
 def _cache_player(entry, card):
+    """
+    Build an identity-only cached player record.
+
+    Cached names may remain valid for Hero, but cached stack values are never
+    authoritative for a new snapshot. Fresh trusted local OCR owns stacks.
+    """
     return {
         "seat": card["seat"],
         "name": _normalize_name(entry.get("name")),
-        "stack_text": str(entry.get("stack_text") or "").strip(),
-        "stack_bb": _normalize_stack_bb(entry.get("stack_bb")),
+        "stack_text": "",
+        "stack_bb": None,
         "is_hero": card["seat"] == "hero",
         "is_active": True,
         "occupancy_confidence": float(card["occupancy_confidence"]),
