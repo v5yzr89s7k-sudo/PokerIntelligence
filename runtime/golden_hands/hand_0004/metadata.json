@@ -1,0 +1,12 @@
+{
+  "format_version": 1,
+  "hand_number": 4,
+  "recorded_at": "2026-08-08T16:24:30.357426",
+  "completed_at": "2026-08-08T16:26:34.326996",
+  "frame_count": 86,
+  "event_count": 17,
+  "expected_source": "runtime/live/current_hand.txt",
+  "events_source": "runtime/live/api_events.jsonl",
+  "allow_live_workers": false,
+  "status": "candidate"
+}
