@@ -83,5 +83,21 @@ class ParticipantFreezerTemporalTests(unittest.TestCase):
         )
 
 
+
+    def test_sparse_table_single_pair_plus_one_stable_card_survives(self):
+        freezer = ParticipantFreezer()
+
+        seat = "seat_top"
+
+        freezer.positive_frames[seat]["card_1"] = 2
+        freezer.positive_frames[seat]["card_2"] = 1
+        freezer.paired_positive_frames[seat] = 1
+
+        stable = freezer.stable_dealt_in_seats()
+
+        self.assertIn(seat, stable)
+
+
+
 if __name__ == "__main__":
     unittest.main()

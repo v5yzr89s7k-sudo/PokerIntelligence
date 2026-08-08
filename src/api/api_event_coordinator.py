@@ -307,6 +307,7 @@ def enrich_stack_change_measurements(
 
     settled_details = {}
     settled_seats = []
+    proposed_transitions = []
 
     for seat, entry in list(pending.items()):
         if now - float(entry["last_change_ts"]) < settle_seconds:
@@ -557,9 +558,14 @@ def enrich_stack_change_measurements(
         previous = float(previous)
         current = float(current)
 
+        # Visual bet-region occupancy is detector evidence only.
+        # It is sufficient to open an action episode, but not sufficient to
+        # validate an extremely large OCR-derived stack commitment.
+        #
+        # Only semantically confirmed commitments may authorize a large stack
+        # collapse.
         has_commitment_evidence = bool(
-            seat in prior_occupied_bet_regions
-            or seat in prior_commitment_seats
+            seat in prior_commitment_seats
         )
 
         validation = validate_stack_transition(
@@ -667,45 +673,119 @@ def enrich_stack_change_measurements(
             "delta_bb": delta,
         }
 
-        settled_details[seat] = measurement
-        settled_seats.append(seat)
-        pending.pop(seat, None)
-
-        print(
-            "[STACK_PIPELINE]",
-            f"seat={seat}",
-            f"movement=yes",
-            f"previous={previous:.2f}",
-            f"current={current:.2f}",
-            f"delta={delta:.2f}",
-            f"confidence={confidence:.2f}",
-            f"mode={reading.get('stack_read_mode')}",
-            "validation=PASS",
-            "emitted=yes",
-            flush=True,
-        )
-
-
-        emit({
-            "type": "stack_update",
+        proposed_transitions.append({
             "seat": seat,
-            "previous_stack_bb": round(previous, 2),
-            "current_stack_bb": round(current, 2),
-            "delta_bb": delta,
+            "entry": entry,
+            "measurement": measurement,
+            "previous": previous,
+            "current": current,
+            "delta": delta,
             "confidence": confidence,
-            "origin_street": measurement.get("origin_street"),
-            "stack_read_mode": measurement.get("stack_read_mode"),
-            "stack_text": measurement.get("stack_text"),
         })
 
+    # Detect batch-wide OCR collapse before publishing any transition.
+    #
+    # A single large preflop commitment can be legitimate. Several different
+    # seats apparently losing large portions of their stacks in the same
+    # settlement cycle is not credible turn-by-turn poker action and was
+    # observed when OCR read unrelated table numbers as stack values.
+    phase = str(state.get("phase") or "WAITING").upper()
+
+    large_preflop = [
+        proposal
+        for proposal in proposed_transitions
+        if (
+            phase == "PREFLOP"
+            and float(proposal["delta"]) >= 8.0
+        )
+    ]
+
+    contaminated_batch = (
+        phase == "PREFLOP"
+        and len(large_preflop) >= 3
+    )
+
+    if contaminated_batch:
         print(
-            f"[STACK_TRANSITION] seat={seat} "
-            f"previous={previous:.2f} "
-            f"current={current:.2f} "
-            f"delta={delta:.2f} "
-            f"confidence={confidence:.2f}",
+            "[STACK_BATCH_REJECT] "
+            f"phase={phase} "
+            f"large_count={len(large_preflop)} "
+            f"seats={[p['seat'] for p in large_preflop]} "
+            f"deltas={[round(float(p['delta']), 2) for p in large_preflop]} "
+            "reason=multi_seat_large_commitment_batch",
             flush=True,
         )
+
+        # Keep proposals pending and wait for another settled visual read.
+        # Bound retries so persistent corruption cannot create an OCR hot loop.
+        for proposal in proposed_transitions:
+            seat = proposal["seat"]
+            entry = proposal["entry"]
+
+            attempts = int(
+                entry.get("batch_anomaly_attempts") or 0
+            ) + 1
+
+            entry["batch_anomaly_attempts"] = attempts
+            entry["last_change_ts"] = now
+
+            if attempts >= 3:
+                pending.pop(seat, None)
+
+                print(
+                    "[STACK_BATCH_DROP] "
+                    f"seat={seat} "
+                    f"attempts={attempts}",
+                    flush=True,
+                )
+
+    else:
+        for proposal in proposed_transitions:
+            seat = proposal["seat"]
+            measurement = proposal["measurement"]
+            previous = proposal["previous"]
+            current = proposal["current"]
+            delta = proposal["delta"]
+            confidence = proposal["confidence"]
+
+            settled_details[seat] = measurement
+            settled_seats.append(seat)
+            pending.pop(seat, None)
+
+            print(
+                "[STACK_PIPELINE]",
+                f"seat={seat}",
+                "movement=yes",
+                f"previous={previous:.2f}",
+                f"current={current:.2f}",
+                f"delta={delta:.2f}",
+                f"confidence={confidence:.2f}",
+                f"mode={measurement.get('stack_read_mode')}",
+                "validation=PASS",
+                "emitted=yes",
+                flush=True,
+            )
+
+            emit({
+                "type": "stack_update",
+                "seat": seat,
+                "previous_stack_bb": round(previous, 2),
+                "current_stack_bb": round(current, 2),
+                "delta_bb": delta,
+                "confidence": confidence,
+                "origin_street": measurement.get("origin_street"),
+                "stack_read_mode": measurement.get("stack_read_mode"),
+                "stack_text": measurement.get("stack_text"),
+            })
+
+            print(
+                f"[STACK_TRANSITION] seat={seat} "
+                f"previous={previous:.2f} "
+                f"current={current:.2f} "
+                f"delta={delta:.2f} "
+                f"confidence={confidence:.2f}",
+                flush=True,
+            )
 
     # Suppress noisy instantaneous detector events. Downstream receives
     # only settled, quantitative stack transitions.
@@ -1778,6 +1858,26 @@ def episode_ready_for_inference(episode):
         street == "PREFLOP"
         and position == "UNKNOWN"
     ):
+        # If position context exists but this seat is absent from it, the
+        # episode belongs to a non-participant / phantom seat. Release it
+        # immediately so inference can suppress it instead of allowing it
+        # to become a permanent chronology barrier.
+        if (
+            positions
+            and seat != "hero"
+            and seat not in positions
+        ):
+            print(
+                "[EPISODE_PHANTOM_RELEASE]",
+                f"seat={seat}",
+                f"street={street}",
+                "reason=seat_not_in_frozen_hand",
+                flush=True,
+            )
+            return True
+
+        # Genuine hand context has not arrived yet. Preserve chronology until
+        # position mapping is available.
         return False
 
     evidence = set(
@@ -1816,10 +1916,17 @@ def episode_ready_for_inference(episode):
             else 0.85
         )
 
-        return (
+        elapsed = (
             time.time() - float(ended_ts)
-            >= wait_seconds
         )
+
+        # Before the late-stack window expires, hold the episode.
+        if elapsed < wait_seconds:
+            return False
+
+        # After the window expires, do not allow this weak visual-only
+        # episode to block every later episode forever.
+        return True
 
     return True
 
@@ -2082,6 +2189,39 @@ def main():
                 table_context
             )
             episode_manager.ingest(observations)
+
+            reinference_ids = (
+                episode_manager.consume_reinference_episode_ids()
+            )
+
+            for episode_id in sorted(reinference_ids):
+                if (
+                    episode_id
+                    in inference_engine.suppressed_episode_ids
+                ):
+                    inference_engine.suppressed_episode_ids.discard(
+                        episode_id
+                    )
+                    inference_engine.processed_episode_ids.discard(
+                        episode_id
+                    )
+
+                    print(
+                        "[INFERENCE_REOPEN]",
+                        f"episode={episode_id}",
+                        "reason=late_stack_after_suppression",
+                        flush=True,
+                    )
+                elif (
+                    episode_id
+                    in inference_engine.processed_episode_ids
+                ):
+                    print(
+                        "[INFERENCE_REOPEN_SKIP]",
+                        f"episode={episode_id}",
+                        "reason=already_published",
+                        flush=True,
+                    )
 
             # Diagnostic-only bootstrap analysis.
             #

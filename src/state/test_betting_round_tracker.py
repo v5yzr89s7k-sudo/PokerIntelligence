@@ -41,6 +41,7 @@ def inferred(
     action,
     street="PREFLOP",
     confidence=0.8,
+    table_context=None,
 ):
     return InferredAction(
         episode_id=episode_id,
@@ -50,7 +51,11 @@ def inferred(
         confidence=confidence,
         evidence=["test_evidence"],
         reason="test",
-        measurements={},
+        measurements={
+            "table_context": dict(
+                table_context or {}
+            ),
+        },
     )
 
 
@@ -274,9 +279,8 @@ def test_order_is_preserved():
     ]
 
 
-def test_later_actor_with_unresolved_preflop_gap_preserves_queue():
+def test_later_actor_without_commitment_evidence_resolves_gap_as_fold():
     hand = make_hand()
-    original_queue = list(hand.players_to_act)
     tracker = BettingRoundTracker(hand)
 
     result = tracker.ingest(
@@ -284,18 +288,36 @@ def test_later_actor_with_unresolved_preflop_gap_preserves_queue():
             1,
             "seat_upper_right",
             BET_OR_RAISE,
+            table_context={
+                "positions": {
+                    "seat_top": "UTG",
+                    "seat_upper_right": "HJ",
+                    "hero": "BTN",
+                },
+                "prior_voluntary_commitment_seats": [],
+                "prior_occupied_bet_regions": [],
+            },
         )
     )
 
-    assert result is None
-    assert hand.players_to_act == original_queue
-    assert hand.actions == []
+    assert result is not None
 
-    assert hand.players["seat_top"].folded is False
-    assert hand.players["seat_top"].active is True
+    assert hand.players_to_act == [
+        "hero",
+    ]
 
-    assert tracker.decisions[-1].accepted is False
-    assert tracker.decisions[-1].canonical_action is None
+    assert [
+        (action.seat, action.action)
+        for action in hand.actions
+    ] == [
+        ("seat_top", "FOLD"),
+        ("seat_upper_right", BET_OR_RAISE),
+    ]
+
+    assert hand.players["seat_top"].folded is True
+    assert hand.players["seat_top"].active is False
+
+    assert tracker.decisions[-1].accepted is True
 
 
 def test_first_actor_consumes_only_itself():
@@ -363,7 +385,7 @@ def test_postflop_skipped_seat_is_not_inferred_as_fold():
     assert hand.players["seat_top"].active is True
 
 
-def test_later_preflop_gap_remains_unresolved():
+def test_later_preflop_gap_with_commitment_evidence_is_deferred():
     hand = make_hand()
     tracker = BettingRoundTracker(hand)
 
@@ -384,12 +406,24 @@ def test_later_preflop_gap_remains_unresolved():
             2,
             "hero",
             CALL,
+            table_context={
+                "positions": {
+                    "seat_top": "UTG",
+                    "seat_upper_right": "HJ",
+                    "hero": "BTN",
+                },
+                "prior_voluntary_commitment_seats": [
+                    "seat_upper_right",
+                ],
+                "prior_occupied_bet_regions": [],
+            },
         )
     )
 
     assert first is not None
 
-    # The unresolved seat before Hero must not be fabricated as a fold.
+    # seat_upper_right has independent commitment evidence, so its action
+    # cannot safely be fabricated as a fold.
     assert second is None
 
     assert [
@@ -402,8 +436,11 @@ def test_later_preflop_gap_remains_unresolved():
     assert hand.players["seat_upper_right"].folded is False
     assert hand.players["seat_upper_right"].active is True
 
-    # Rejecting/defering the action must not consume the queue.
     assert hand.players_to_act == queue_before_second
+
+    assert tracker.decisions[-1].accepted is False
+    assert tracker.decisions[-1].canonical_action is None
+    assert "commitment evidence" in tracker.decisions[-1].reason
 
 
 def test_forced_blinds_do_not_consume_preflop_queue():
@@ -441,11 +478,11 @@ if __name__ == "__main__":
         test_street_change_resets_aggression,
         test_stale_street_action_is_rejected,
         test_order_is_preserved,
-        test_later_actor_with_unresolved_preflop_gap_preserves_queue,
+        test_later_actor_without_commitment_evidence_resolves_gap_as_fold,
         test_first_actor_consumes_only_itself,
         test_actor_outside_queue_does_not_corrupt_queue,
         test_postflop_skipped_seat_is_not_inferred_as_fold,
-        test_later_preflop_gap_remains_unresolved,
+        test_later_preflop_gap_with_commitment_evidence_is_deferred,
         test_forced_blinds_do_not_consume_preflop_queue,
     ]
 

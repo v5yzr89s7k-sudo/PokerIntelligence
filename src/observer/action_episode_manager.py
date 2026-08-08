@@ -110,6 +110,11 @@ class ActionEpisodeManager:
         # Hold unmatched stack evidence briefly instead of discarding it.
         self.pending_stack_by_seat = {}
 
+        # Closed episodes can acquire quantitative stack evidence after their
+        # first inference pass. Record those IDs so the coordinator can reopen
+        # previously suppressed inference exactly once.
+        self.reinference_episode_ids = set()
+
     def set_table_context(self, context):
         self.table_context = deepcopy(context or {})
 
@@ -218,6 +223,14 @@ class ActionEpisodeManager:
         seat = observation.seat or "table"
         street = observation.street or "unknown"
 
+        print(
+            f"[EPISODE] late_stack_attempt "
+            f"seat={seat} "
+            f"street={street} "
+            f"ts={observation.ts:.3f}",
+            flush=True,
+        )
+
         for episode in reversed(self.closed):
             if episode.seat != seat or episode.street != street:
                 continue
@@ -228,9 +241,24 @@ class ActionEpisodeManager:
             age = observation.ts - episode.ended_ts
 
             if age < 0.0:
+                print(
+                    f"[EPISODE] late_stack_reject "
+                    f"episode={episode.episode_id} "
+                    f"seat={seat} street={street} "
+                    f"reason=negative_age age={age:.3f}",
+                    flush=True,
+                )
                 continue
 
             if age > self.late_stack_attach_seconds:
+                print(
+                    f"[EPISODE] late_stack_reject "
+                    f"episode={episode.episode_id} "
+                    f"seat={seat} street={street} "
+                    f"reason=expired age={age:.3f} "
+                    f"limit={self.late_stack_attach_seconds:.3f}",
+                    flush=True,
+                )
                 break
 
             kinds = {
@@ -251,9 +279,27 @@ class ActionEpisodeManager:
                 flush=True,
             )
             episode.add(observation)
+
+            self.reinference_episode_ids.add(
+                episode.episode_id
+            )
+
+            print(
+                "[EPISODE] reinference_requested",
+                f"episode={episode.episode_id}",
+                f"seat={seat}",
+                f"street={street}",
+                flush=True,
+            )
+
             return True
 
         return False
+
+    def consume_reinference_episode_ids(self):
+        ids = set(self.reinference_episode_ids)
+        self.reinference_episode_ids.clear()
+        return ids
 
     def _consume_pending_stack(self, seat, street, opened_ts):
         observation = self.pending_stack_by_seat.get(seat)
@@ -421,6 +467,18 @@ class ActionEpisodeManager:
             return
 
         ep.close(reason)
+
+        print(
+            "[EPISODE CLOSED]",
+            f"id={ep.episode_id}",
+            f"seat={ep.seat}",
+            f"street={ep.street}",
+            f"reason={reason}",
+            f"confidence={ep.confidence:.2f}",
+            f"types={[o.get('type') for o in ep.observations]}",
+            flush=True,
+        )
+
         self.closed.append(ep)
         self.active_by_seat.pop(seat, None)
 

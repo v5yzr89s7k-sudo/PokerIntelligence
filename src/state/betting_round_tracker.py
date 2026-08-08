@@ -547,29 +547,77 @@ class BettingRoundTracker:
                 action_street == "PREFLOP"
                 and skipped_seats
             ):
-                self._record_decision(
-                    episode_id,
-                    action_street,
-                    seat,
-                    action,
-                    None,
-                    False,
-                    (
-                        "unresolved earlier preflop actors; "
-                        "action deferred without queue mutation"
-                    ),
+                measurements = item.get("measurements") or {}
+                table_context = (
+                    measurements.get("table_context")
+                    or {}
                 )
+
+                prior_committed = set(
+                    table_context.get(
+                        "prior_voluntary_commitment_seats"
+                    )
+                    or []
+                )
+
+                # Raw bet-region occupancy is visual evidence only. It can be
+                # stale, bootstrap noise, or lingering chips and therefore
+                # must never establish an unresolved voluntary action.
+                #
+                # Only semantically confirmed voluntary commitments may block
+                # preflop skipped-seat resolution.
+                commitment_evidence = set(
+                    prior_committed
+                )
+
+                unresolved_skipped = [
+                    skipped_seat
+                    for skipped_seat in skipped_seats
+                    if skipped_seat in commitment_evidence
+                ]
+
+                if unresolved_skipped:
+                    self._record_decision(
+                        episode_id,
+                        action_street,
+                        seat,
+                        action,
+                        None,
+                        False,
+                        (
+                            "unresolved earlier preflop actors with "
+                            "commitment evidence; action deferred "
+                            "without queue mutation"
+                        ),
+                    )
+
+                    print(
+                        "[PREFLOP_UNRESOLVED_GAP]",
+                        f"seat={seat}",
+                        f"skipped={skipped_seats}",
+                        f"commitment_evidence="
+                        f"{sorted(commitment_evidence)}",
+                        f"unresolved={unresolved_skipped}",
+                        f"raw_action={action}",
+                        f"canonical_candidate={canonical_action}",
+                        flush=True,
+                    )
+
+                    # DEFERRED is not PROCESSED.
+                    self.processed_episode_ids.discard(
+                        episode_id
+                    )
+
+                    return None
 
                 print(
-                    "[PREFLOP_UNRESOLVED_GAP]",
+                    "[PREFLOP_GAP_RESOLVED]",
                     f"seat={seat}",
                     f"skipped={skipped_seats}",
-                    f"raw_action={action}",
-                    f"canonical_candidate={canonical_action}",
+                    "resolution=FOLD",
+                    "reason=no_commitment_evidence",
                     flush=True,
                 )
-
-                return None
 
             skipped_seats = self._consume_action_queue(seat)
 

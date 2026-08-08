@@ -791,6 +791,28 @@ def handle_pot_update(state, event):
         expected_text = f"{expected:.2f}"
         difference_text = f"{difference:.2f}"
 
+    # Canonical action accounting is authoritative once actions have
+    # been reconstructed. OCR corroborates it but may not overwrite the
+    # hand with an implausible value.
+    if expected is not None:
+        tolerance = max(
+            1.0,
+            round(expected * 0.35, 2),
+        )
+
+        if abs(observed - expected) > tolerance:
+            print(
+                "[CANONICAL_POT_REJECT]",
+                f"observed={observed:.2f}",
+                f"expected={expected:.2f}",
+                f"difference={observed - expected:.2f}",
+                f"tolerance={tolerance:.2f}",
+                "reason=outside_expected_range",
+                flush=True,
+            )
+
+            return state
+
     accepted = canonical.set_observed_pot(observed)
     canonical_save(canonical)
 
@@ -1011,6 +1033,27 @@ def handle_inferred_action(state, event):
                 f"{event.get('seat')} {event.get('action')} "
                 f"reason={decision.reason}"
             )
+
+            # Deferred actions remain pending for replay.
+            if "deferred" in decision.reason.lower():
+                pending = list(
+                    state.get("pending_inferred_actions") or []
+                )
+
+                pending.append(dict(event))
+                pending.sort(
+                    key=lambda item: float(item.get("ts") or 0.0)
+                )
+
+                state["pending_inferred_actions"] = pending
+
+                print(
+                    "[BUFFER] deferred inferred_action "
+                    f"seat={event.get('seat')} "
+                    f"action={event.get('action')}",
+                    flush=True,
+                )
+
         return state
 
     canonical_save(canonical)
@@ -1025,6 +1068,30 @@ def handle_inferred_action(state, event):
         f"canonical_action {added.street} "
         f"{added.seat} {added.action}",
     )
+
+    pending = list(
+        state.get("pending_inferred_actions") or []
+    )
+
+    if pending:
+        state["pending_inferred_actions"] = []
+
+        pending.sort(
+            key=lambda item: float(
+                item.get("ts") or 0.0
+            )
+        )
+
+        print(
+            f"[REPLAY] retrying {len(pending)} deferred inferred actions",
+            flush=True,
+        )
+
+        for pending_event in pending:
+            state = handle_inferred_action(
+                state,
+                pending_event,
+            )
 
     return state
 

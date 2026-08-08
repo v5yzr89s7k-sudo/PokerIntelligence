@@ -122,22 +122,12 @@ class ParticipantFreezer:
         if self.frozen:
             return list(self._dealt_in_seats)
 
-        dealt_in = []
-
-        for seat in SEAT_ORDER:
-            if seat == "hero":
-                if hero_is_dealt:
-                    dealt_in.append(seat)
-                continue
-
-            card_1 = self.max_scores[seat]["card_1"]
-            card_2 = self.max_scores[seat]["card_2"]
-
-            if (
-                card_1 > self.threshold
-                and card_2 > self.threshold
-            ):
-                dealt_in.append(seat)
+        # Freeze from accumulated temporal evidence instead of a single
+        # strongest frame. This prevents one-frame noise from permanently
+        # adding or removing participants.
+        dealt_in = self.stable_dealt_in_seats(
+            hero_is_dealt=hero_is_dealt,
+        )
 
         self._dealt_in_seats = dealt_in
         self.frozen = True
@@ -175,11 +165,29 @@ class ParticipantFreezer:
                 self.paired_positive_frames[seat]
             )
 
-            if (
-                card_1_hits >= int(minimum_card_hits)
-                and card_2_hits >= int(minimum_card_hits)
-                and paired_hits >= int(minimum_paired_hits)
-            ):
+            # Adaptive temporal rule.
+            #
+            # Strong evidence:
+            #   paired visible in at least two frames.
+            #
+            # Sparse-table rule:
+            #   paired visible once AND one individual card remained stable.
+            #
+            # This prevents a genuine short-handed player from disappearing
+            # while remaining resistant to isolated one-frame noise.
+            strong_pair = (
+                paired_hits >= 2
+            )
+
+            sparse_confirmed = (
+                paired_hits >= int(minimum_paired_hits)
+                and (
+                    card_1_hits >= int(minimum_card_hits)
+                    or card_2_hits >= int(minimum_card_hits)
+                )
+            )
+
+            if strong_pair or sparse_confirmed:
                 stable.append(seat)
 
         return stable

@@ -237,32 +237,6 @@ class ActionInferenceEngine:
             reason = "table-level pot transition without seat attribution"
 
         elif (
-            street.upper() == "PREFLOP"
-            and position == "SB"
-            and BET_REGION_OCCUPIED in kinds
-            and not prior_committed
-        ):
-            action = POST_SMALL_BLIND
-            confidence = min(max(episode_confidence, 0.70), 0.90)
-            reason = (
-                "initial preflop SB commitment before any "
-                "confirmed voluntary action"
-            )
-
-        elif (
-            street.upper() == "PREFLOP"
-            and position == "BB"
-            and BET_REGION_OCCUPIED in kinds
-            and not prior_committed
-        ):
-            action = POST_BIG_BLIND
-            confidence = min(max(episode_confidence, 0.75), 0.92)
-            reason = (
-                "initial preflop BB commitment before any "
-                "confirmed voluntary action"
-            )
-
-        elif (
             STACK_CHANGED in kinds
             and BET_REGION_OCCUPIED in kinds
             and prior_committed
@@ -324,6 +298,7 @@ class ActionInferenceEngine:
             reason=reason,
             measurements={
                 **measurements,
+                "table_context": dict(table_context),
                 "timeline": timeline,
                 "timeline_types": [
                     event.get("type")
@@ -358,8 +333,8 @@ class ActionInferenceEngine:
 
             action = self.infer_episode(item)
 
-            # Every closed episode is processed exactly once, including
-            # episodes deliberately suppressed below.
+            # Scheduler-level inference remains one-shot. Canonical deferral
+            # is handled independently by the state-machine pending buffer.
             self.processed_episode_ids.add(episode_id)
 
             evidence = set(action.evidence)
