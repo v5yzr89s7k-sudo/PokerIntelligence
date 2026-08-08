@@ -1,4 +1,5 @@
 from pathlib import Path
+import fcntl
 import subprocess
 import sys
 import time
@@ -11,6 +12,7 @@ EVENT_LOG = LIVE / "api_events.jsonl"
 CURSOR = LIVE / "api_event_state_machine_cursor.txt"
 STATE = LIVE / "api_event_state_machine_state.json"
 CURRENT = LIVE / "current_hand.txt"
+RUNNER_LOCK = LIVE / "run_live_observer.lock"
 
 DRAIN_TIMEOUT_SECONDS = 10.0
 POLL_SECONDS = 0.05
@@ -18,6 +20,32 @@ POLL_SECONDS = 0.05
 
 class EventReplayError(RuntimeError):
     pass
+
+
+def _acquire_validation_runtime():
+    LIVE.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    lock_handle = RUNNER_LOCK.open(
+        "a+",
+        encoding="utf-8",
+    )
+
+    try:
+        fcntl.flock(
+            lock_handle.fileno(),
+            fcntl.LOCK_EX | fcntl.LOCK_NB,
+        )
+    except BlockingIOError:
+        lock_handle.close()
+        raise EventReplayError(
+            "live observer is running; validation requires "
+            "exclusive access to runtime/live"
+        )
+
+    return lock_handle
 
 
 def _reset_state_machine_runtime():
@@ -79,6 +107,8 @@ def replay(event_file: Path):
         raise EventReplayError(
             f"event file does not exist: {event_file}"
         )
+
+    validation_lock = _acquire_validation_runtime()
 
     _reset_state_machine_runtime()
 
@@ -148,3 +178,11 @@ def replay(event_file: Path):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
+
+        try:
+            fcntl.flock(
+                validation_lock.fileno(),
+                fcntl.LOCK_UN,
+            )
+        finally:
+            validation_lock.close()
