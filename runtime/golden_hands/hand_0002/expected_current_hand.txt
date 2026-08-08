@@ -1,0 +1,47 @@
+CURRENT HAND
+========================================================================
+Started: 2026-08-08 11:46:36
+Hand ID: live-1786203996885
+
+TABLE — 8 players
+------------------------------------------------------------------------
+BB       seat_top                 28.36 BB
+BTN      seat_mid_left            19.82 BB
+CO       seat_lower_left          64.13 BB
+HJ       poker5068                32.42 BB [HERO]
+LJ       seat_lower_right         72.08 BB
+SB       seat_upper_left                  
+UTG      seat_upper_right         33.71 BB
+UTG+1    seat_mid_right           99.41 BB
+
+Hero Position: HJ
+Hero Cards: 7h Jc
+
+PREFLOP
+------------------------------------------------------------------------
+Starting Pot: 2.5 BB
+
+BB posts ante 0.12 BB
+UTG posts ante 0.12 BB
+UTG+1 posts ante 0.12 BB
+LJ posts ante 0.12 BB
+HJ (poker5068) posts ante 0.12 BB
+CO posts ante 0.12 BB
+BTN posts ante 0.12 BB
+SB posts ante 0.12 BB
+SB posts small blind 0.5 BB
+BB posts big blind 1 BB
+UTG folds
+UTG+1 opens to 6.01 BB
+LJ 3-bets to 7.01 BB
+HJ (poker5068) calls 7 BB
+
+Ending Pot: 18.5 BB
+
+FLOP: 8s Qd Td
+------------------------------------------------------------------------
+Starting Pot: 18.5 BB
+
+
+
+Current Pot: 18.5 BB

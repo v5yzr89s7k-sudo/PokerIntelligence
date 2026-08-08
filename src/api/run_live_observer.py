@@ -1,4 +1,6 @@
 from pathlib import Path
+import fcntl
+import os
 import subprocess
 import sys
 import time
@@ -6,6 +8,7 @@ import signal
 
 ROOT = Path(__file__).resolve().parents[2]
 LIVE = ROOT / "runtime/live"
+RUNNER_LOCK = LIVE / "run_live_observer.lock"
 EVENT_LOG = LIVE / "api_events.jsonl"
 STATE_CURSOR = LIVE / "api_event_state_machine_cursor.txt"
 
@@ -14,6 +17,34 @@ DRAIN_POLL_SECONDS = 0.10
 
 procs = []
 stopping = False
+
+
+def acquire_single_instance():
+    LIVE.mkdir(parents=True, exist_ok=True)
+
+    lock_handle = RUNNER_LOCK.open(
+        "a+",
+        encoding="utf-8",
+    )
+
+    try:
+        fcntl.flock(
+            lock_handle.fileno(),
+            fcntl.LOCK_EX | fcntl.LOCK_NB,
+        )
+    except BlockingIOError:
+        lock_handle.close()
+        raise SystemExit(
+            "Poker Intelligence observer is already running. "
+            "Refusing to start a second instance."
+        )
+
+    lock_handle.seek(0)
+    lock_handle.truncate()
+    lock_handle.write(str(os.getpid()) + "\n")
+    lock_handle.flush()
+
+    return lock_handle
 
 
 def reset_runtime():
@@ -175,6 +206,8 @@ def stop_all(*_):
 
 signal.signal(signal.SIGINT, stop_all)
 signal.signal(signal.SIGTERM, stop_all)
+
+single_instance_lock = acquire_single_instance()
 
 reset_runtime()
 start("state_machine", ["src/api/api_event_state_machine.py"])
