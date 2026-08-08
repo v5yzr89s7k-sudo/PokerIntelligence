@@ -1,0 +1,55 @@
+CURRENT HAND
+========================================================================
+Started: 2026-08-08 11:29:33
+Hand ID: live-1786202973729
+
+TABLE — 8 players
+------------------------------------------------------------------------
+BB       Jemjoker                 80.13 BB
+BTN      CassiaEmerson1           93.42 BB
+CO       patrickferjor             4.78 BB
+HJ       Benevolence                      
+LJ       cowmilker49              36.02 BB
+SB       poker5068                         [HERO]
+UTG      brDva                    27.57 BB
+UTG+1    korchemnyi87                     
+
+Hero Position: SB
+Hero Cards: Qh 5h
+
+PREFLOP
+------------------------------------------------------------------------
+Starting Pot: 2.41 BB
+
+LJ (cowmilker49) posts ante 0.11 BB
+HJ (Benevolence) posts ante 0.11 BB
+CO (patrickferjor) posts ante 0.11 BB
+BTN (CassiaEmerson1) posts ante 0.11 BB
+SB (poker5068) posts ante 0.11 BB
+BB (Jemjoker) posts ante 0.11 BB
+UTG (brDva) posts ante 0.11 BB
+UTG+1 (korchemnyi87) posts ante 0.11 BB
+SB (poker5068) posts small blind 0.5 BB
+BB (Jemjoker) posts big blind 1 BB
+
+Ending Pot: 2.4 BB
+
+FLOP: 9d 8s 4s
+------------------------------------------------------------------------
+Starting Pot: 2.4 BB
+
+
+
+Ending Pot: 2.4 BB
+
+TURN: Ks
+------------------------------------------------------------------------
+Starting Pot: 2.4 BB
+
+SB (poker5068) folds
+
+Ending Pot: 2.41 BB
+
+RESULT
+------------------------------------------------------------------------
+Hero folded on turn

@@ -1,0 +1,15 @@
+{
+  "format_version": 1,
+  "hand_number": 1,
+  "recorded_at": "2026-08-08T11:29:32.423098",
+  "completed_at": "2026-08-08T11:30:33.271080",
+  "event_count": 62,
+  "expected_source": "runtime/live/current_hand.txt",
+  "events_source": "runtime/live/api_events.jsonl",
+  "allow_live_workers": false,
+  "status": "verified",
+  "validation_layer": "canonical_event_stream",
+  "validation_command": "python3 src/validation/run_suite.py",
+  "frames_required_for_validation": false,
+  "recorded_frame_count": 27
+}
