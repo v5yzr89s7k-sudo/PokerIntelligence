@@ -131,6 +131,7 @@ def default_state():
         "pending_inferred_actions": [],
         "pending_stack_updates": [],
         "pending_pot_updates": [],
+        "pending_high_pot": None,
         "pending_terminal_events": [],
         "timeline": [],
     }
@@ -791,27 +792,78 @@ def handle_pot_update(state, event):
         expected_text = f"{expected:.2f}"
         difference_text = f"{difference:.2f}"
 
-    # Canonical action accounting is authoritative once actions have
-    # been reconstructed. OCR corroborates it but may not overwrite the
-    # hand with an implausible value.
     if expected is not None:
         tolerance = max(
             1.0,
             round(expected * 0.35, 2),
         )
 
-        if abs(observed - expected) > tolerance:
+        lower_bound = expected - tolerance
+        upper_bound = expected + tolerance
+
+        # An observed pot materially below already reconstructed
+        # commitments contradicts canonical accounting.
+        if observed < lower_bound:
+            state["pending_high_pot"] = None
+
             print(
                 "[CANONICAL_POT_REJECT]",
                 f"observed={observed:.2f}",
                 f"expected={expected:.2f}",
                 f"difference={observed - expected:.2f}",
                 f"tolerance={tolerance:.2f}",
-                "reason=outside_expected_range",
+                "reason=below_canonical_commitments",
                 flush=True,
             )
 
             return state
+
+        # A much higher table pot can be legitimate when action inference
+        # missed calls, raises, or all-in commitments. However, one isolated
+        # OCR spike must not overwrite canonical state.
+        #
+        # Require a second high observation on the SAME street before
+        # promoting the larger observed pot to authoritative state.
+        if observed > upper_bound:
+            pending_high = state.get("pending_high_pot") or {}
+            pending_phase = pending_high.get("phase")
+            pending_value = pending_high.get("pot_bb")
+
+            confirmed_high = bool(
+                pending_phase == state.get("phase")
+                and pending_value is not None
+                and observed >= float(pending_value) - 1.0
+            )
+
+            if not confirmed_high:
+                state["pending_high_pot"] = {
+                    "phase": state.get("phase"),
+                    "pot_bb": observed,
+                    "ts": event.get("ts") or time.time(),
+                }
+
+                print(
+                    "[CANONICAL_POT_PENDING_HIGH]",
+                    f"observed={observed:.2f}",
+                    f"expected={expected:.2f}",
+                    f"difference={observed - expected:.2f}",
+                    f"phase={state.get('phase')}",
+                    "reason=awaiting_same_street_confirmation",
+                    flush=True,
+                )
+
+                return state
+
+            print(
+                "[CANONICAL_POT_CONFIRMED_HIGH]",
+                f"previous={float(pending_value):.2f}",
+                f"observed={observed:.2f}",
+                f"expected={expected:.2f}",
+                f"phase={state.get('phase')}",
+                flush=True,
+            )
+
+        state["pending_high_pot"] = None
 
     accepted = canonical.set_observed_pot(observed)
     canonical_save(canonical)
@@ -870,6 +922,7 @@ def handle_board(state, event):
     next_phase = transition_for_board_len(n)
     state["phase"] = next_phase
     state["board"] = board
+    state["pending_high_pot"] = None
 
     canonical = canonical_load()
     canonical.set_board(

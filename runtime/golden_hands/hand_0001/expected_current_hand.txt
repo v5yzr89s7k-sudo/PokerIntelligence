@@ -32,23 +32,23 @@ UTG+1 (korchemnyi87) posts ante 0.11 BB
 SB (poker5068) posts small blind 0.5 BB
 BB (Jemjoker) posts big blind 1 BB
 
-Ending Pot: 2.4 BB
+Ending Pot: 17.9 BB
 
 FLOP: 9d 8s 4s
 ------------------------------------------------------------------------
-Starting Pot: 2.4 BB
+Starting Pot: 17.9 BB
 
 
 
-Ending Pot: 2.4 BB
+Ending Pot: 17.9 BB
 
 TURN: Ks
 ------------------------------------------------------------------------
-Starting Pot: 2.4 BB
+Starting Pot: 17.9 BB
 
 SB (poker5068) folds
 
-Ending Pot: 2.41 BB
+Ending Pot: 22.38 BB
 
 RESULT
 ------------------------------------------------------------------------

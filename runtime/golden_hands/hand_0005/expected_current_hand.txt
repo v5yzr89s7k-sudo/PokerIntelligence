@@ -1,0 +1,73 @@
+CURRENT HAND
+========================================================================
+Started: 2026-08-08 16:39:35
+Hand ID: live-1786221575554
+
+TABLE — 8 players
+------------------------------------------------------------------------
+BB       seat_mid_left            84.83 BB
+BTN      poker5068               147.95 BB [HERO]
+CO       seat_lower_right                 
+HJ       cheftrucker             188.61 BB
+LJ       seat_upper_right         79.96 BB
+SB       seat_lower_left          72.96 BB
+UTG      seat_upper_left          51.06 BB
+UTG+1    seat_top                 71.23 BB
+
+Hero Position: BTN
+Hero Cards: 5h 8c
+
+PREFLOP
+------------------------------------------------------------------------
+Starting Pot: 2.5 BB
+
+UTG+1 posts ante 0.12 BB
+LJ posts ante 0.12 BB
+HJ (cheftrucker) posts ante 0.12 BB
+CO posts ante 0.12 BB
+BTN (poker5068) posts ante 0.12 BB
+SB posts ante 0.12 BB
+BB posts ante 0.12 BB
+UTG posts ante 0.12 BB
+SB posts small blind 0.5 BB
+BB posts big blind 1 BB
+UTG folds
+UTG+1 folds
+LJ folds
+HJ (cheftrucker) folds
+CO folds
+BTN (poker5068) opens to 2.01 BB
+SB folds
+BB 3-bets to 10 BB
+
+Ending Pot: 31 BB
+
+FLOP: 7d Tc 6c
+------------------------------------------------------------------------
+Starting Pot: 31 BB
+
+BB checks
+BTN (poker5068) bets 24.94 BB
+
+Ending Pot: 105.82 BB
+
+TURN: Ad
+------------------------------------------------------------------------
+Starting Pot: 105.82 BB
+
+BB checks
+BTN (poker5068) bets 50.89 BB
+
+Ending Pot: 246.12 BB
+
+RIVER: 3h
+------------------------------------------------------------------------
+Starting Pot: 246.12 BB
+
+
+
+Ending Pot: 246.12 BB
+
+RESULT
+------------------------------------------------------------------------
+Board cleared after river
