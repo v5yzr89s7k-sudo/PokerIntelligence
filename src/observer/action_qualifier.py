@@ -1,0 +1,123 @@
+from dataclasses import dataclass
+from typing import List
+
+
+@dataclass
+class ActionQualification:
+    episode_id: int
+    seat: str
+    street: str
+
+    # The actual candidate poker action is explicit in the qualification.
+    action: str
+    confidence: float
+    evidence: List[str]
+
+    evidence_mature: bool
+    maturity_reason: str
+
+    publish: bool
+    qualification_reason: str
+
+    def to_dict(self):
+        return {
+            "episode_id": self.episode_id,
+            "seat": self.seat,
+            "street": self.street,
+            "action": self.action,
+            "confidence": self.confidence,
+            "evidence": list(self.evidence),
+            "evidence_mature": self.evidence_mature,
+            "maturity_reason": self.maturity_reason,
+            "publish": self.publish,
+            "qualification_reason": self.qualification_reason,
+        }
+
+
+class ActionQualifier:
+    """
+    Semantic gate between action inference and canonical publication.
+
+    Phase 1 is pass-through only:
+      - every candidate action remains publishable;
+      - qualification records the inferred ACTION explicitly;
+      - evidence maturity is exposed for diagnostics.
+
+    A later phase may retire immature candidate actions here without
+    changing episode scheduling or action inference.
+    """
+
+    def qualify(self, episode, action):
+        item = (
+            episode.to_dict()
+            if hasattr(episode, "to_dict")
+            else dict(episode)
+        )
+
+        evidence = list(
+            getattr(action, "evidence", None)
+            or []
+        )
+
+        action_name = str(
+            getattr(action, "action", None)
+            or "UNKNOWN"
+        )
+
+        evidence_mature = bool(
+            item.get("evidence_mature", False)
+        )
+
+        # First evidence-gating enforcement.
+        #
+        # The nine-hand golden corpus contains five inferred actions without
+        # quantitative stack evidence, and every one of them is UNKNOWN.
+        #
+        # Retire only that proven class for now. Do not make assumptions about
+        # non-chip actions such as CHECK/FOLD or forced posts merely because
+        # they lack STACK_CHANGED evidence.
+        if (
+            action_name == "UNKNOWN"
+            and not evidence_mature
+        ):
+            publish = False
+            qualification_reason = (
+                "retire_immature_unknown"
+            )
+        else:
+            publish = True
+            qualification_reason = (
+                "publish_candidate_action"
+            )
+
+        return ActionQualification(
+            episode_id=int(
+                item.get("episode_id")
+                or 0
+            ),
+            seat=str(
+                getattr(action, "seat", None)
+                or item.get("seat")
+                or "unknown"
+            ),
+            street=str(
+                getattr(action, "street", None)
+                or item.get("street")
+                or "unknown"
+            ),
+            action=action_name,
+            confidence=float(
+                getattr(action, "confidence", 0.0)
+                or 0.0
+            ),
+            evidence=evidence,
+            evidence_mature=evidence_mature,
+            maturity_reason=str(
+                item.get("maturity_reason")
+                or "unknown"
+            ),
+            publish=publish,
+            qualification_reason=(
+                qualification_reason
+            ),
+        )

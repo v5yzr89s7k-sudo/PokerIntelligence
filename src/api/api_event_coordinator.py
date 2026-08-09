@@ -19,6 +19,8 @@ from src.events.participant_evidence_collector import (
 from src.observer.continuous_observer import ContinuousObserver
 from src.observer.observation_timeline import ObservationTimeline
 from src.observer.observation_correlator import ObservationCorrelator
+from src.observer.action_qualifier import ActionQualifier
+
 from src.observer.action_episode_manager import (
     ActionEpisodeManager,
     LATE_STACK_ATTACH_SECONDS,
@@ -2055,6 +2057,7 @@ def main():
     episode_manager = ActionEpisodeManager()
     episode_scheduler = StreetEpisodeScheduler()
     inference_engine = ActionInferenceEngine()
+    action_qualifier = ActionQualifier()
     commitment_tracker = StreetCommitmentTracker()
     commitment_street = "WAITING"
     last_deferred_count = None
@@ -2463,11 +2466,85 @@ def main():
             )
 
             if new_actions:
+                released_by_episode = {}
+
+                for episode in released_closed:
+                    item = (
+                        episode.to_dict()
+                        if hasattr(episode, "to_dict")
+                        else episode
+                    )
+
+                    episode_id = int(
+                        item.get("episode_id")
+                        or 0
+                    )
+
+                    if episode_id > 0:
+                        released_by_episode[
+                            episode_id
+                        ] = episode
+
                 for action in new_actions:
+                    episode_id = int(
+                        getattr(action, "episode_id", 0)
+                        or 0
+                    )
+
+                    episode = released_by_episode.get(
+                        episode_id
+                    )
+
+                    if episode is None:
+                        print(
+                            "[ACTION_QUALIFIER_SKIP]",
+                            f"episode={episode_id}",
+                            f"action={action.action}",
+                            "reason=episode_not_found",
+                            flush=True,
+                        )
+
+                        qualification = None
+                    else:
+                        qualification = (
+                            action_qualifier.qualify(
+                                episode,
+                                action,
+                            )
+                        )
+
+                        print(
+                            "[ACTION_QUALIFICATION]",
+                            f"episode={qualification.episode_id}",
+                            f"seat={qualification.seat}",
+                            f"street={qualification.street}",
+                            f"action={qualification.action}",
+                            f"confidence={qualification.confidence:.2f}",
+                            f"mature={qualification.evidence_mature}",
+                            f"publish={qualification.publish}",
+                            f"reason={qualification.qualification_reason}",
+                            flush=True,
+                        )
+
                     print(
                         f"[INFERRED] {action.street} {action.seat} "
                         f"{action.action} confidence={action.confidence:.2f}"
                     )
+
+                    # Phase 1 qualifier is pass-through, so this condition
+                    # currently preserves existing runtime behavior exactly.
+                    if (
+                        qualification is not None
+                        and not qualification.publish
+                    ):
+                        print(
+                            "[ACTION_RETIRED]",
+                            f"episode={qualification.episode_id}",
+                            f"action={qualification.action}",
+                            f"reason={qualification.qualification_reason}",
+                            flush=True,
+                        )
+                        continue
 
                     if (
                         action.action in {

@@ -333,6 +333,28 @@ class ActionInferenceEngine:
 
             action = self.infer_episode(item)
 
+            # Phase 2 diagnostic for evidence-gated actions.
+            #
+            # Do not change publication behavior yet. Record episodes that
+            # reached inference without quantitative seat-level commitment
+            # evidence so we can measure exactly which inferred actions would
+            # be retired by the future evidence gate.
+            evidence_mature = bool(
+                item.get("evidence_mature", False)
+            )
+
+            if not evidence_mature:
+                print(
+                    "[IMMATURE_EPISODE]",
+                    f"episode={episode_id}",
+                    f"seat={item.get('seat')}",
+                    f"street={item.get('street')}",
+                    f"action={action.action}",
+                    f"reason={item.get('maturity_reason')}",
+                    f"evidence={list(action.evidence)}",
+                    flush=True,
+                )
+
             # Scheduler-level inference remains one-shot. Canonical deferral
             # is handled independently by the state-machine pending buffer.
             self.processed_episode_ids.add(episode_id)

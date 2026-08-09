@@ -25,6 +25,14 @@ class ActionEpisode:
     ended_ts: Optional[float] = None
     observations: List[dict] = field(default_factory=list)
     confidence: float = 0.0
+
+    # Evidence maturity is distinct from chronological readiness.
+    #
+    # An episode may be closed and old enough for the scheduler while still
+    # lacking enough seat-level evidence to support a voluntary poker action.
+    evidence_mature: bool = False
+    maturity_reason: str = "insufficient_evidence"
+
     closed: bool = False
     close_reason: str = ""
     pending_close_ts: Optional[float] = None
@@ -60,6 +68,33 @@ class ActionEpisode:
             score += 0.05
 
         self.confidence = min(score, 1.0)
+        self.evaluate_maturity()
+
+    def evaluate_maturity(self):
+        """
+        Classify whether this episode contains quantitative seat-level
+        commitment evidence.
+
+        Phase 1 is diagnostic only. Nothing in scheduling or inference consumes
+        this value yet.
+
+        STACK_CHANGED is currently the authoritative quantitative evidence for
+        a voluntary chip commitment. Table-level POT_CHANGED and visual
+        bet-region evidence do not identify which player committed chips.
+        """
+        kinds = {
+            item.get("type")
+            for item in self.observations
+        }
+
+        if STACK_CHANGED in kinds:
+            self.evidence_mature = True
+            self.maturity_reason = "quantitative_stack_commitment"
+        else:
+            self.evidence_mature = False
+            self.maturity_reason = "no_quantitative_stack_commitment"
+
+        return self.evidence_mature
 
     def close(self, reason=""):
         if not self.closed:
@@ -79,6 +114,8 @@ class ActionEpisode:
             "observation_count": len(self.observations),
             "observation_types": [o.get("type") for o in self.observations],
             "confidence": round(self.confidence, 2),
+            "evidence_mature": self.evidence_mature,
+            "maturity_reason": self.maturity_reason,
             "closed": self.closed,
             "close_reason": self.close_reason,
             "pending_close_ts": self.pending_close_ts,

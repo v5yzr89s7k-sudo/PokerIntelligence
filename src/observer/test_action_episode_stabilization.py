@@ -66,9 +66,11 @@ assert len(manager.closed) == 1
 episode = manager.closed[0].to_dict()
 kinds = episode["observation_types"]
 
-# The first stack change occurred before direct chip evidence and must
-# be ignored. Only the later stack change strengthens the open episode.
-assert kinds.count(STACK_CHANGED) == 1
+# Observations from the same detector cycle are processed in poker-semantic
+# priority order: BET_REGION_OCCUPIED opens the episode before STACK_CHANGED
+# is applied. Therefore both the same-cycle quantitative stack evidence and
+# the later settled stack evidence remain attached to this episode.
+assert kinds.count(STACK_CHANGED) == 2
 assert BET_REGION_OCCUPIED in kinds
 assert BET_REGION_CLEARED in kinds
 assert POT_CHANGED in kinds
