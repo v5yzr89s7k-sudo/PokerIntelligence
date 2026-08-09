@@ -140,7 +140,8 @@ def main():
                     event_start_line:
                 ]
 
-                completed = 0
+                target_hand_started = False
+                target_hand_complete = False
 
                 for line in recording_lines:
                     try:
@@ -148,13 +149,24 @@ def main():
                     except json.JSONDecodeError:
                         continue
 
-                    if event.get("type") == "hand_complete":
-                        completed += 1
+                    event_type = event.get("type")
 
-                if completed >= 1:
+                    # Events arriving after recorder start may still belong to
+                    # the previous hand because workers are asynchronous.
+                    # The target fixture begins only at the first hero_cards.
+                    if not target_hand_started:
+                        if event_type == "hero_cards":
+                            target_hand_started = True
+                        continue
+
+                    if event_type == "hand_complete":
+                        target_hand_complete = True
+                        break
+
+                if target_hand_complete:
                     print()
                     print(
-                        "Hand complete detected. "
+                        "Target hand complete detected. "
                         "Stopping recording automatically."
                     )
 
@@ -240,14 +252,70 @@ def main():
         if line.strip()
     ]
 
-    recording_event_lines = all_event_lines[
+    raw_recording_lines = all_event_lines[
         event_start_line:
     ]
+
+    # A recorder may begin while late asynchronous events from the previous
+    # hand are still arriving. Define the golden fixture semantically:
+    #
+    #   first hero_cards
+    #       through
+    #   first hand_complete
+    #
+    # Nothing outside that interval belongs to the target hand.
+    recording_event_lines = []
+    target_hand_started = False
+    target_hand_complete = False
+
+    for line in raw_recording_lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        event_type = event.get("type")
+
+        if not target_hand_started:
+            if event_type != "hero_cards":
+                continue
+
+            target_hand_started = True
+
+        recording_event_lines.append(line)
+
+        if event_type == "hand_complete":
+            target_hand_complete = True
+            break
 
     events_text = (
         "\n".join(recording_event_lines)
         + ("\n" if recording_event_lines else "")
     )
+
+    if not target_hand_started:
+        print()
+        print(
+            "ERROR: target hand never produced hero_cards."
+        )
+        print("Invalid fixture removed.")
+        shutil.rmtree(
+            hand_dir,
+            ignore_errors=True,
+        )
+        return 1
+
+    if not target_hand_complete:
+        print()
+        print(
+            "ERROR: target hand never completed."
+        )
+        print("Invalid fixture removed.")
+        shutil.rmtree(
+            hand_dir,
+            ignore_errors=True,
+        )
+        return 1
 
     if not events_text.strip():
         print()
