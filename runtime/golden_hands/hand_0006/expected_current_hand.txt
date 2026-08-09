@@ -1,0 +1,67 @@
+CURRENT HAND
+========================================================================
+Started: 2026-08-09 13:10:18
+Hand ID: live-1786295418472
+
+TABLE — 7 players
+------------------------------------------------------------------------
+BB       Telariust                44.12 BB
+BTN      hexenmeister            249.91 BB
+CO       smalloy81                89.53 BB
+HJ       poker5068                79.91 BB [HERO]
+LJ       Justiceiro07             22.29 BB
+SB       Despol                           
+UTG      LoneWolf9696             85.06 BB
+
+Hero Position: HJ
+Hero Cards: Kh Ac
+
+PREFLOP
+------------------------------------------------------------------------
+Starting Pot: 2.38 BB
+
+BB (Telariust) posts ante 0.12 BB
+UTG (LoneWolf9696) posts ante 0.12 BB
+LJ (Justiceiro07) posts ante 0.12 BB
+HJ (poker5068) posts ante 0.12 BB
+CO (smalloy81) posts ante 0.12 BB
+BTN (hexenmeister) posts ante 0.12 BB
+SB (Despol) posts ante 0.12 BB
+SB (Despol) posts small blind 0.5 BB
+BB (Telariust) posts big blind 1 BB
+UTG (LoneWolf9696) folds
+LJ (Justiceiro07) folds
+HJ (poker5068) folds
+CO (smalloy81) folds
+BTN (hexenmeister) opens to 2.11 BB
+
+Ending Pot: 2.37 BB
+
+FLOP: 9d Qc 4c
+------------------------------------------------------------------------
+Starting Pot: 2.37 BB
+
+
+
+Ending Pot: 2.37 BB
+
+TURN: 2d
+------------------------------------------------------------------------
+Starting Pot: 2.37 BB
+
+
+
+Ending Pot: 2.37 BB
+
+RIVER: Kd
+------------------------------------------------------------------------
+Starting Pot: 2.37 BB
+
+SB (Despol) checks
+BB (Telariust) bets 0.62 BB
+
+Ending Pot: 15.39 BB
+
+RESULT
+------------------------------------------------------------------------
+Board cleared after river

@@ -556,7 +556,21 @@ class CanonicalHand:
             summary is not None
             and not summary.pot_observed
         ):
-            summary.ending_pot_bb = self.expected_pot_bb
+            # Reconstructed commitments may be incomplete. A new street
+            # inherits the real pot carried from the previous street, so
+            # incomplete action accounting must never reduce that amount.
+            inherited_pot = summary.starting_pot_bb
+
+            if inherited_pot is None:
+                summary.ending_pot_bb = self.expected_pot_bb
+            else:
+                summary.ending_pot_bb = round(
+                    max(
+                        float(inherited_pot),
+                        float(self.expected_pot_bb or 0.0),
+                    ),
+                    2,
+                )
 
 
     def set_observed_pot(self, pot_bb: float) -> float:

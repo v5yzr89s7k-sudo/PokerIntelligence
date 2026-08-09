@@ -137,6 +137,10 @@ def fresh_state():
         "hero_request_ts": None,
         "pot_request_id": None,
         "pot_request_ts": None,
+        "last_valid_river_frame": None,
+        "terminal_pot_pending": False,
+        "terminal_pot_request_id": None,
+        "terminal_pot_started_ts": None,
         "initial_pot_queued": False,
         "last_local_board_count": 0,
         "last_local_hero_visible": False,
@@ -1810,18 +1814,110 @@ def maybe_complete_early(state, count, hero_visible):
     return state
 
 
-def maybe_complete_hand(state, count):
+def maybe_complete_hand(state, count, frame=None):
     if state.get("phase") != "RIVER":
         state["board_clear_seen"] = 0
+        state["last_valid_river_frame"] = None
+        state["terminal_pot_pending"] = False
+        state["terminal_pot_request_id"] = None
+        state["terminal_pot_started_ts"] = None
+        return state
+
+    # Preserve the newest frame that unquestionably belongs to this hand.
+    # A terminal pot read may execute after the board disappears, but it must
+    # read pixels captured while the river was still visible.
+    if count == 5:
+        state["board_clear_seen"] = 0
+
+        if frame is not None:
+            state["last_valid_river_frame"] = str(frame)
+
         return state
 
     if count == 0:
-        state["board_clear_seen"] = state.get("board_clear_seen", 0) + 1
+        state["board_clear_seen"] = (
+            state.get("board_clear_seen", 0) + 1
+        )
     else:
         state["board_clear_seen"] = 0
+        return state
 
-    if state["board_clear_seen"] >= 4:
-        emit({"type": "hand_complete", "result": "Board cleared after river"})
+    if state["board_clear_seen"] < 4:
+        return state
+
+    # First terminal cycle: replace any ordinary in-flight pot request with
+    # one tied to the last frame where this river was definitely visible.
+    if not state.get("terminal_pot_pending"):
+        river_frame_text = state.get("last_valid_river_frame")
+
+        if river_frame_text:
+            river_frame = Path(river_frame_text)
+
+            if river_frame.exists():
+                state = queue_pot_request(
+                    state,
+                    river_frame,
+                )
+
+                state["terminal_pot_pending"] = True
+                state["terminal_pot_request_id"] = (
+                    state.get("pot_request_id")
+                )
+                state["terminal_pot_started_ts"] = time.time()
+
+                print(
+                    "[TERMINAL_POT] queued",
+                    f"request={str(state.get('pot_request_id') or '')[:8]}",
+                    f"frame={river_frame.name}",
+                    flush=True,
+                )
+
+                return state
+
+        print(
+            "[TERMINAL_POT] no valid river frame; completing without final read",
+            flush=True,
+        )
+
+        emit({
+            "type": "hand_complete",
+            "result": "Board cleared after river",
+        })
+        return fresh_state()
+
+    # apply_pot_result() clears pot_request_id after either a successful or
+    # failed worker result. Once that happens, settlement is complete and the
+    # hand may close. A valid result has already emitted pot_update.
+    if state.get("pot_request_id") is None:
+        print(
+            "[TERMINAL_POT] settled; completing hand",
+            flush=True,
+        )
+
+        emit({
+            "type": "hand_complete",
+            "result": "Board cleared after river",
+        })
+        return fresh_state()
+
+    started = float(
+        state.get("terminal_pot_started_ts") or 0.0
+    )
+
+    if started and time.time() - started >= 2.5:
+        print(
+            "[TERMINAL_POT] timeout; completing without final pot result",
+            flush=True,
+        )
+
+        # Ignore any worker result arriving after the hand is closed.
+        state["pot_request_id"] = None
+        state["pot_request_ts"] = None
+
+        emit({
+            "type": "hand_complete",
+            "result": "Board cleared after river",
+        })
         return fresh_state()
 
     return state
@@ -2115,6 +2211,7 @@ def main():
 
         if (
             state.get("phase") != "WAITING"
+            and not state.get("terminal_pot_pending")
             and bool(getattr(changes, "pot_changed", False))
             and state.get("pot_request_id") is None
         ):
@@ -2455,7 +2552,11 @@ def main():
             hero_visible,
         )
         state = maybe_complete_early(state, count, hero_visible)
-        state = maybe_complete_hand(state, count)
+        state = maybe_complete_hand(
+            state,
+            count,
+            frame=frame,
+        )
 
         save_state(state)
 
