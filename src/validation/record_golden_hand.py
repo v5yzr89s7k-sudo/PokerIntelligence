@@ -90,7 +90,8 @@ def main():
     print("IMPORTANT:")
     print("  1. The normal live observer must already be running.")
     print("  2. Start this BEFORE the target hand is dealt.")
-    print("  3. Press Ctrl+C immediately AFTER that hand is complete.")
+    print("  3. DO NOT press Ctrl+C.")
+    print("  4. Recording stops automatically after hand_complete.")
     print()
     print("Recording...")
     print()
@@ -126,6 +127,42 @@ def main():
             frame_number += 1
             time.sleep(0.15)
 
+            if EVENT_LOG.exists():
+                live_event_lines = [
+                    line
+                    for line in EVENT_LOG.read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                    if line.strip()
+                ]
+
+                recording_lines = live_event_lines[
+                    event_start_line:
+                ]
+
+                completed = 0
+
+                for line in recording_lines:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if event.get("type") == "hand_complete":
+                        completed += 1
+
+                if completed >= 1:
+                    print()
+                    print(
+                        "Hand complete detected. "
+                        "Stopping recording automatically."
+                    )
+
+                    # Give the state machine a short window to finish
+                    # publishing current_hand.txt for this terminal event.
+                    time.sleep(0.75)
+                    break
+
     except KeyboardInterrupt:
         pass
 
@@ -144,8 +181,11 @@ def main():
             "does not exist."
         )
         print(
-            "Fixture retained for inspection but is "
-            "NOT golden."
+            "Invalid fixture removed."
+        )
+        shutil.rmtree(
+            hand_dir,
+            ignore_errors=True,
         )
         return 1
 
@@ -159,8 +199,11 @@ def main():
             "ERROR: current_hand.txt is empty."
         )
         print(
-            "Fixture retained for inspection but is "
-            "NOT golden."
+            "Invalid fixture removed."
+        )
+        shutil.rmtree(
+            hand_dir,
+            ignore_errors=True,
         )
         return 1
 
@@ -181,8 +224,11 @@ def main():
             "does not exist."
         )
         print(
-            "Fixture retained for inspection but is "
-            "NOT golden."
+            "Invalid fixture removed."
+        )
+        shutil.rmtree(
+            hand_dir,
+            ignore_errors=True,
         )
         return 1
 
@@ -210,8 +256,11 @@ def main():
             "during this recording."
         )
         print(
-            "Fixture retained for inspection but is "
-            "NOT golden."
+            "Invalid fixture removed."
+        )
+        shutil.rmtree(
+            hand_dir,
+            ignore_errors=True,
         )
         return 1
 
@@ -237,8 +286,11 @@ def main():
             f"{hand_complete_count}"
         )
         print(
-            "Fixture retained for inspection but is "
-            "NOT golden."
+            "Invalid fixture removed."
+        )
+        shutil.rmtree(
+            hand_dir,
+            ignore_errors=True,
         )
         return 1
 
