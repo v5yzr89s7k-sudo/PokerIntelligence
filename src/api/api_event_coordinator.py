@@ -1821,7 +1821,9 @@ def maybe_complete_early(state, count, hero_visible):
 
 def maybe_complete_hand(state, count, frame=None):
     if state.get("phase") != "RIVER":
-        state["board_clear_seen"] = 0
+        # FLOP/TURN board-clear accumulation belongs to maybe_complete_early().
+        # Do not reset board_clear_seen here or the early-completion threshold
+        # can never be reached.
         state["last_valid_river_frame"] = None
         state["terminal_pot_pending"] = False
         state["terminal_pot_request_id"] = None
