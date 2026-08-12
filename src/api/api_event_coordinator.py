@@ -1698,14 +1698,8 @@ def apply_pot_result(state, result):
 
 def consume_ready_worker_results(state):
     """
-    Consume completed non-board worker results before another expensive
+    Consume completed worker results before performing another expensive
     capture/perception cycle.
-
-    Board results are intentionally NOT consumed here. They remain pending for
-    maybe_read_board(), which runs after local perception, episode settlement,
-    scheduling, inference, and qualification. This prevents a completed board
-    worker from advancing the street ahead of unresolved actions from the
-    current street.
 
     Returns:
         (state, consumed_result, emitted_board)
@@ -1741,6 +1735,28 @@ def consume_ready_worker_results(state):
 
                 save_state(state)
                 return state, True, False
+
+    board_request_id = state.get("board_request_id")
+
+    if board_request_id:
+        board_result = find_board_result(board_request_id)
+
+        if board_result is not None:
+            log_latency(
+                "coordinator_consumed",
+                request_id=board_request_id,
+                worker="board",
+                ok=board_result.get("ok"),
+                elapsed_ms=board_result.get("elapsed_ms"),
+                expected_len=board_result.get("expected_len"),
+                fast_path=True,
+            )
+
+            state, board_emitted = apply_board_result(
+                state,
+                board_result,
+            )
+            consumed = True
 
     pot_request_id = state.get("pot_request_id")
 
