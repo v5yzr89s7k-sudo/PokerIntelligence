@@ -2866,11 +2866,37 @@ def main():
 
         hero_turn_visible = blink_visible or buttons_visible
 
-        state = maybe_emit_hero_decision(
-            state,
-            hero_turn_visible,
-            hero_visible,
-        )
+        # Explicit Hero-card disappearance is stronger action-completion
+        # evidence than a trailing nameplate blink. Replay 0001 shows the
+        # action buttons disappearing first, Hero cards clearing shortly
+        # afterward, and the blink sensor remaining active for another frame.
+        #
+        # Complete the active decision immediately on the explicit card-clear
+        # transition, but leave fold classification to maybe_complete_early()
+        # and its existing sustained-clear debounce.
+        if (
+            changes.hero_cards_cleared
+            and state.get("hero_decision_active")
+        ):
+            emit({"type": "hero_action_complete"})
+            state["hero_decision_active"] = False
+            state["last_hero_action_complete_phase"] = (
+                state.get("phase")
+            )
+
+            print(
+                "[HERO_ACTION_COMPLETE] "
+                f"street={state.get('phase')} "
+                "reason=hero_cards_cleared",
+                flush=True,
+            )
+        else:
+            state = maybe_emit_hero_decision(
+                state,
+                hero_turn_visible,
+                hero_visible,
+            )
+
         state = maybe_complete_early(state, count, hero_visible)
         state = maybe_complete_hand(
             state,
