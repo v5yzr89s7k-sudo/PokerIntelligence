@@ -2466,53 +2466,23 @@ def main():
             )
 
             if new_actions:
-                released_by_episode = {}
-
-                for episode in released_closed:
-                    item = (
-                        episode.to_dict()
-                        if hasattr(episode, "to_dict")
-                        else episode
+                qualified_actions = (
+                    action_qualifier.qualify_many(
+                        released_closed,
+                        new_actions,
                     )
+                )
 
-                    episode_id = int(
-                        item.get("episode_id")
-                        or 0
-                    )
-
-                    if episode_id > 0:
-                        released_by_episode[
-                            episode_id
-                        ] = episode
-
-                for action in new_actions:
-                    episode_id = int(
-                        getattr(action, "episode_id", 0)
-                        or 0
-                    )
-
-                    episode = released_by_episode.get(
-                        episode_id
-                    )
-
-                    if episode is None:
+                for action, qualification in qualified_actions:
+                    if qualification is None:
                         print(
                             "[ACTION_QUALIFIER_SKIP]",
-                            f"episode={episode_id}",
+                            f"episode={getattr(action, 'episode_id', 0)}",
                             f"action={action.action}",
                             "reason=episode_not_found",
                             flush=True,
                         )
-
-                        qualification = None
                     else:
-                        qualification = (
-                            action_qualifier.qualify(
-                                episode,
-                                action,
-                            )
-                        )
-
                         print(
                             "[ACTION_QUALIFICATION]",
                             f"episode={qualification.episode_id}",
@@ -2531,8 +2501,6 @@ def main():
                         f"{action.action} confidence={action.confidence:.2f}"
                     )
 
-                    # Phase 1 qualifier is pass-through, so this condition
-                    # currently preserves existing runtime behavior exactly.
                     if (
                         qualification is not None
                         and not qualification.publish

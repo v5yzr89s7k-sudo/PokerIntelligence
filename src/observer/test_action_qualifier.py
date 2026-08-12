@@ -34,6 +34,8 @@ immature_action = FakeAction(
     ],
 )
 
+immature_action.episode_id = 4
+
 decision = qualifier.qualify(
     immature_episode,
     immature_action,
@@ -80,6 +82,8 @@ mature_action = FakeAction(
         "stack_changed",
     ],
 )
+
+mature_action.episode_id = 5
 
 decision = qualifier.qualify(
     mature_episode,
@@ -131,5 +135,57 @@ serialized = decision.to_dict()
 
 assert serialized["action"] == "BET_OR_RAISE"
 assert serialized["publish"] is True
+
+
+
+# Batch qualification must preserve ACTION and source-episode pairing.
+batch = qualifier.qualify_many(
+    [
+        immature_episode,
+        mature_episode,
+    ],
+    [
+        immature_action,
+        mature_action,
+    ],
+)
+
+assert len(batch) == 2
+
+first_action, first_decision = batch[0]
+second_action, second_decision = batch[1]
+
+assert first_action.action == "UNKNOWN"
+assert first_decision.action == "UNKNOWN"
+assert first_decision.publish is False
+
+assert second_action.action == "BET_OR_RAISE"
+assert second_decision.action == "BET_OR_RAISE"
+assert second_decision.publish is True
+
+
+# Missing source episodes remain explicit rather than silently publishing
+# or fabricating a qualification.
+missing_action = FakeAction(
+    seat="seat_top",
+    street="PREFLOP",
+    action="BET_OR_RAISE",
+    confidence=0.75,
+    evidence=[
+        "bet_region_occupied",
+        "stack_changed",
+    ],
+)
+
+missing_action.episode_id = 999
+
+missing_batch = qualifier.qualify_many(
+    [],
+    [missing_action],
+)
+
+assert len(missing_batch) == 1
+assert missing_batch[0][0].action == "BET_OR_RAISE"
+assert missing_batch[0][1] is None
 
 print("ActionQualifier evidence-gate regression passed.")

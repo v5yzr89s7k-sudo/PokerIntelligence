@@ -47,6 +47,64 @@ class ActionQualifier:
     changing episode scheduling or action inference.
     """
 
+    def qualify_many(self, episodes, actions):
+        """
+        Pair inferred candidate actions with their source episodes and return
+        action-aware qualification decisions.
+
+        Returns:
+            list of (action, qualification)
+
+        qualification is None only when the source episode cannot be found.
+        The coordinator remains responsible only for publication side effects.
+        """
+        episodes_by_id = {}
+
+        for episode in episodes:
+            item = (
+                episode.to_dict()
+                if hasattr(episode, "to_dict")
+                else episode
+            )
+
+            episode_id = int(
+                item.get("episode_id")
+                or 0
+            )
+
+            if episode_id > 0:
+                episodes_by_id[episode_id] = episode
+
+        qualified = []
+
+        for action in actions:
+            episode_id = int(
+                getattr(action, "episode_id", 0)
+                or 0
+            )
+
+            episode = episodes_by_id.get(
+                episode_id
+            )
+
+            if episode is None:
+                qualified.append(
+                    (action, None)
+                )
+                continue
+
+            qualified.append(
+                (
+                    action,
+                    self.qualify(
+                        episode,
+                        action,
+                    ),
+                )
+            )
+
+        return qualified
+
     def qualify(self, episode, action):
         item = (
             episode.to_dict()
