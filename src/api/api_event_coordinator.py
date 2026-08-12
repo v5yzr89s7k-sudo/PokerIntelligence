@@ -104,6 +104,9 @@ TIMELINE_JSON = ROOT / "runtime/live/current_observation_timeline.json"
 CORRELATOR_JSON = ROOT / "runtime/live/current_observation_correlator.json"
 EPISODES_JSON = ROOT / "runtime/live/current_action_episodes.json"
 INFERRED_ACTIONS_JSON = ROOT / "runtime/live/current_inferred_actions.json"
+ACTION_QUALIFICATIONS_JSON = (
+    ROOT / "runtime/live/current_action_qualifications.json"
+)
 EPISODE_SCHEDULER_JSON = (
     ROOT / "runtime/live/pending_episode_scheduler.json"
 )
@@ -2058,6 +2061,15 @@ def main():
     episode_scheduler = StreetEpisodeScheduler()
     inference_engine = ActionInferenceEngine()
     action_qualifier = ActionQualifier()
+
+    ACTION_QUALIFICATIONS_JSON.write_text(
+        json.dumps(
+            action_qualifier.to_dict(),
+            indent=2,
+        )
+        + "\n"
+    )
+
     commitment_tracker = StreetCommitmentTracker()
     commitment_street = "WAITING"
     last_deferred_count = None
@@ -2534,6 +2546,14 @@ def main():
 
                 INFERRED_ACTIONS_JSON.write_text(
                     json.dumps(inference_engine.to_dict(), indent=2)
+                )
+
+                ACTION_QUALIFICATIONS_JSON.write_text(
+                    json.dumps(
+                        action_qualifier.to_dict(),
+                        indent=2,
+                    )
+                    + "\n"
                 )
 
         # Preserve this frame's confirmed bet occupancy as context for the

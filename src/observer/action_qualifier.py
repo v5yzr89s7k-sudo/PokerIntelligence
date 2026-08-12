@@ -47,6 +47,29 @@ class ActionQualifier:
     changing episode scheduling or action inference.
     """
 
+    def __init__(self):
+        # Ordered diagnostic history of every candidate ACTION that reached
+        # semantic qualification during this observer run.
+        self.qualifications = []
+
+    def to_dict(self):
+        return {
+            "count": len(self.qualifications),
+            "published_count": sum(
+                1
+                for item in self.qualifications
+                if item.get("publish")
+            ),
+            "retired_count": sum(
+                1
+                for item in self.qualifications
+                if not item.get("publish")
+            ),
+            "qualifications": list(
+                self.qualifications
+            ),
+        }
+
     def qualify_many(self, episodes, actions):
         """
         Pair inferred candidate actions with their source episodes and return
@@ -148,7 +171,7 @@ class ActionQualifier:
                 "publish_candidate_action"
             )
 
-        return ActionQualification(
+        qualification = ActionQualification(
             episode_id=int(
                 item.get("episode_id")
                 or 0
@@ -179,3 +202,9 @@ class ActionQualifier:
                 qualification_reason
             ),
         )
+
+        self.qualifications.append(
+            qualification.to_dict()
+        )
+
+        return qualification

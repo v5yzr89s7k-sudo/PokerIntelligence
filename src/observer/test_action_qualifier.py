@@ -188,4 +188,39 @@ assert len(missing_batch) == 1
 assert missing_batch[0][0].action == "BET_OR_RAISE"
 assert missing_batch[0][1] is None
 
+
+# Qualification diagnostics retain ACTION and publication decisions.
+diagnostics = qualifier.to_dict()
+
+assert diagnostics["count"] >= 3
+assert diagnostics["published_count"] >= 2
+assert diagnostics["retired_count"] >= 1
+
+unknown_records = [
+    item
+    for item in diagnostics["qualifications"]
+    if item.get("action") == "UNKNOWN"
+]
+
+assert unknown_records
+assert any(
+    item.get("publish") is False
+    and item.get("qualification_reason")
+        == "retire_immature_unknown"
+    for item in unknown_records
+)
+
+mature_records = [
+    item
+    for item in diagnostics["qualifications"]
+    if item.get("action") == "BET_OR_RAISE"
+]
+
+assert mature_records
+assert any(
+    item.get("publish") is True
+    and item.get("evidence_mature") is True
+    for item in mature_records
+)
+
 print("ActionQualifier evidence-gate regression passed.")
