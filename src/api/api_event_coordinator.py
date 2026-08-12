@@ -36,6 +36,9 @@ from src.observer.action_inference_engine import ActionInferenceEngine
 from src.state.street_commitment_tracker import (
     StreetCommitmentTracker,
 )
+from src.state.recent_stack_observations import (
+    RecentStackObservations,
+)
 from src.vision.window_capture import find_acr_table_window, capture_window_crop
 from src.api.canonical_frame import to_canonical_frame
 from src.vision.action_sequence_recorder import ActionSequenceRecorder
@@ -281,6 +284,9 @@ def enrich_stack_change_measurements(
     prior_occupied_bet_regions=None,
     prior_commitment_seats=None,
     event_street=None,
+    recent_stack_observations=None,
+    frame_path="",
+    frame_ts=None,
 ):
     """
     Convert noisy stack-region movement into one settled quantitative
@@ -687,6 +693,21 @@ def enrich_stack_change_measurements(
 
         previous = float(previous)
         current = float(current)
+
+        # Preserve trusted visual stack evidence independently from
+        # canonical transition validation. In particular, an unchanged
+        # trusted stack is valuable terminal evidence at a later street
+        # boundary even though it must never emit stack_update here.
+        if recent_stack_observations is not None:
+            recent_stack_observations.add(
+                seat=seat,
+                stack_bb=current,
+                confidence=confidence,
+                votes=votes,
+                mode=reading.get("mode", "unknown"),
+                frame_path=str(frame_path or ""),
+                ts=frame_ts if frame_ts is not None else now,
+            )
 
         # Visual bet-region occupancy is detector evidence only.
         # It is sufficient to open an action episode, but not sufficient to
@@ -2270,6 +2291,10 @@ class CoordinatorRuntime:
         default_factory=StreetCommitmentTracker
     )
 
+    recent_stack_observations: RecentStackObservations = field(
+        default_factory=RecentStackObservations
+    )
+
     participant_frame_buffer: deque = field(
         default_factory=lambda: deque(maxlen=8)
     )
@@ -2309,6 +2334,8 @@ def main():
     )
 
     commitment_tracker = runtime.commitment_tracker
+    recent_stack_observations = runtime.recent_stack_observations
+    recent_stack_hand_token = None
     commitment_street = "WAITING"
     last_deferred_count = None
     previous_occupied_bet_regions = set()
@@ -2431,6 +2458,18 @@ def main():
                 flush=True,
             )
 
+        current_hand_token = state.get("hand_token")
+
+        if current_hand_token != recent_stack_hand_token:
+            recent_stack_observations.clear()
+            recent_stack_hand_token = current_hand_token
+
+            print(
+                "[STACK_EVIDENCE_RESET] "
+                f"hand_token={str(current_hand_token or '')[:8] or 'none'}",
+                flush=True,
+            )
+
         current_stack_street = str(
             state.get("phase") or "WAITING"
         ).upper()
@@ -2452,6 +2491,9 @@ def main():
             ),
             prior_commitment_seats=prior_commitment_seats,
             event_street=event_street,
+            recent_stack_observations=recent_stack_observations,
+            frame_path=str(frame or ""),
+            frame_ts=time.time(),
         )
 
         log_observation(changes)
