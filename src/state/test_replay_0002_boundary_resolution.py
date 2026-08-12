@@ -160,12 +160,170 @@ def main():
     print("===== NEGATIVE CONTROL =====")
     print(negative.to_dict())
 
+    # ------------------------------------------------------------
+    # Remaining unresolved responders.
+    #
+    # Use the same real flop-boundary frame. Every seat below still
+    # owes a response to the final 7 BB preflop price.
+    #
+    # Strong unchanged reads may resolve FOLD.
+    # Weak/ambiguous reads must remain unresolved.
+    # ------------------------------------------------------------
+
+    cases = [
+        {
+            "position": "CO",
+            "seat": "seat_lower_left",
+            "previous": 64.13,
+            "prior_live": 0.0,
+            "expected": "FOLD",
+        },
+        {
+            "position": "BTN",
+            "seat": "seat_mid_left",
+            "previous": 19.82,
+            "prior_live": 0.0,
+            "expected": "FOLD",
+        },
+        {
+            "position": "SB",
+            "seat": "seat_upper_left",
+            "previous": 37.94,
+            "prior_live": 0.5,
+            "expected": "FOLD",
+        },
+        {
+            "position": "BB",
+            "seat": "seat_top",
+            "previous": 28.36,
+            "prior_live": 1.0,
+            # Frame 79 has the correct numeric value but an untrusted
+            # segmentation disagreement. Replay 0002 frame 70 provides
+            # an independently trusted 0.98 / 2-vote observation of the
+            # same unchanged terminal stack before the flop boundary.
+            "frame": 70,
+            "expected": "FOLD",
+        },
+    ]
+
+    print()
+    print("===== REMAINING REAL BOUNDARY RESPONDERS =====")
+
+    actual = []
+
+    for case in cases:
+        case_frame = case.get(
+            "frame",
+            79,
+        )
+
+        case_path, case_read = read_real_stack(
+            case["seat"],
+            case_frame,
+        )
+
+        case_observation = BoundaryStackObservation(
+            street="PREFLOP",
+            seat=case["seat"],
+            previous_stack_bb=case["previous"],
+            observed_stack_bb=case_read.get("stack_bb"),
+            confidence=float(
+                case_read.get("confidence") or 0.0
+            ),
+            votes=int(
+                case_read.get("votes") or 0
+            ),
+            mode=str(
+                case_read.get("mode") or ""
+            ),
+            frame_path=str(case_path),
+            ts=None,
+        )
+
+        case_resolution = resolve_boundary_action(
+            case_observation,
+            owes_action=True,
+            betting_open=True,
+            current_price_bb=7.0,
+            prior_live_commitment_bb=case["prior_live"],
+        )
+
+        print()
+        print(
+            case["position"],
+            case["seat"],
+        )
+        print("read      =", case_read)
+        print(
+            "observation=",
+            case_observation.to_dict(),
+        )
+        print(
+            "resolution =",
+            case_resolution.to_dict(),
+        )
+
+        if case["expected"] is None:
+            assert case_resolution.resolved is False, (
+                case_resolution
+            )
+            assert case_resolution.action is None, (
+                case_resolution
+            )
+        else:
+            assert case_resolution.resolved is True, (
+                case_resolution
+            )
+            assert (
+                case_resolution.action
+                == case["expected"]
+            ), case_resolution
+
+        actual.append(
+            (
+                case["position"],
+                case_resolution.action,
+                case_resolution.resolved,
+                case_observation.confidence,
+                case_observation.votes,
+            )
+        )
+
+    print()
+    print("===== REAL BOUNDARY SUMMARY =====")
+
+    for item in actual:
+        print(item)
+
+    assert actual[0][0:3] == (
+        "CO",
+        "FOLD",
+        True,
+    )
+
+    assert actual[1][0:3] == (
+        "BTN",
+        "FOLD",
+        True,
+    )
+
+    assert actual[2][0:3] == (
+        "SB",
+        "FOLD",
+        True,
+    )
+
+    assert actual[3][0:3] == (
+        "BB",
+        "FOLD",
+        True,
+    )
+
     print()
     print(
         "PASS Replay 0002 boundary resolution: "
-        "real unchanged UTG+1 stack at flop boundary + "
-        "preserved 6-of-7 BB response obligation -> FOLD; "
-        "same pixels without an action obligation remain unresolved"
+        "real trusted terminal stack evidence independently resolves "
+        "UTG+1/CO/BTN/SB/BB folds without lowering confidence thresholds"
     )
 
 
