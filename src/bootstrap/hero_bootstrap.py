@@ -130,6 +130,7 @@ class HeroBootstrap:
         participant_collector,
         hand_token,
         frozen_ts,
+        starting_roster_seats=None,
     ):
         """
         Begin hand initialization from a completed Hero worker result.
@@ -187,9 +188,25 @@ class HeroBootstrap:
             time.perf_counter() - stage_started
         ) * 1000.0
 
+        # Card-back evidence and table occupancy answer different questions.
+        #
+        # frozen_participants:
+        #     seats for which this hand produced dealt-in/card evidence.
+        #
+        # starting_roster_seats:
+        #     players visibly seated at hand start. This must own position
+        #     assignment so an immediate UTG fold cannot shrink the table and
+        #     shift every downstream poker position.
+        starting_roster = list(
+            dict.fromkeys(
+                starting_roster_seats
+                or frozen_participants
+            )
+        )
+
         position_players = [
             {"seat": seat}
-            for seat in frozen_participants
+            for seat in starting_roster
         ]
 
         stage_started = time.perf_counter()
@@ -210,6 +227,7 @@ class HeroBootstrap:
             "hero_cards": cards,
             "validation_error": None,
             "frozen_participants": frozen_participants,
+            "starting_roster_seats": starting_roster,
             "dealer": dealer,
             "positions": positions,
             "timings_ms": {
@@ -260,6 +278,8 @@ def populate_local_stacks(
     }
 
     for seat, player in players_by_seat.items():
+        seat_started = time.perf_counter()
+
         stack_result = {
             "stack_bb": None,
             "stack_text": "",
@@ -296,11 +316,22 @@ def populate_local_stacks(
             stack_result.get("votes") or 0
         )
 
+        # Bootstrap is establishing an initial baseline, not validating
+        # a live stack transition. Accept a reliable green-only read so Hero
+        # does not start with no baseline.
         trusted = (
             stack_bb is not None
             and float(stack_bb) > 0.0
-            and confidence >= 0.95
-            and votes >= 2
+            and (
+                (
+                    confidence >= 0.95
+                    and votes >= 2
+                )
+                or (
+                    seat == "hero"
+                    and stack_result.get("mode") == "green_only"
+                )
+            )
         )
 
         player.update({
@@ -321,8 +352,14 @@ def populate_local_stacks(
             ),
         })
 
+        seat_ms = (
+            time.perf_counter() - seat_started
+        ) * 1000.0
+
         print(
-            f"[LOCAL_STACK] seat={seat} "
+            f"[LOCAL_STACK] "
+            f"seat={seat} "
+            f"elapsed={seat_ms:.1f}ms "
             f"stack={stack_bb if trusted else None} "
             f"confidence={confidence:.2f} "
             f"votes={votes} "

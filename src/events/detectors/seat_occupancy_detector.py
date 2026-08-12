@@ -95,27 +95,25 @@ def seat_occupancy(frame, geometry):
             _crop(frame, stack_rect)
         )
 
-        # Stack/name text is the most stable occupancy evidence. Requiring
-        # agreement from more than one visual property avoids classifying
-        # plain felt or a single transient pixel group as an occupied seat.
-        stack_votes = sum([
-            stack_features["gray_std"] >= 14.0,
-            stack_features["edge_density"] >= 0.043,
-            stack_features["bright_ratio"] >= 0.010,
-        ])
-
-        seat_votes = sum([
-            seat_features["gray_std"] >= 20.0,
-            seat_features["edge_density"] >= 0.040,
-            seat_features["bright_ratio"] >= 0.020,
-        ])
-
+        # Occupied player panels have strong structural edge content in
+        # both the seat/nameplate region and stack line. Empty ACR seats may
+        # still have substantial variance/brightness from felt and table UI,
+        # so gray_std and bright_ratio must not independently establish
+        # occupancy.
+        #
+        # Calibrated against Replay 0001 across 12 consecutive frames:
+        # seven real players and one empty seat classified 96/96 correctly.
         occupied = bool(
-            stack_votes >= 2
-            or (
-                stack_votes >= 1
-                and seat_votes >= 2
-            )
+            seat_features["edge_density"] >= 0.070
+            and stack_features["edge_density"] >= 0.065
+        )
+
+        stack_votes = int(
+            stack_features["edge_density"] >= 0.065
+        )
+
+        seat_votes = int(
+            seat_features["edge_density"] >= 0.070
         )
 
         confidence = 0.0

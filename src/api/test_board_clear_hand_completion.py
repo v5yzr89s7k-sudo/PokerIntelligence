@@ -36,9 +36,45 @@ def run_non_river_clear_test(phase):
     print(f"PASS {phase}: four board-clear observations reset hand to WAITING")
 
 
+def test_river_partial_board_noise_preserves_clear_progress():
+    state = fresh_state()
+    state["phase"] = "RIVER"
+
+    # Establish a valid fully-visible river frame.
+    state = maybe_complete_hand(state, 5)
+    assert state["phase"] == "RIVER"
+    assert state["board_clear_seen"] == 0
+
+    # Real captured failure shape:
+    # three clear observations, one noisy partial-board observation,
+    # then another clear observation.
+    for count, expected in [
+        (0, 1),
+        (0, 2),
+        (0, 3),
+        (1, 3),
+    ]:
+        state = maybe_complete_hand(state, count)
+        assert state["phase"] == "RIVER", (count, state)
+        assert state["board_clear_seen"] == expected, (count, state)
+
+    # Fourth actual clear observation reaches terminal settlement.
+    # With no preserved river frame in this isolated unit test, completion
+    # occurs immediately without a terminal pot read.
+    state = maybe_complete_hand(state, 0)
+
+    assert state["phase"] == "WAITING", state
+    assert state["board_clear_seen"] == 0, state
+
+    print(
+        "PASS RIVER: partial board noise does not delay hand completion"
+    )
+
+
 def main():
     run_non_river_clear_test("FLOP")
     run_non_river_clear_test("TURN")
+    test_river_partial_board_noise_preserves_clear_progress()
     print("PASS board-clear hand completion regression")
 
 

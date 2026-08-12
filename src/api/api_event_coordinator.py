@@ -7,11 +7,13 @@ import cv2
 import sys
 import uuid
 from collections import deque
+from dataclasses import dataclass, field
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from src.events.detectors.action_buttons_detector import action_buttons_visible
 from src.events.detectors.hero_turn_detector import HeroBlinkBuffer
+from src.events.detectors.seat_occupancy_detector import occupied_seats
 from src.events.local_event_detector import LocalEventDetector
 from src.events.participant_evidence_collector import (
     ParticipantEvidenceCollector,
@@ -301,6 +303,8 @@ def enrich_stack_change_measurements(
     # Candidates may originate from raw stack motion or independent
     # bet-region evidence.
     for seat in candidate_seats:
+        is_new_candidate = seat not in pending
+
         entry = pending.setdefault(
             seat,
             {
@@ -308,10 +312,29 @@ def enrich_stack_change_measurements(
                 "last_change_ts": now,
                 "max_mean_diff": 0.0,
                 "origin_street": state.get("phase", "WAITING"),
+                "trigger_sources": [],
             },
         )
 
+        sources = set(entry.get("trigger_sources") or [])
+
+        if seat in raw_changed_seats:
+            sources.add("stack_motion")
+
+        if seat in bet_evidence_seats:
+            sources.add("bet_region_appeared")
+
+        entry["trigger_sources"] = sorted(sources)
         entry["last_change_ts"] = now
+
+        if is_new_candidate:
+            print(
+                "[STACK_CANDIDATE]",
+                f"seat={seat}",
+                f"sources={entry['trigger_sources']}",
+                f"street={entry.get('origin_street')}",
+                flush=True,
+            )
 
         # If the stack transition began before Hero cards completed,
         # promote the transition to the current street as soon as the
@@ -782,6 +805,7 @@ def enrich_stack_change_measurements(
                 "[STACK_PIPELINE]",
                 f"seat={seat}",
                 "movement=yes",
+                f"sources={entry.get('trigger_sources') or []}",
                 f"previous={previous:.2f}",
                 f"current={current:.2f}",
                 f"delta={delta:.2f}",
@@ -1250,11 +1274,32 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
             state["hero_visible_seen"] = 0
             return state
 
+        starting_roster_seats = []
+
+        starting_roster_frame = result.get("canonical_frame")
+        starting_roster_image = (
+            cv2.imread(str(starting_roster_frame))
+            if starting_roster_frame
+            else None
+        )
+
+        if starting_roster_image is not None:
+            starting_roster_image = cv2.resize(
+                starting_roster_image,
+                (934, 696),
+            )
+
+            starting_roster_seats = occupied_seats(
+                starting_roster_image,
+                GEOM,
+            )
+
         bootstrap = HeroBootstrap.initialize_hand(
             result=result,
             participant_collector=PARTICIPANT_COLLECTOR,
             hand_token=request_token,
             frozen_ts=time.time(),
+            starting_roster_seats=starting_roster_seats,
         )
 
         cards = bootstrap["hero_cards"]
@@ -1305,13 +1350,16 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
             )
 
         frozen_participants = bootstrap["frozen_participants"]
+        starting_roster_seats = bootstrap["starting_roster_seats"]
         dealer = bootstrap["dealer"]
         positions = bootstrap["positions"]
 
         print(
             f"[PARTICIPANT_FREEZE_PUBLISH] "
-            f"count={len(frozen_participants)} "
-            f"seats={frozen_participants}",
+            f"dealt_count={len(frozen_participants)} "
+            f"dealt_seats={frozen_participants} "
+            f"roster_count={len(starting_roster_seats)} "
+            f"roster_seats={starting_roster_seats}",
             flush=True,
         )
 
@@ -1362,7 +1410,7 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
 
         local_players = bootstrap_local_stacks(
             canonical_image=canonical_image,
-            frozen_participants=frozen_participants,
+            frozen_participants=starting_roster_seats,
             geometry=GEOM,
             crop_geometry_region=_crop_geometry_region,
             stack_reader=read_stack,
@@ -1862,8 +1910,15 @@ def maybe_complete_hand(state, count, frame=None):
         state["board_clear_seen"] = (
             state.get("board_clear_seen", 0) + 1
         )
-    else:
+    elif count == 5:
+        # A fully visible river disproves an in-progress clear candidate.
         state["board_clear_seen"] = 0
+        return state
+    else:
+        # Once a confirmed five-card river has begun clearing, partial board
+        # counts (1-4) are transitional detector noise. Do not let one noisy
+        # frame erase accumulated terminal-clear evidence and keep the old hand
+        # alive into the next deal.
         return state
 
     if state["board_clear_seen"] < 4:
@@ -2051,35 +2106,96 @@ def episode_ready_for_inference(episode):
     return True
 
 
+@dataclass
+class CoordinatorRuntime:
+    """
+    Long-lived objects shared across coordinator perception frames.
+
+    Live mode and deterministic frame replay must use the same instances
+    across a hand. Scalar control-flow state remains in main() for now;
+    this first refactor changes object ownership only, not behavior.
+    """
+
+    local_detector: LocalEventDetector = field(
+        default_factory=LocalEventDetector
+    )
+
+    hero_blink_buffer: HeroBlinkBuffer = field(
+        default_factory=lambda: HeroBlinkBuffer(
+            max_samples=6,
+            diff_threshold=5.0,
+            mean_range_threshold=5.0,
+            required_transitions=2,
+        )
+    )
+
+    sequence_recorder: ActionSequenceRecorder = field(
+        default_factory=lambda: ActionSequenceRecorder(
+            max_frames=240
+        )
+    )
+
+    observer: ContinuousObserver = field(
+        default_factory=ContinuousObserver
+    )
+
+    timeline: ObservationTimeline = field(
+        default_factory=ObservationTimeline
+    )
+
+    correlator: ObservationCorrelator = field(
+        default_factory=ObservationCorrelator
+    )
+
+    episode_manager: ActionEpisodeManager = field(
+        default_factory=ActionEpisodeManager
+    )
+
+    episode_scheduler: StreetEpisodeScheduler = field(
+        default_factory=StreetEpisodeScheduler
+    )
+
+    inference_engine: ActionInferenceEngine = field(
+        default_factory=ActionInferenceEngine
+    )
+
+    action_qualifier: ActionQualifier = field(
+        default_factory=ActionQualifier
+    )
+
+    commitment_tracker: StreetCommitmentTracker = field(
+        default_factory=StreetCommitmentTracker
+    )
+
+    participant_frame_buffer: deque = field(
+        default_factory=lambda: deque(maxlen=8)
+    )
+
+
 def main():
     print("api_event_coordinator running event-only mode. Ctrl+C to stop.")
     print(f"Events: {EVENT_LOG}")
     state = load_state()
-    local_detector = LocalEventDetector()
-    hero_blink_buffer = HeroBlinkBuffer(
-        max_samples=6,
-        diff_threshold=5.0,
-        mean_range_threshold=5.0,
-        required_transitions=2,
-    )
+    runtime = CoordinatorRuntime()
+
+    local_detector = runtime.local_detector
+    hero_blink_buffer = runtime.hero_blink_buffer
     previous_blink_visible = False
 
-    sequence_recorder = ActionSequenceRecorder(
-        max_frames=240
-    )
+    sequence_recorder = runtime.sequence_recorder
     sequence_dir = sequence_recorder.start_session()
     print(
         f"[DEBUG_SEQUENCE] recording to {sequence_dir}",
         flush=True,
     )
 
-    observer = ContinuousObserver()
-    timeline = ObservationTimeline()
-    correlator = ObservationCorrelator()
-    episode_manager = ActionEpisodeManager()
-    episode_scheduler = StreetEpisodeScheduler()
-    inference_engine = ActionInferenceEngine()
-    action_qualifier = ActionQualifier()
+    observer = runtime.observer
+    timeline = runtime.timeline
+    correlator = runtime.correlator
+    episode_manager = runtime.episode_manager
+    episode_scheduler = runtime.episode_scheduler
+    inference_engine = runtime.inference_engine
+    action_qualifier = runtime.action_qualifier
 
     ACTION_QUALIFICATIONS_JSON.write_text(
         json.dumps(
@@ -2089,7 +2205,7 @@ def main():
         + "\n"
     )
 
-    commitment_tracker = StreetCommitmentTracker()
+    commitment_tracker = runtime.commitment_tracker
     commitment_street = "WAITING"
     last_deferred_count = None
     previous_occupied_bet_regions = set()
@@ -2098,7 +2214,7 @@ def main():
     # A fast early-position fold may occur before HAND_START_LOCAL creates the
     # hand token. Replaying this short buffer lets participant evidence retain
     # players who were dealt in but folded before the trigger frame.
-    participant_frame_buffer = deque(maxlen=8)
+    participant_frame_buffer = runtime.participant_frame_buffer
 
 
     INFERRED_ACTIONS_JSON.write_text(
