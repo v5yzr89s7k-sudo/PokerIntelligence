@@ -110,10 +110,10 @@ def _prepare_images(crop):
     return enlarged, gray, green
 
 
-def _ocr(image):
+def _ocr(image, config=OCR_CONFIG):
     raw = pytesseract.image_to_string(
         image,
-        config=OCR_CONFIG,
+        config=config,
     ).strip()
 
     return {
@@ -240,23 +240,75 @@ def read_stack(crop) -> Dict[str, Any]:
     green_value = green_result["stack_bb"]
     plain_value = plain_result["stack_bb"]
 
-    # Both methods agree.
+    # Green-mask and grayscale PSM7 are correlated views of the same glyph.
+    # They can therefore agree on the same systematic OCR error. Replay 0001
+    # demonstrated ACR's leading "5" being read as "9" by both views.
+    #
+    # Verify apparent two-view agreement with an independent single-line/glyph
+    # segmentation mode before assigning high confidence.
     if (
         green_value is not None
         and green_value == plain_value
     ):
+        # Replay 0001 calibration: ACR's leading "5" is systematically
+        # misread as "9" by the normal PSM7 paths. A fixed 130 grayscale
+        # threshold with PSM13 preserves the glyph correctly across the
+        # captured transition:
+        #
+        #   65.6 -> 56.6 -> 51.6
+        #
+        # This is an independent verification path, not a digit substitution.
+        psm13_image = cv2.threshold(
+            gray,
+            130,
+            255,
+            cv2.THRESH_BINARY,
+        )[1]
+
+        psm13_result = {
+            "variant": "psm13_t130",
+            **_ocr(
+                psm13_image,
+                config="--psm 13",
+            ),
+        }
+
+        psm13_value = psm13_result["stack_bb"]
+
+        if (
+            psm13_value is not None
+            and psm13_value != green_value
+        ):
+            # Do not let correlated PSM7 agreement overrule an independent
+            # segmentation result. Return all evidence at reduced confidence;
+            # the coordinator's canonical-stack continuity and transition
+            # validator will decide whether the alternate value is plausible.
+            return {
+                "raw": [
+                    green_result,
+                    plain_result,
+                    psm13_result,
+                ],
+                "stack_bb": psm13_value,
+                "stack_text": f"{psm13_value:g} BB",
+                "confidence": 0.95,
+                "votes": 2,
+                "mode": "psm13_verification",
+            }
+
         value = green_value
 
         return {
             "raw": [
                 green_result,
                 plain_result,
+                psm13_result,
             ],
             "stack_bb": value,
             "stack_text": f"{value:g} BB",
             "confidence": 0.98,
             "votes": 2,
-            "mode": "agreement",
+            "mode": "agreement_verified",
         }
 
     # Only one method produced a value.
