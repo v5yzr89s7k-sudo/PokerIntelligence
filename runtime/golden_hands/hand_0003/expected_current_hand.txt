@@ -33,7 +33,7 @@ UTG folds
 LJ folds
 HJ folds
 CO folds
-BTN opens to 42.01 BB
+BTN opens to 42 BB
 
 Ending Pot: 2.37 BB
 

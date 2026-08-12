@@ -421,7 +421,15 @@ class CanonicalHand:
             and action.action == "POST_ANTE"
         )
 
-        return round(total, 2)
+        # Preserve betting-unit precision internally.
+        #
+        # Tournament antes commonly use fractional BB values such as 0.125.
+        # Rounding an ante to two decimals here creates phantom live
+        # commitment (0.125 - 0.12 = 0.005), which can turn a legitimate
+        # 3.5 BB raise into 3.51 BB and contaminate later call/raise sizing.
+        #
+        # Human-readable formatting may round separately at the writer layer.
+        return round(total, 4)
 
     def add_action(
         self,

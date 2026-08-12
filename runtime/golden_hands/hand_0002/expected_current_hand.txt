@@ -32,8 +32,8 @@ SB posts ante 0.12 BB
 SB posts small blind 0.5 BB
 BB posts big blind 1 BB
 UTG folds
-UTG+1 opens to 6.01 BB
-LJ 3-bets to 7.01 BB
+UTG+1 opens to 6 BB
+LJ 3-bets to 7 BB
 HJ (poker5068) calls 7 BB
 
 Ending Pot: 18.5 BB
