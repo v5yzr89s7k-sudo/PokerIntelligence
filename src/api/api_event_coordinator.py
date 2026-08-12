@@ -228,6 +228,51 @@ def _canonical_stack_values():
     return values
 
 
+def event_street_for_frame(state, local_board_count):
+    """
+    Resolve the street for local perception events on the current frame.
+
+    Canonical state remains API-confirmed and authoritative for hand state.
+    This resolver exists only for event-time attribution while asynchronous
+    board confirmation is still pending.
+
+    Only valid poker board lengths may advance the provisional street.
+    Partial/noisy board counts such as 1 or 2 never create a street.
+    """
+    canonical = str(
+        state.get("phase") or "WAITING"
+    ).upper()
+
+    try:
+        count = int(local_board_count or 0)
+    except (TypeError, ValueError):
+        count = 0
+
+    local_street = {
+        3: "FLOP",
+        4: "TURN",
+        5: "RIVER",
+    }.get(count)
+
+    if local_street is None:
+        return canonical
+
+    rank = {
+        "WAITING": -1,
+        "PREFLOP": 0,
+        "FLOP": 1,
+        "TURN": 2,
+        "RIVER": 3,
+    }
+
+    # Local perception may provisionally advance event attribution, but it
+    # must never move events backward relative to confirmed canonical state.
+    if rank.get(local_street, -1) > rank.get(canonical, -1):
+        return local_street
+
+    return canonical
+
+
 def enrich_stack_change_measurements(
     changes,
     img,
@@ -235,6 +280,7 @@ def enrich_stack_change_measurements(
     *,
     prior_occupied_bet_regions=None,
     prior_commitment_seats=None,
+    event_street=None,
 ):
     """
     Convert noisy stack-region movement into one settled quantitative
@@ -311,7 +357,14 @@ def enrich_stack_change_measurements(
                 "first_change_ts": now,
                 "last_change_ts": now,
                 "max_mean_diff": 0.0,
-                "origin_street": state.get("phase", "WAITING"),
+                # Street belongs to candidate onset, not eventual OCR
+                # settlement time. event_street may provisionally lead the
+                # API-confirmed canonical phase when a valid local board is
+                # already visible.
+                "origin_street": (
+                    event_street
+                    or state.get("phase", "WAITING")
+                ),
                 "trigger_sources": [],
             },
         )
@@ -666,8 +719,30 @@ def enrich_stack_change_measurements(
                 now - float(entry.get("first_change_ts") or now)
             )
 
+            trigger_sources = set(
+                entry.get("trigger_sources") or []
+            )
+
+            # A bet-region appearance is independent physical evidence that
+            # chips were committed, but ACR may update the displayed stack
+            # after the chips themselves appear. In that narrow case an
+            # initial trusted zero-delta OCR read means "not visible yet",
+            # not "no wager occurred".
+            #
+            # Keep the candidate alive only inside the existing bounded retry
+            # budget. Do not use raw visual commitment evidence to authorize
+            # large stack collapses; semantic commitment evidence remains the
+            # validator's separate safety input.
+            physical_commitment_pending = bool(
+                validation.reason == "no_stack_change"
+                and "bet_region_appeared" in trigger_sources
+            )
+
             retrying = bool(
-                validation.decision != STACK_REJECT
+                (
+                    validation.decision != STACK_REJECT
+                    or physical_commitment_pending
+                )
                 and attempts < maximum_ocr_attempts
                 and pending_age < maximum_pending_seconds
             )
@@ -2287,6 +2362,22 @@ def main():
 
         changes = local_detector.detect(img)
 
+        event_street = event_street_for_frame(
+            state,
+            getattr(changes, "board_count", 0),
+        )
+
+        if event_street != str(
+            state.get("phase") or "WAITING"
+        ).upper():
+            print(
+                "[EVENT_STREET] "
+                f"canonical={state.get('phase')} "
+                f"local_board={getattr(changes, 'board_count', 0)} "
+                f"event={event_street}",
+                flush=True,
+            )
+
         # Hero cards appear at the deal, before any player can act.
         # Start participant evidence immediately instead of waiting for
         # Hero API request stability. This preserves early-position players
@@ -2360,6 +2451,7 @@ def main():
                 previous_occupied_bet_regions
             ),
             prior_commitment_seats=prior_commitment_seats,
+            event_street=event_street,
         )
 
         log_observation(changes)
@@ -2412,7 +2504,7 @@ def main():
 
         observations = observer.ingest_changes(
             changes,
-            street=state.get("phase", "WAITING")
+            street=event_street,
         )
         timeline.add_many(observations)
         timeline.write_json(TIMELINE_JSON)
