@@ -493,10 +493,38 @@ def enrich_stack_change_measurements(
             is_increase = (
                 continuity_value > previous_value + 0.05
             )
+            # Independent chip-commitment evidence permits a wider
+            # continuity window for one OCR candidate. This is still bounded
+            # and may only select a stack decrease.
+            #
+            # Replay 0001:
+            #   BB canonical 65.6
+            #   correlated PSM7 candidate 96.6
+            #   independent PSM13 candidate 56.6
+            #   bet-region appearance confirms chip commitment
+            #   -> safely recover the 9 BB decrease.
+            #
+            # Without commitment evidence, preserve the original conservative
+            # 3 BB single-candidate window.
+            has_commitment_evidence = bool(
+                seat in bet_evidence_seats
+                or seat in prior_occupied_bet_regions
+                or seat in prior_commitment_seats
+                or "bet_region_appeared"
+                in set(entry.get("trigger_sources") or [])
+            )
+
+            single_vote_limit = (
+                max(12.0, previous_value * 0.35)
+                if has_commitment_evidence
+                else 3.0
+            )
+
             single_vote_plausible = (
                 continuity_votes == 1
-                and continuity_distance <= 3.0
+                and continuity_distance <= single_vote_limit
             )
+
             consensus_plausible = (
                 continuity_votes >= 2
                 and continuity_distance

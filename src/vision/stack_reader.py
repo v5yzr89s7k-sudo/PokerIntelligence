@@ -279,21 +279,27 @@ def read_stack(crop) -> Dict[str, Any]:
             psm13_value is not None
             and psm13_value != green_value
         ):
-            # Do not let correlated PSM7 agreement overrule an independent
-            # segmentation result. Return all evidence at reduced confidence;
-            # the coordinator's canonical-stack continuity and transition
-            # validator will decide whether the alternate value is plausible.
+            # PSM13 is independent evidence, not an authoritative override.
+            #
+            # Green + plain PSM7 are correlated and can agree on the same
+            # glyph error (Replay 0001: 56.6 -> 96.6). But PSM13 can also be
+            # wrong independently (Replay 0001 Hero: 90.84 vs 80.84).
+            #
+            # Preserve every candidate and deliberately mark the result
+            # ambiguous. The coordinator owns canonical previous-stack
+            # continuity and will promote a candidate only when the resulting
+            # transition is plausible.
             return {
                 "raw": [
                     green_result,
                     plain_result,
                     psm13_result,
                 ],
-                "stack_bb": psm13_value,
-                "stack_text": f"{psm13_value:g} BB",
-                "confidence": 0.95,
-                "votes": 2,
-                "mode": "psm13_verification",
+                "stack_bb": green_value,
+                "stack_text": f"{green_value:g} BB",
+                "confidence": 0.50,
+                "votes": 1,
+                "mode": "segmentation_disagreement",
             }
 
         value = green_value

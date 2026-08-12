@@ -125,7 +125,7 @@ def main():
     assert event["current_stack_bb"] == 56.6, event
     assert event["delta_bb"] == 9.0, event
     assert event["origin_street"] == "PREFLOP", event
-    assert event["stack_read_mode"] == "psm13_verification", event
+    assert event["stack_read_mode"] == "continuity", event
 
     assert (
         "seat_mid_left"
