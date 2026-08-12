@@ -29,7 +29,11 @@ def occupied_seats(players):
             seats.append(seat)
     return [s for s in SEAT_ORDER if s in seen]
 
-def assign_positions(players, dealer_button_seat):
+def assign_positions(
+    players,
+    dealer_button_seat,
+    preserve_physical_slots=False,
+):
     seats = occupied_seats(players)
     n = len(seats)
 
@@ -39,6 +43,38 @@ def assign_positions(players, dealer_button_seat):
     ):
         return {
             seat: "unknown"
+            for seat in seats
+        }
+
+    if preserve_physical_slots:
+        # ACR uses a fixed eight-seat physical layout. Poker Intelligence
+        # preserves those physical positional slots even when one or more
+        # chairs are empty. This prevents an empty interior chair from
+        # compressing every earlier position.
+        #
+        # Example:
+        #   BTN, SB, BB, UTG, UTG+1, [empty LJ], HJ, CO
+        #
+        # The empty LJ chair remains a physical LJ slot; HJ does not become
+        # LJ merely because that chair is empty.
+        dealer_index = SEAT_ORDER.index(
+            dealer_button_seat
+        )
+
+        physical_order = (
+            SEAT_ORDER[dealer_index:]
+            + SEAT_ORDER[:dealer_index]
+        )
+
+        physical_labels = POSITIONS_BY_COUNT[8]
+
+        physical_positions = {
+            seat: physical_labels[index]
+            for index, seat in enumerate(physical_order)
+        }
+
+        return {
+            seat: physical_positions[seat]
             for seat in seats
         }
 

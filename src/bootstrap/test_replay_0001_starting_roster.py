@@ -108,13 +108,24 @@ def main():
 
     assert result["starting_roster_seats"] == expected_roster
 
-    assert result["positions"]["hero"] == "BTN", (
-        result["positions"]
+    expected_positions = {
+        "hero": "BTN",
+        "seat_lower_left": "SB",
+        "seat_mid_left": "BB",
+        "seat_upper_left": "UTG",
+        "seat_top": "UTG+1",
+        "seat_mid_right": "HJ",
+        "seat_lower_right": "CO",
+    }
+
+    assert result["positions"] == expected_positions, (
+        result["positions"],
+        expected_positions,
     )
 
     print(
         "PASS Replay 0001 starting roster: "
-        "7 players, Hero BTN"
+        "7 players, physical LJ slot preserved, Hero BTN"
     )
 
 

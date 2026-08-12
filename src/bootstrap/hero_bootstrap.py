@@ -213,6 +213,7 @@ class HeroBootstrap:
         positions = assign_positions(
             position_players,
             dealer["dealer_button_seat"],
+            preserve_physical_slots=True,
         )
         position_assignment_ms = (
             time.perf_counter() - stage_started
