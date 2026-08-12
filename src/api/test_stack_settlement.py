@@ -117,6 +117,69 @@ def test_trusted_decrease_is_accepted():
     assert "hero" not in state["pending_stack_reads"]
 
 
+def test_bet_region_appearance_schedules_stack_read_without_raw_motion():
+    state = {
+        "phase": "PREFLOP",
+        "pending_stack_reads": {},
+    }
+
+    changes = ChangeSet()
+    changes.bet_region_appeared = ["seat_mid_left"]
+
+    image = np.zeros((696, 934, 3), dtype=np.uint8)
+
+    now = time.time()
+
+    # First pass: bet-region evidence creates a pending quantitative read.
+    with (
+        patch(
+            "src.api.api_event_coordinator._canonical_stack_values",
+            return_value={"seat_mid_left": 65.6},
+        ),
+        patch(
+            "src.api.api_event_coordinator.read_stack",
+            return_value={
+                "stack_bb": 56.6,
+                "stack_text": "56.6 BB",
+                "confidence": 0.98,
+                "votes": 2,
+                "mode": "agreement",
+                "raw": [],
+            },
+        ),
+    ):
+        enrich_stack_change_measurements(
+            changes,
+            image,
+            state,
+        )
+
+        assert "seat_mid_left" in state["pending_stack_reads"]
+        assert changes.stack_changed_seats == []
+
+        # Simulate the normal 450ms settlement delay without sleeping.
+        state["pending_stack_reads"]["seat_mid_left"]["last_change_ts"] = (
+            now - 1.0
+        )
+
+        changes.bet_region_appeared = []
+
+        enrich_stack_change_measurements(
+            changes,
+            image,
+            state,
+        )
+
+    assert changes.stack_changed_seats == ["seat_mid_left"]
+
+    measurement = changes.stack_change_details["seat_mid_left"]
+
+    assert measurement["previous_stack_bb"] == 65.6
+    assert measurement["current_stack_bb"] == 56.6
+    assert measurement["delta_bb"] == 9.0
+    assert "seat_mid_left" not in state["pending_stack_reads"]
+
+
 def test_positive_jump_does_not_mutate_baseline():
     changes, state = run_settlement({
         "stack_bb": 91.75,
@@ -165,6 +228,7 @@ def main():
     test_zero_stack_is_retried_without_all_in_confirmation()
     test_single_vote_is_retried_without_mutating_baseline()
     test_trusted_decrease_is_accepted()
+    test_bet_region_appearance_schedules_stack_read_without_raw_motion()
     test_positive_jump_does_not_mutate_baseline()
     test_missing_canonical_baseline_times_out()
 

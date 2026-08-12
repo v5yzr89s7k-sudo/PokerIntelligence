@@ -273,6 +273,21 @@ def enrich_stack_change_measurements(
         or {}
     )
 
+    # A confirmed bet-region appearance is independent evidence that this
+    # seat may have committed chips. Schedule the same settled quantitative
+    # stack read even when the stack pixel-motion detector missed the change.
+    #
+    # This is only an OCR trigger. It does NOT publish STACK_CHANGED; the
+    # existing canonical comparison and validation path remains authoritative.
+    bet_evidence_seats = list(
+        getattr(changes, "bet_region_appeared", [])
+        or []
+    )
+
+    candidate_seats = list(dict.fromkeys(
+        raw_changed_seats + bet_evidence_seats
+    ))
+
     pending = state.setdefault(
         "pending_stack_reads",
         {},
@@ -282,8 +297,10 @@ def enrich_stack_change_measurements(
     # reads it but never maintains a second persistent stack history.
     canonical_values = _canonical_stack_values()
 
-    # Record movement, but do not publish it yet.
-    for seat in raw_changed_seats:
+    # Record quantitative-read candidates, but do not publish them yet.
+    # Candidates may originate from raw stack motion or independent
+    # bet-region evidence.
+    for seat in candidate_seats:
         entry = pending.setdefault(
             seat,
             {
