@@ -65,11 +65,22 @@ def reset_tracker():
     print("[TRACKER] reset", flush=True)
 
 
-def write_betting_round_status(tracker, canonical):
+def write_betting_round_status(tracker, canonical, state=None):
+    """
+    Publish authoritative betting-round state for read-only downstream
+    consumers.
+
+    hand_id identifies CanonicalHand persistence. hand_token identifies the
+    live perception hand. Both are published so asynchronous consumers can
+    reject stale status from another live hand.
+    """
     status = tracker.commitment_tracker.round_status(
         canonical.current_street
     )
     status["hand_id"] = canonical.hand_id
+    status["hand_token"] = str(
+        (state or {}).get("hand_token") or ""
+    )
     status["canonical_players_to_act"] = list(
         canonical.players_to_act or []
     )
@@ -1068,6 +1079,7 @@ def handle_inferred_action(state, event):
     status = write_betting_round_status(
         tracker,
         canonical,
+        state,
     )
 
     print(
