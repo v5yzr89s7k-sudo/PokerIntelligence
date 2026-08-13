@@ -63,7 +63,7 @@ def main():
     }
 
     expected = {
-        "seat_mid_right": 93.41,
+        "seat_mid_right": 53.41,
         "seat_lower_left": 64.13,
         "seat_mid_left": 19.82,
         "seat_upper_left": 37.94,
@@ -95,23 +95,27 @@ def main():
 
     # Critical Replay 0002 temporal proof:
     #
-    # The exact boundary frame 79 gives BB the correct numerical value
-    # but does not satisfy the trust threshold. The retrospective worker
-    # must therefore walk backward and recover frame 70 automatically.
+    # After ACR stack-display precision normalization, the exact boundary
+    # frame 79 independently resolves BB to the displayed 28.36 BB with
+    # strong consensus. The worker therefore correctly uses the newest
+    # trusted boundary frame directly.
     bb = by_seat["seat_top"]
 
+    assert bb["stack_bb"] == 28.36, bb
+    assert bb["confidence"] >= 0.95, bb
+    assert bb["votes"] >= 3, bb
     assert bb["frame_path"].endswith(
-        "0070_full.png"
+        "0079_full.png"
     ), bb
+    assert bb["frame_ts"] == 79.0, bb
 
-    assert bb["frame_ts"] == 70.0, bb
-
-    # The other four seats have trusted terminal evidence on frame 79.
+    # All five responders now have trusted terminal evidence on frame 79.
     for seat in (
         "seat_mid_right",
         "seat_lower_left",
         "seat_mid_left",
         "seat_upper_left",
+        "seat_top",
     ):
         assert by_seat[seat]["frame_path"].endswith(
             "0079_full.png"
@@ -132,8 +136,8 @@ def main():
     print(
         "PASS Replay 0002 boundary stack worker: "
         "retrospective OCR automatically recovers trusted terminal "
-        "evidence for all five unresolved responders; BB falls back "
-        "from weak frame 79 to trusted frame 70 without poker semantics"
+        "evidence for all five unresolved responders directly from "
+        "the boundary frame without poker semantics"
     )
 
 

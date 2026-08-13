@@ -2,7 +2,10 @@ import cv2
 import json
 from pathlib import Path
 
-from src.vision.stack_reader import read_stack
+from src.vision.stack_reader import (
+    read_stack,
+    read_stack_independent_consensus,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -40,9 +43,14 @@ def read_frame(seat, index):
     w = int(r["width"])
     h = int(r["height"])
 
-    return read_stack(
-        image[y:y+h, x:x+w]
-    )
+    crop = image[y:y+h, x:x+w]
+
+    return {
+        "ordinary": read_stack(crop),
+        "independent": (
+            read_stack_independent_consensus(crop)
+        ),
+    }
 
 
 def main():
@@ -60,19 +68,37 @@ def main():
         15,
     )
 
-    assert utg1_before["stack_bb"] == 99.41, (
-        utg1_before
-    )
+    # Ordinary PSM7-based reading remains deliberately provisional:
+    # it exposes the known correlated leading-digit ambiguity rather than
+    # pretending 99.41 is authoritative.
+    assert (
+        utg1_before["ordinary"]["mode"]
+        == "segmentation_disagreement"
+    ), utg1_before
 
-    assert utg1_after["stack_bb"] == 93.41, (
-        utg1_after
-    )
+    assert (
+        utg1_before["independent"]["stack_bb"]
+        == 55.41
+    ), utg1_before
+
+    assert (
+        utg1_after["independent"]["stack_bb"]
+        == 53.41
+    ), utg1_after
+
+    assert (
+        utg1_before["independent"]["votes"] >= 3
+    ), utg1_before
+
+    assert (
+        utg1_after["independent"]["votes"] >= 3
+    ), utg1_after
 
     assert round(
-        utg1_before["stack_bb"]
-        - utg1_after["stack_bb"],
+        utg1_before["independent"]["stack_bb"]
+        - utg1_after["independent"]["stack_bb"],
         2,
-    ) == 6.0
+    ) == 2.0
 
     # --------------------------------------------------------
     # LJ 3-bet
@@ -88,17 +114,19 @@ def main():
         29,
     )
 
-    assert lj_before["stack_bb"] == 72.08, (
-        lj_before
-    )
+    assert (
+        lj_before["independent"]["stack_bb"]
+        == 72.08
+    ), lj_before
 
-    assert lj_after["stack_bb"] == 65.08, (
-        lj_after
-    )
+    assert (
+        lj_after["independent"]["stack_bb"]
+        == 65.08
+    ), lj_after
 
     assert round(
-        lj_before["stack_bb"]
-        - lj_after["stack_bb"],
+        lj_before["independent"]["stack_bb"]
+        - lj_after["independent"]["stack_bb"],
         2,
     ) == 7.0
 
@@ -116,23 +144,25 @@ def main():
         37,
     )
 
-    assert hero_before["stack_bb"] == 32.42, (
-        hero_before
-    )
+    assert (
+        hero_before["independent"]["stack_bb"]
+        == 32.42
+    ), hero_before
 
-    assert hero_after["stack_bb"] == 25.42, (
-        hero_after
-    )
+    assert (
+        hero_after["independent"]["stack_bb"]
+        == 25.42
+    ), hero_after
 
     assert round(
-        hero_before["stack_bb"]
-        - hero_after["stack_bb"],
+        hero_before["independent"]["stack_bb"]
+        - hero_after["independent"]["stack_bb"],
         2,
     ) == 7.0
 
     print(
-        "PASS Replay 0002 stack OCR: "
-        "UTG+1 99.41->93.41 (6 BB), "
+        "PASS Replay 0002 stack OCR evidence: "
+        "UTG+1 55.41->53.41 (2 BB), "
         "LJ 72.08->65.08 (7 BB), "
         "Hero 32.42->25.42 (7 BB)"
     )

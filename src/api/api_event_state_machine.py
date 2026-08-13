@@ -13,10 +13,20 @@ BETTING_ROUND_STATUS_PATH = (
     ROOT / "runtime/live/betting_round_status.json"
 )
 
+BOUNDARY_STACK_RESULTS_PATH = (
+    ROOT / "runtime/live/boundary_stack_results.jsonl"
+)
+BOUNDARY_STACK_CURSOR_PATH = (
+    ROOT / "runtime/live/boundary_stack_state_machine_cursor.txt"
+)
+
 from src.api.position_engine import assign_positions
 from src.state.canonical_hand import CanonicalHand
 from src.state.canonical_hand_store import CanonicalHandStore
 from src.state.betting_round_tracker import BettingRoundTracker
+from src.state.boundary_result_promoter import (
+    promote_boundary_observation,
+)
 from src.api.participant_validation_recorder import (
     record_participant_comparison,
 )
@@ -117,6 +127,30 @@ def save_cursor(n):
     CURSOR.write_text(str(n) + "\n")
 
 
+def read_boundary_stack_cursor():
+    if BOUNDARY_STACK_CURSOR_PATH.exists():
+        try:
+            return int(
+                BOUNDARY_STACK_CURSOR_PATH
+                .read_text()
+                .strip()
+                or "0"
+            )
+        except Exception:
+            return 0
+    return 0
+
+
+def save_boundary_stack_cursor(n):
+    BOUNDARY_STACK_CURSOR_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    BOUNDARY_STACK_CURSOR_PATH.write_text(
+        str(int(n)) + "\n"
+    )
+
+
 def default_state():
     return {
         "phase": "WAITING",
@@ -140,6 +174,7 @@ def default_state():
         "canonical_snapshot_ready": False,
         "pending_board_events": [],
         "pending_inferred_actions": [],
+        "pending_stack_baseline_observations": [],
         "pending_stack_updates": [],
         "pending_pot_updates": [],
         "pending_high_pot": None,
@@ -459,6 +494,19 @@ def handle_table_snapshot(state, event):
         pending_events = []
 
         for pending_event in list(
+            state.get(
+                "pending_stack_baseline_observations"
+            )
+            or []
+        ):
+            pending_events.append(
+                (
+                    "stack_baseline_observation",
+                    dict(pending_event),
+                )
+            )
+
+        for pending_event in list(
             state.get("pending_stack_updates") or []
         ):
             pending_events.append(
@@ -501,6 +549,7 @@ def handle_table_snapshot(state, event):
 
         state["pending_board_events"] = []
         state["pending_inferred_actions"] = []
+        state["pending_stack_baseline_observations"] = []
         state["pending_stack_updates"] = []
         state["pending_pot_updates"] = []
         state["pending_terminal_events"] = []
@@ -512,7 +561,19 @@ def handle_table_snapshot(state, event):
         )
 
         for event_type, pending_event in pending_events:
-            if event_type == "stack_update":
+            if event_type == "stack_baseline_observation":
+                state = handle_stack_baseline_observation(
+                    state,
+                    pending_event,
+                )
+                print(
+                    "[STATE] replayed buffered "
+                    "stack_baseline_observation "
+                    f"{pending_event.get('seat')}",
+                    flush=True,
+                )
+
+            elif event_type == "stack_update":
                 state = handle_stack_update(
                     state,
                     pending_event,
@@ -675,6 +736,7 @@ def handle_hero_cards(state, event):
     state["canonical_snapshot_ready"] = False
     state["pending_board_events"] = []
     state["pending_inferred_actions"] = []
+    state["pending_stack_baseline_observations"] = []
     state["pending_stack_updates"] = []
     state["pending_pot_updates"] = []
     state["pending_terminal_events"] = []
@@ -686,6 +748,120 @@ def handle_hero_cards(state, event):
 
     state = record_timeline(state, f"hero_cards {' '.join(cards)}")
     print("[STATE] WAITING -> PREFLOP", cards)
+
+    return state
+
+
+def handle_stack_baseline_observation(state, event):
+    """
+    Promote independently observed pre-change stack pixels into an unresolved
+    canonical starting baseline.
+
+    The coordinator supplies perception evidence only. CanonicalHand remains
+    the sole owner of authoritative stack state.
+    """
+    if state.get("phase") == "WAITING":
+        print(
+            "[SKIP] stack_baseline_observation while waiting",
+            flush=True,
+        )
+        return state
+
+    seat = event.get("seat")
+    observed_stack_bb = event.get("observed_stack_bb")
+
+    if not seat or observed_stack_bb is None:
+        print(
+            "[SKIP] invalid stack_baseline_observation",
+            event,
+            flush=True,
+        )
+        return state
+
+    confidence = float(
+        event.get("confidence") or 0.0
+    )
+    votes = int(
+        event.get("votes") or 0
+    )
+
+    # This event is allowed to initialize canonical stack state only from the
+    # independently segmented pre-change family. Keep the existing strong
+    # perception threshold.
+    if confidence < 0.95 or votes < 3:
+        print(
+            "[STACK_BASELINE_REJECT] "
+            f"seat={seat} "
+            f"confidence={confidence:.2f} "
+            f"votes={votes} "
+            "reason=untrusted_prechange_observation",
+            flush=True,
+        )
+        return state
+
+    if not state.get("canonical_snapshot_ready"):
+        pending = list(
+            state.get(
+                "pending_stack_baseline_observations"
+            )
+            or []
+        )
+
+        pending.append(dict(event))
+        pending.sort(
+            key=lambda item: float(
+                item.get("ts") or 0.0
+            )
+        )
+
+        state[
+            "pending_stack_baseline_observations"
+        ] = pending
+
+        print(
+            "[BUFFER] stack_baseline_observation "
+            f"until table_snapshot seat={seat}",
+            flush=True,
+        )
+
+        return state
+
+    canonical = canonical_load()
+
+    result = canonical.resolve_starting_stack_baseline(
+        seat=seat,
+        observed_stack_bb=float(observed_stack_bb),
+    )
+
+    if result is None:
+        print(
+            "[STACK_BASELINE_REJECT] "
+            f"seat={seat} reason=unknown_seat",
+            flush=True,
+        )
+        return state
+
+    if not result.get("resolved"):
+        print(
+            "[STACK_BASELINE_REJECT] "
+            f"seat={seat} "
+            f"observed={float(observed_stack_bb):.2f} "
+            f"reason={result.get('reason')}",
+            flush=True,
+        )
+        return state
+
+    canonical_save(canonical)
+
+    print(
+        "[CANONICAL_STACK_BASELINE] "
+        f"seat={seat} "
+        f"stack={float(result['starting_stack_bb']):.2f} "
+        f"confidence={confidence:.2f} "
+        f"votes={votes} "
+        "source=prechange_stack_pixels",
+        flush=True,
+    )
 
     return state
 
@@ -1359,6 +1535,186 @@ def handle_hand_complete(state, event):
     return default_state()
 
 
+def handle_boundary_stack_result(state, result):
+    """
+    Consume one asynchronous retrospective stack result.
+
+    The result stream carries objective perception evidence only.
+    Poker semantics are resolved here against the state-machine-owned
+    preserved betting obligations for the street that just ended.
+    """
+    if state.get("phase") == "WAITING":
+        print(
+            "[BOUNDARY_RESULT_SKIP] reason=waiting",
+            flush=True,
+        )
+        return state
+
+    if not state.get("canonical_snapshot_ready"):
+        print(
+            "[BOUNDARY_RESULT_SKIP] "
+            "reason=canonical_snapshot_not_ready",
+            flush=True,
+        )
+        return state
+
+    result_token = str(
+        result.get("hand_token") or ""
+    )
+    state_token = str(
+        state.get("hand_token") or ""
+    )
+
+    if (
+        not result_token
+        or not state_token
+        or result_token != state_token
+    ):
+        print(
+            "[BOUNDARY_RESULT_SKIP] "
+            "reason=hand_token_mismatch "
+            f"state={state_token[:8]} "
+            f"result={result_token[:8]}",
+            flush=True,
+        )
+        return state
+
+    old_street = str(
+        result.get("street") or ""
+    ).upper()
+
+    current_street = str(
+        state.get("phase") or ""
+    ).upper()
+
+    expected_current = {
+        "PREFLOP": "FLOP",
+        "FLOP": "TURN",
+        "TURN": "RIVER",
+    }.get(old_street)
+
+    if expected_current != current_street:
+        print(
+            "[BOUNDARY_RESULT_SKIP] "
+            "reason=street_relationship_mismatch "
+            f"old={old_street} "
+            f"current={current_street}",
+            flush=True,
+        )
+        return state
+
+    canonical = canonical_load()
+    tracker = tracker_for_hand(canonical)
+
+    observations = list(
+        result.get("observations") or []
+    )
+
+    # Worker/request order is transport order, not poker chronology.
+    #
+    # Promote terminal observations in the preserved old-street response
+    # order owned by StreetCommitmentTracker. Any extra/non-owing result
+    # remains harmless and is processed afterward, where the promoter's
+    # obligation gate will reject it.
+    observation_by_seat = {
+        str(item.get("seat") or ""): item
+        for item in observations
+        if isinstance(item, dict)
+        and item.get("seat")
+    }
+
+    preserved_owing_order = list(
+        tracker.commitment_tracker
+        .players_owing_action(old_street)
+    )
+
+    ordered_seats = list(
+        dict.fromkeys(
+            preserved_owing_order
+            + list(observation_by_seat)
+        )
+    )
+
+    promoted = []
+
+    for seat in ordered_seats:
+        item = observation_by_seat.get(seat)
+
+        if not isinstance(item, dict):
+            continue
+
+        observation = item.get("observation")
+
+        if not isinstance(observation, dict):
+            continue
+
+        promotion = promote_boundary_observation(
+            hand=canonical,
+            commitment_tracker=(
+                tracker.commitment_tracker
+            ),
+            street=old_street,
+            seat=seat,
+            observation=observation,
+        )
+
+        if promotion.resolved:
+            promoted.append(
+                promotion.to_dict()
+            )
+
+            state = record_timeline(
+                state,
+                "boundary_action "
+                f"{old_street} "
+                f"{seat} "
+                f"{promotion.action}",
+            )
+
+            print(
+                "[BOUNDARY_ACTION] "
+                f"street={old_street} "
+                f"seat={seat} "
+                f"action={promotion.action} "
+                f"sequence={promotion.canonical_sequence}",
+                flush=True,
+            )
+        else:
+            print(
+                "[BOUNDARY_UNRESOLVED] "
+                f"street={old_street} "
+                f"seat={seat} "
+                f"reason={promotion.reason}",
+                flush=True,
+            )
+
+    if promoted:
+        canonical_save(canonical)
+
+    old_status = (
+        tracker.commitment_tracker.round_status(
+            old_street
+        )
+    )
+
+    print(
+        "[BOUNDARY_STATUS] "
+        f"street={old_street} "
+        f"complete={old_status.get('complete')} "
+        f"owing={old_status.get('players_owing_action')}",
+        flush=True,
+    )
+
+    # Keep the public status artifact current-street scoped.
+    write_betting_round_status(
+        tracker,
+        canonical,
+        state,
+    )
+
+    return state
+
+
 def handle_event(state, event):
     t = event.get("type")
 
@@ -1367,6 +1723,12 @@ def handle_event(state, event):
 
     if t == "table_snapshot":
         return handle_table_snapshot(state, event)
+
+    if t == "stack_baseline_observation":
+        return handle_stack_baseline_observation(
+            state,
+            event,
+        )
 
     if t == "stack_update":
         return handle_stack_update(state, event)
@@ -1421,6 +1783,50 @@ def main():
             state = handle_event(state, event)
             save_state(state)
             save_cursor(i + 1)
+
+        # Boundary OCR is intentionally outside api_events.jsonl.
+        # Consume its result stream against the same in-memory tracker
+        # that owns preserved old-street betting obligations.
+        if BOUNDARY_STACK_RESULTS_PATH.exists():
+            boundary_lines = (
+                BOUNDARY_STACK_RESULTS_PATH
+                .read_text()
+                .splitlines()
+            )
+            boundary_cursor = (
+                read_boundary_stack_cursor()
+            )
+
+            for i in range(
+                boundary_cursor,
+                len(boundary_lines),
+            ):
+                line = boundary_lines[i].strip()
+
+                if not line:
+                    save_boundary_stack_cursor(i + 1)
+                    continue
+
+                try:
+                    result = json.loads(line)
+                except Exception:
+                    # A worker may be in the middle of appending.
+                    # Do not advance the cursor past a partial line.
+                    break
+
+                if (
+                    result.get("type")
+                    != "boundary_stack_result"
+                ):
+                    save_boundary_stack_cursor(i + 1)
+                    continue
+
+                state = handle_boundary_stack_result(
+                    state,
+                    result,
+                )
+                save_state(state)
+                save_boundary_stack_cursor(i + 1)
 
         time.sleep(0.5)
 

@@ -42,7 +42,13 @@ from src.state.recent_stack_observations import (
 from src.vision.window_capture import find_acr_table_window, capture_window_crop
 from src.api.canonical_frame import to_canonical_frame
 from src.vision.action_sequence_recorder import ActionSequenceRecorder
-from src.vision.stack_reader import read_stack
+from src.vision.stack_reader import (
+    read_stack,
+    read_stack_independent_consensus,
+)
+from src.vision.stack_candidate_resolver import (
+    resolve_stack_candidates,
+)
 from src.bootstrap.hero_bootstrap import (
     HeroBootstrap,
     bootstrap_local_stacks,
@@ -122,6 +128,14 @@ HERO_REQUESTS = ROOT / "runtime/live/hero_requests.jsonl"
 HERO_RESULTS = ROOT / "runtime/live/hero_results.jsonl"
 POT_REQUESTS = ROOT / "runtime/live/pot_requests.jsonl"
 POT_RESULTS = ROOT / "runtime/live/pot_results.jsonl"
+
+BOUNDARY_STACK_REQUESTS = (
+    ROOT / "runtime/live/boundary_stack_requests.jsonl"
+)
+BETTING_ROUND_STATUS = (
+    ROOT / "runtime/live/betting_round_status.json"
+)
+
 EVENT_LOG.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -156,6 +170,7 @@ def fresh_state():
         "last_local_hero_visible": False,
         "pending_stack_reads": {},
         "bootstrap_occupancy_diagnosed": False,
+        "last_boundary_stack_request_key": None,
     }
 
 
@@ -276,11 +291,75 @@ def event_street_for_frame(state, local_board_count):
     return canonical
 
 
+def prechange_stack_observation(
+    img,
+    seat,
+):
+    """
+    Read one preserved pre-change stack ROI.
+
+    This exceptional path is used only to recover an unresolved canonical
+    starting baseline. It performs perception only and assigns no poker
+    semantics.
+    """
+    if img is None:
+        return None
+
+    region = (
+        GEOM.get("stack_regions", {})
+        .get(seat)
+    )
+
+    if not isinstance(region, dict):
+        return None
+
+    x = int(region["x"])
+    y = int(region["y"])
+    w = int(region["width"])
+    h = int(region["height"])
+
+    crop = img[
+        y:y + h,
+        x:x + w,
+    ]
+
+    if crop is None or crop.size == 0:
+        return None
+
+    result = read_stack_independent_consensus(
+        crop
+    )
+
+    value = result.get("stack_bb")
+    votes = int(result.get("votes") or 0)
+    confidence = float(
+        result.get("confidence") or 0.0
+    )
+
+    if (
+        value is None
+        or votes < 3
+        or confidence < 0.95
+    ):
+        return None
+
+    return {
+        "observed_stack_bb": float(value),
+        "confidence": confidence,
+        "votes": votes,
+        "mode": result.get(
+            "mode",
+            "independent_segmentation",
+        ),
+    }
+
+
 def enrich_stack_change_measurements(
     changes,
     img,
     state,
     *,
+    prechange_image=None,
     prior_occupied_bet_regions=None,
     prior_commitment_seats=None,
     event_street=None,
@@ -356,6 +435,51 @@ def enrich_stack_change_measurements(
     # bet-region evidence.
     for seat in candidate_seats:
         is_new_candidate = seat not in pending
+
+        # A raw stack-motion transition gives us access to the immediately
+        # preceding pixels before the detector advances its frame baseline.
+        #
+        # Recover that absolute pre-change stack only when:
+        #   - this is the first frame of the pending episode;
+        #   - the trigger is actual stack motion, not bet-region-only evidence;
+        #   - CanonicalHand has no absolute baseline for this seat.
+        #
+        # The coordinator emits perception evidence only. The state machine
+        # owns candidate matching and canonical promotion.
+        if (
+            is_new_candidate
+            and seat in raw_changed_seats
+            and canonical_values.get(seat) is None
+            and prechange_image is not None
+        ):
+            baseline = prechange_stack_observation(
+                prechange_image,
+                seat,
+            )
+
+            if baseline is not None:
+                emit({
+                    "type": "stack_baseline_observation",
+                    "seat": seat,
+                    "observed_stack_bb": baseline[
+                        "observed_stack_bb"
+                    ],
+                    "confidence": baseline[
+                        "confidence"
+                    ],
+                    "votes": baseline["votes"],
+                    "mode": baseline["mode"],
+                    "origin_street": event_street,
+                })
+
+                print(
+                    "[STACK_BASELINE_OBSERVATION] "
+                    f"seat={seat} "
+                    f"stack={baseline['observed_stack_bb']:.2f} "
+                    f"votes={baseline['votes']} "
+                    "source=prechange_stack_pixels",
+                    flush=True,
+                )
 
         entry = pending.setdefault(
             seat,
@@ -506,12 +630,14 @@ def enrich_stack_change_measurements(
 
         reading = read_stack(crop)
 
-        # Resolve large OCR disagreements against the last trusted stack.
+        # Resolve competing OCR candidates against the last trusted
+        # canonical stack.
         #
-        # Continuity may promote an ambiguous OCR candidate only when the
-        # transition is plausible. Otherwise preserve the resolver's original
-        # low-confidence result so the settlement retry mechanism rejects it.
+        # OCR preprocessing variants are evidence, not independent votes.
+        # In particular, correlated grayscale/Otsu agreement must not bypass
+        # continuity when another OCR family exposes a conflicting candidate.
         raw_readings = reading.get("raw") or []
+
         candidate_values = [
             float(item["stack_bb"])
             for item in raw_readings
@@ -519,52 +645,20 @@ def enrich_stack_change_measurements(
             and float(item["stack_bb"]) > 0.0
         ]
 
+        unique_candidates = {
+            round(value, 6)
+            for value in candidate_values
+        }
+
         if (
             previous is not None
-            and int(reading.get("votes") or 0) < 2
-            and len(set(candidate_values)) >= 2
-            and (
-                max(candidate_values) - min(candidate_values)
-            ) > 20.0
+            and len(unique_candidates) >= 2
         ):
             previous_value = float(previous)
 
-            candidate_counts = {}
-            for value in candidate_values:
-                candidate_counts[value] = (
-                    candidate_counts.get(value, 0) + 1
-                )
-
-            continuity_value = min(
-                candidate_counts,
-                key=lambda value: abs(previous_value - value),
-            )
-            continuity_votes = candidate_counts[
-                continuity_value
-            ]
-            continuity_distance = abs(
-                previous_value - continuity_value
-            )
-
-            # Stack increases are never wagers. A single OCR variant may only
-            # be promoted when it is extremely close to the canonical value.
-            # A two-variant candidate gets a wider—but still bounded—window.
-            is_increase = (
-                continuity_value > previous_value + 0.05
-            )
-            # Independent chip-commitment evidence permits a wider
-            # continuity window for one OCR candidate. This is still bounded
-            # and may only select a stack decrease.
-            #
-            # Replay 0001:
-            #   BB canonical 65.6
-            #   correlated PSM7 candidate 96.6
-            #   independent PSM13 candidate 56.6
-            #   bet-region appearance confirms chip commitment
-            #   -> safely recover the 9 BB decrease.
-            #
-            # Without commitment evidence, preserve the original conservative
-            # 3 BB single-candidate window.
+            # Preserve the existing evidence-dependent continuity window.
+            # Physical chip evidence permits a wider candidate search, but
+            # this remains bounded and can only select a non-increasing stack.
             has_commitment_evidence = bool(
                 seat in bet_evidence_seats
                 or seat in prior_occupied_bet_regions
@@ -573,34 +667,25 @@ def enrich_stack_change_measurements(
                 in set(entry.get("trigger_sources") or [])
             )
 
-            single_vote_limit = (
+            maximum_drop_bb = (
                 max(12.0, previous_value * 0.35)
                 if has_commitment_evidence
                 else 3.0
             )
 
-            single_vote_plausible = (
-                continuity_votes == 1
-                and continuity_distance <= single_vote_limit
-            )
-
-            consensus_plausible = (
-                continuity_votes >= 2
-                and continuity_distance
-                <= max(12.0, previous_value * 0.35)
-            )
-
-            plausible = bool(
-                not is_increase
-                and (
-                    single_vote_plausible
-                    or consensus_plausible
-                )
+            resolution = resolve_stack_candidates(
+                candidate_values,
+                previous_stack_bb=previous_value,
+                maximum_drop_bb=maximum_drop_bb,
             )
 
             original_value = reading.get("stack_bb")
 
-            if plausible:
+            if resolution.resolved:
+                continuity_value = float(
+                    resolution.value
+                )
+
                 reading["stack_bb"] = continuity_value
                 reading["stack_text"] = (
                     f"{continuity_value:g} BB"
@@ -614,19 +699,29 @@ def enrich_stack_change_measurements(
                     f"previous={previous_value:.2f} "
                     f"resolver={original_value} "
                     f"selected={continuity_value:.2f} "
-                    f"distance={continuity_distance:.2f} "
-                    f"candidate_votes={continuity_votes} "
+                    f"distance={float(resolution.distance or 0.0):.2f} "
+                    f"reason={resolution.reason} "
                     f"candidates={candidate_values}",
                     flush=True,
                 )
             else:
+                # Candidate disagreement invalidates correlated-family
+                # confidence. Preserve the provisional value for diagnostics,
+                # but force the normal settlement retry path to reject it.
+                reading["confidence"] = min(
+                    float(reading.get("confidence") or 0.0),
+                    0.50,
+                )
+                reading["votes"] = 1
+                reading["mode"] = "continuity_unresolved"
+
                 print(
                     f"[STACK_CONTINUITY_REJECT] seat={seat} "
                     f"previous={previous_value:.2f} "
                     f"resolver={original_value} "
-                    f"nearest={continuity_value:.2f} "
-                    f"distance={continuity_distance:.2f} "
-                    f"candidate_votes={continuity_votes} "
+                    f"reason={resolution.reason} "
+                    f"distance={resolution.distance} "
+                    f"max_drop={maximum_drop_bb:.2f} "
                     f"candidates={candidate_values}",
                     flush=True,
                 )
@@ -1597,6 +1692,160 @@ def append_jsonl(path, payload):
         f.flush()
 
 
+def load_betting_round_status():
+    """
+    Read the state machine's authoritative betting obligation artifact.
+
+    Failure or partial writes are nonfatal. A missing/invalid artifact means
+    there is no safe basis for retrospective boundary work.
+    """
+    if not BETTING_ROUND_STATUS.exists():
+        return {}
+
+    try:
+        value = json.loads(
+            BETTING_ROUND_STATUS.read_text()
+        )
+    except Exception:
+        return {}
+
+    return value if isinstance(value, dict) else {}
+
+
+def maybe_queue_boundary_stack_request(
+    state,
+    *,
+    previous_street,
+    next_street,
+    frames,
+    status=None,
+):
+    """
+    Queue retrospective stack OCR only at a valid local street advance.
+
+    This function is routing only. It performs no OCR and assigns no poker
+    semantics. The state-machine betting status is authoritative for which
+    seats still owed action on the street that just ended.
+    """
+    previous_street = str(
+        previous_street or "WAITING"
+    ).upper()
+
+    next_street = str(
+        next_street or previous_street
+    ).upper()
+
+    valid_advance = {
+        ("PREFLOP", "FLOP"),
+        ("FLOP", "TURN"),
+        ("TURN", "RIVER"),
+    }
+
+    if (previous_street, next_street) not in valid_advance:
+        return state, None
+
+    hand_token = str(
+        state.get("hand_token") or ""
+    )
+
+    if not hand_token:
+        return state, None
+
+    if status is None:
+        status = load_betting_round_status()
+
+    status_token = str(
+        (status or {}).get("hand_token") or ""
+    )
+
+    status_street = str(
+        (status or {}).get("street") or ""
+    ).upper()
+
+    if status_token != hand_token:
+        return state, None
+
+    if status_street != previous_street:
+        return state, None
+
+    seats = list(dict.fromkeys(
+        (status or {}).get("players_owing_action")
+        or []
+    ))
+
+    if not seats:
+        return state, None
+
+    request_key = (
+        f"{hand_token}:{previous_street}"
+    )
+
+    if (
+        state.get("last_boundary_stack_request_key")
+        == request_key
+    ):
+        return state, None
+
+    usable_frames = []
+
+    for item in list(frames or []):
+        frame_path = str(
+            (item or {}).get("frame_path") or ""
+        )
+
+        if not frame_path:
+            continue
+
+        usable_frames.append({
+            "ts": (item or {}).get("ts"),
+            "frame_path": frame_path,
+            "local_board_count": int(
+                (item or {}).get(
+                    "local_board_count",
+                    0,
+                )
+                or 0
+            ),
+        })
+
+    if not usable_frames:
+        return state, None
+
+    request_id = uuid.uuid4().hex
+
+    payload = {
+        "type": "boundary_stack_request",
+        "request_id": request_id,
+        "hand_token": hand_token,
+        "street": previous_street,
+        "next_street": next_street,
+        "boundary_ts": time.time(),
+        "seats": seats,
+        "frames": usable_frames,
+    }
+
+    append_jsonl(
+        BOUNDARY_STACK_REQUESTS,
+        payload,
+    )
+
+    state[
+        "last_boundary_stack_request_key"
+    ] = request_key
+
+    print(
+        "[BOUNDARY_STACK_REQUEST] "
+        f"request={request_id[:8]} "
+        f"street={previous_street} "
+        f"next={next_street} "
+        f"seats={seats} "
+        f"frames={len(usable_frames)}",
+        flush=True,
+    )
+
+    return state, payload
+
+
 def queue_board_request(state, expected_len, frame):
     request_id = uuid.uuid4().hex
 
@@ -2299,6 +2548,13 @@ class CoordinatorRuntime:
         default_factory=lambda: deque(maxlen=8)
     )
 
+    # Metadata only: no image copies and no OCR on the coordinator hot path.
+    # Retains enough recent captures for the asynchronous boundary worker to
+    # retrospectively inspect the street that just ended.
+    boundary_frame_buffer: deque = field(
+        default_factory=lambda: deque(maxlen=32)
+    )
+
 
 def main():
     print("api_event_coordinator running event-only mode. Ctrl+C to stop.")
@@ -2345,6 +2601,7 @@ def main():
     # hand token. Replaying this short buffer lets participant evidence retain
     # players who were dealt in but folded before the trigger frame.
     participant_frame_buffer = runtime.participant_frame_buffer
+    boundary_frame_buffer = runtime.boundary_frame_buffer
 
 
     INFERRED_ACTIONS_JSON.write_text(
@@ -2387,12 +2644,41 @@ def main():
             state,
         )
 
+        prechange_image = (
+            local_detector.previous_frame.copy()
+            if local_detector.previous_frame is not None
+            else None
+        )
+
         changes = local_detector.detect(img)
+
+        local_board_count = int(
+            getattr(changes, "board_count", 0)
+            or 0
+        )
+
+        boundary_frame_buffer.append({
+            "ts": time.time(),
+            "frame_path": str(frame or ""),
+            "local_board_count": local_board_count,
+        })
+
+        previous_canonical_street = str(
+            state.get("phase") or "WAITING"
+        ).upper()
 
         event_street = event_street_for_frame(
             state,
-            getattr(changes, "board_count", 0),
+            local_board_count,
         )
+
+        if event_street != previous_canonical_street:
+            state, _ = maybe_queue_boundary_stack_request(
+                state,
+                previous_street=previous_canonical_street,
+                next_street=event_street,
+                frames=list(boundary_frame_buffer),
+            )
 
         if event_street != str(
             state.get("phase") or "WAITING"
@@ -2486,6 +2772,7 @@ def main():
             changes,
             img,
             state,
+            prechange_image=prechange_image,
             prior_occupied_bet_regions=(
                 previous_occupied_bet_regions
             ),

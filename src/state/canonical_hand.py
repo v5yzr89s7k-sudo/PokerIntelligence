@@ -36,6 +36,12 @@ class CanonicalPlayer:
     starting_stack_bb: Optional[float] = None
     current_stack_bb: Optional[float] = None
     last_confirmed_stack_bb: Optional[float] = None
+
+    # Unresolved perception evidence from the authoritative hand-start
+    # snapshot. These values are hypotheses only; they must never be treated
+    # as canonical stack state until later evidence uniquely resolves one.
+    starting_stack_candidates: List[float] = field(default_factory=list)
+
     is_hero: bool = False
     folded: bool = False
     all_in: bool = False
@@ -175,6 +181,14 @@ class CanonicalHand:
                 starting_stack_bb=float(stack_bb) if stack_bb is not None else None,
                 current_stack_bb=float(stack_bb) if stack_bb is not None else None,
                 last_confirmed_stack_bb=float(stack_bb) if stack_bb is not None else None,
+                starting_stack_candidates=[
+                    float(value)
+                    for value in (
+                        item.get("stack_candidates") or []
+                    )
+                    if value is not None
+                    and float(value) > 0.0
+                ],
                 is_hero=bool(item.get("is_hero")) or seat == self.hero_seat,
                 active=bool(item.get("is_active", True)),
             )
@@ -249,6 +263,22 @@ class CanonicalHand:
                         else None
                     )
                 ),
+                starting_stack_candidates=(
+                    [
+                        float(value)
+                        for value in (
+                            item.get("stack_candidates") or []
+                        )
+                        if value is not None
+                        and float(value) > 0.0
+                    ]
+                    if "stack_candidates" in item
+                    else (
+                        list(existing.starting_stack_candidates)
+                        if existing
+                        else []
+                    )
+                ),
                 is_hero=(
                     bool(item.get("is_hero"))
                     or seat == self.hero_seat
@@ -301,6 +331,107 @@ class CanonicalHand:
             self._initialize_players_to_act()
 
         return self
+
+    def resolve_starting_stack_baseline(
+        self,
+        seat: str,
+        observed_stack_bb: float,
+        *,
+        tolerance_bb: float = 0.02,
+    ) -> Optional[dict]:
+        """
+        Promote independently observed pre-change stack evidence into the
+        canonical starting baseline.
+
+        This is intentionally conservative:
+          - the starting baseline must still be unresolved;
+          - current/last-confirmed stack state must still be unresolved;
+          - the observation must uniquely match exactly one preserved
+            starting-stack candidate.
+
+        No action amount or poker-semantic inference is used.
+        """
+        player = self.players.get(seat)
+
+        if player is None:
+            return None
+
+        if (
+            player.starting_stack_bb is not None
+            or player.current_stack_bb is not None
+            or player.last_confirmed_stack_bb is not None
+        ):
+            return {
+                "seat": seat,
+                "resolved": False,
+                "reason": "canonical_stack_already_initialized",
+                "observed_stack_bb": float(observed_stack_bb),
+            }
+
+        try:
+            observed = float(observed_stack_bb)
+        except (TypeError, ValueError):
+            return {
+                "seat": seat,
+                "resolved": False,
+                "reason": "invalid_observation",
+                "observed_stack_bb": None,
+            }
+
+        if observed <= 0.0:
+            return {
+                "seat": seat,
+                "resolved": False,
+                "reason": "invalid_observation",
+                "observed_stack_bb": observed,
+            }
+
+        matches = []
+
+        for candidate in (
+            player.starting_stack_candidates or []
+        ):
+            try:
+                candidate_value = float(candidate)
+            except (TypeError, ValueError):
+                continue
+
+            if candidate_value <= 0.0:
+                continue
+
+            if abs(candidate_value - observed) <= tolerance_bb:
+                if candidate_value not in matches:
+                    matches.append(candidate_value)
+
+        if len(matches) != 1:
+            return {
+                "seat": seat,
+                "resolved": False,
+                "reason": (
+                    "no_matching_starting_candidate"
+                    if not matches
+                    else "ambiguous_starting_candidates"
+                ),
+                "observed_stack_bb": observed,
+                "matching_candidates": list(matches),
+            }
+
+        resolved = float(matches[0])
+
+        player.starting_stack_bb = resolved
+        player.current_stack_bb = resolved
+        player.last_confirmed_stack_bb = resolved
+
+        return {
+            "seat": seat,
+            "resolved": True,
+            "reason": "unique_prechange_candidate_match",
+            "starting_stack_bb": resolved,
+            "current_stack_bb": resolved,
+            "last_confirmed_stack_bb": resolved,
+            "observed_stack_bb": observed,
+        }
+
 
     def update_player_stack(
         self,
@@ -535,6 +666,123 @@ class CanonicalHand:
 
         return item
 
+    def add_boundary_action(
+        self,
+        *,
+        street: str,
+        seat: str,
+        action: str,
+        amount_bb: Optional[float] = None,
+        raise_to_bb: Optional[float] = None,
+        all_in: bool = False,
+        confidence: Optional[float] = None,
+        source: str = "boundary_resolution",
+        evidence: Optional[List[str]] = None,
+        ts: Optional[float] = None,
+    ) -> CanonicalAction:
+        """
+        Promote a trusted retrospective street-boundary resolution.
+
+        Unlike add_action(), this method may record an action for a street
+        that has already ended. It must never mutate the live betting price,
+        live aggressor, or current-street action queue.
+
+        This is intentionally narrow infrastructure for independently
+        resolved boundary evidence, not a general stale-action escape hatch.
+        """
+        target_street = str(street or "").upper()
+        normalized_action = str(action or "").upper()
+
+        if target_street not in ("PREFLOP", "FLOP", "TURN", "RIVER"):
+            raise ValueError(
+                f"invalid_boundary_street: {target_street}"
+            )
+
+        if normalized_action not in ("FOLD", "CALL", "CHECK"):
+            raise ValueError(
+                f"unsupported_boundary_action: {normalized_action}"
+            )
+
+        player = self.players.get(seat)
+
+        if player is None:
+            raise ValueError(
+                f"unknown_boundary_seat: {seat}"
+            )
+
+        # Boundary promotion must be idempotent. The same asynchronous
+        # result may never create duplicate canonical chronology.
+        duplicate = next(
+            (
+                existing
+                for existing in self.actions
+                if existing.street == target_street
+                and existing.seat == seat
+                and existing.action == normalized_action
+                and existing.source == source
+            ),
+            None,
+        )
+
+        if duplicate is not None:
+            return duplicate
+
+        item = CanonicalAction(
+            sequence=self._next_sequence,
+            ts=ts or time.time(),
+            street=target_street,
+            seat=seat,
+            position=player.position,
+            player_name=player.name,
+            action=normalized_action,
+            amount_bb=amount_bb,
+            raise_to_bb=raise_to_bb,
+            all_in=all_in,
+            confidence=confidence,
+            source=source,
+            evidence=list(evidence or []),
+        )
+
+        self._next_sequence += 1
+        self.actions.append(item)
+
+        if normalized_action == "FOLD":
+            player.folded = True
+            player.active = False
+
+        if all_in:
+            player.all_in = True
+
+        committed = float(
+            player.committed_by_street.get(
+                target_street,
+                0.0,
+            )
+            or 0.0
+        )
+
+        if amount_bb is not None:
+            committed += float(amount_bb)
+
+        if raise_to_bb is not None:
+            ante_committed = self.ante_committed_bb(
+                seat,
+                target_street,
+            )
+            committed = (
+                ante_committed
+                + float(raise_to_bb)
+            )
+
+        player.committed_by_street[target_street] = committed
+
+        # Historical commitment affects reconstructed pot accounting, but
+        # must not modify current_bet_bb or last_aggressor_seat.
+        self._recompute_expected_pot_bb()
+
+        return item
+
+
     def _recompute_expected_pot_bb(self):
         """
         Reconstruct the expected pot from canonical commitments.
@@ -684,6 +932,15 @@ class CanonicalHand:
                     "last_confirmed_stack_bb",
                     item.get("starting_stack_bb"),
                 ),
+                starting_stack_candidates=[
+                    float(value)
+                    for value in (
+                        item.get("starting_stack_candidates")
+                        or []
+                    )
+                    if value is not None
+                    and float(value) > 0.0
+                ],
                 is_hero=bool(item.get("is_hero")),
                 folded=bool(item.get("folded")),
                 all_in=bool(item.get("all_in")),

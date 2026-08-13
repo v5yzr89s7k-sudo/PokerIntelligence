@@ -15,6 +15,36 @@ OCR_CONFIG = "--psm 7"
 def _parse_value(raw: str) -> Optional[float]:
     text = str(raw or "").strip()
 
+    def normalize_stack_token(token):
+        """
+        Normalize OCR numeric text to ACR stack-display precision.
+
+        ACR stack values display at most two decimal digits. OCR may merge
+        adjacent BB glyphs into trailing digits, e.g.:
+            28.36BB -> 28.3688
+
+        Excess decimal digits therefore cannot represent additional stack
+        precision. Truncate them before numeric conversion; never round them.
+        """
+        token = str(token)
+
+        if "." not in token:
+            return token
+
+        integer_part, decimal_part = token.split(
+            ".",
+            1,
+        )
+
+        if len(decimal_part) > 2:
+            decimal_part = decimal_part[:2]
+
+        return (
+            integer_part
+            + "."
+            + decimal_part
+        )
+
     # When OCR includes the BB suffix, accept only a syntactically valid
     # numeric token immediately before BB. Never salvage a partial number
     # from malformed text such as "95./2 BB" or "99./2 BB".
@@ -28,7 +58,11 @@ def _parse_value(raw: str) -> Optional[float]:
 
     if match:
         try:
-            return float(match.group(1))
+            return float(
+                normalize_stack_token(
+                    match.group(1)
+                )
+            )
         except ValueError:
             return None
 
@@ -55,7 +89,9 @@ def _parse_value(raw: str) -> Optional[float]:
         token = numbers[0]
 
     try:
-        return float(token)
+        return float(
+            normalize_stack_token(token)
+        )
     except ValueError:
         return None
 
@@ -224,6 +260,100 @@ def _resolve(readings):
     return majority_value, majority_votes
 
 
+def _independent_segmentation_consensus(gray):
+    """
+    Independently verify a stack value across several fixed-threshold
+    segmentations.
+
+    Green-mask, grayscale PSM7, and Otsu are correlated views and may share
+    the same glyph error. This verifier uses thresholded PSM13 reads and
+    returns a candidate only when that independent family is internally
+    consistent.
+
+    No digit substitutions or poker-state assumptions are applied here.
+    """
+    thresholds = (90, 100, 110, 120, 130)
+
+    readings = []
+
+    for threshold in thresholds:
+        image = cv2.threshold(
+            gray,
+            threshold,
+            255,
+            cv2.THRESH_BINARY,
+        )[1]
+
+        result = {
+            "variant": f"psm13_t{threshold}",
+            **_ocr(
+                image,
+                config="--psm 13",
+            ),
+        }
+
+        readings.append(result)
+
+    numeric = [
+        item.get("stack_bb")
+        for item in readings
+        if item.get("stack_bb") is not None
+    ]
+
+    if not numeric:
+        return None, 0, readings
+
+    counts = Counter(numeric)
+    value, votes = counts.most_common(1)[0]
+
+    # Require agreement across at least three independent threshold
+    # segmentations. One or two lucky OCR reads are insufficient.
+    if votes < 3:
+        return None, votes, readings
+
+    return value, votes, readings
+
+
+def read_stack_independent_consensus(crop) -> Dict[str, Any]:
+    """
+    Independently read one stack crop across the fixed-threshold PSM13
+    segmentation family.
+
+    This is a perception-only interface. It applies no continuity,
+    digit substitution, poker semantics, or canonical-state assumptions.
+    """
+    _, gray, _ = _prepare_images(crop)
+
+    value, votes, readings = (
+        _independent_segmentation_consensus(gray)
+    )
+
+    return {
+        "stack_bb": (
+            float(value)
+            if value is not None
+            else None
+        ),
+        "stack_text": (
+            f"{float(value):g} BB"
+            if value is not None
+            else ""
+        ),
+        "confidence": (
+            0.98
+            if value is not None and int(votes) >= 3
+            else 0.0
+        ),
+        "votes": int(votes),
+        "mode": (
+            "independent_segmentation"
+            if value is not None and int(votes) >= 3
+            else "independent_unresolved"
+        ),
+        "raw": list(readings or []),
+    }
+
+
 def read_stack(crop) -> Dict[str, Any]:
     _, gray, green = _prepare_images(crop)
 
@@ -357,7 +487,11 @@ def read_stack(crop) -> Dict[str, Any]:
             "mode": "plain_only",
         }
 
-    # Disagreement: use Otsu as the tiebreaker.
+    # Disagreement: use Otsu as the correlated-family tiebreaker, but also
+    # expose the independent thresholded PSM13 family as candidate evidence.
+    #
+    # The stack reader does NOT decide which OCR family is authoritative.
+    # Canonical continuity belongs to the coordinator.
     otsu = cv2.threshold(
         gray,
         0,
@@ -370,13 +504,24 @@ def read_stack(crop) -> Dict[str, Any]:
         **_ocr(otsu),
     }
 
+    independent_value, independent_votes, independent_readings = (
+        _independent_segmentation_consensus(gray)
+    )
+
     readings = [
         green_result,
         plain_result,
         otsu_result,
+        *independent_readings,
     ]
 
-    value, votes = _resolve(readings)
+    # Preserve the existing correlated-family resolver behavior for the
+    # reader's provisional value. Independent candidates are evidence only.
+    value, votes = _resolve([
+        green_result,
+        plain_result,
+        otsu_result,
+    ])
 
     # Debug suspicious OCR disagreements.
     numeric = [

@@ -8,7 +8,10 @@ import cv2
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from src.vision.stack_reader import read_stack
+from src.vision.stack_reader import (
+    read_stack,
+    read_stack_independent_consensus,
+)
 
 
 REQUESTS = ROOT / "runtime/live/boundary_stack_requests.jsonl"
@@ -57,6 +60,42 @@ def trusted_read(frame_path, seat):
     if crop.size == 0:
         return None
 
+    # Prefer the independent thresholded PSM13 family when it reaches
+    # its stronger three-vote consensus. This protects the boundary path
+    # from correlated green/plain OCR errors such as Replay 0002's
+    # 53.41 -> 93.41 leading-digit failure.
+    independent = (
+        read_stack_independent_consensus(crop)
+        or {}
+    )
+
+    independent_stack = independent.get("stack_bb")
+    independent_confidence = float(
+        independent.get("confidence") or 0.0
+    )
+    independent_votes = int(
+        independent.get("votes") or 0
+    )
+
+    if (
+        independent_stack is not None
+        and independent_confidence >= MIN_CONFIDENCE
+        and independent_votes >= 3
+    ):
+        return {
+            "seat": seat,
+            "stack_bb": float(independent_stack),
+            "confidence": independent_confidence,
+            "votes": independent_votes,
+            "mode": independent.get(
+                "mode",
+                "independent_segmentation",
+            ),
+            "frame_path": str(frame_path),
+        }
+
+    # Fall back to the existing ordinary stack reader when independent
+    # segmentation does not establish a strong consensus.
     reading = read_stack(crop) or {}
 
     stack_bb = reading.get("stack_bb")

@@ -704,6 +704,33 @@ def _read_local_stacks(cards, cache_snapshot):
 
         result = read_stack(stack_crop)
 
+        stack_candidates = []
+
+        for reading in result.get("raw") or []:
+            if not isinstance(reading, dict):
+                continue
+
+            value = reading.get("stack_bb")
+
+            if value is None:
+                continue
+
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+
+            if value <= 0.0:
+                continue
+
+            if value not in stack_candidates:
+                stack_candidates.append(value)
+
+        result = {
+            **result,
+            "stack_candidates": stack_candidates,
+        }
+
         trusted_stack = (
             result.get("stack_bb") is not None
             and float(result.get("stack_bb")) > 0.0
@@ -1030,6 +1057,10 @@ def read_table_snapshot_v2(frame, dealt_in_seats=None):
         player["stack_read_mode"] = local_stack[
             "mode"
         ]
+        player["stack_candidates"] = list(
+            local_stack.get("stack_candidates")
+            or []
+        )
 
         players.append(player)
 

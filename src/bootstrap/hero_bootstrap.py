@@ -253,6 +253,7 @@ def build_local_players(*, frozen_participants):
             "stack_text": "",
             "stack_confidence": 0.0,
             "stack_read_mode": "unavailable",
+            "stack_candidates": [],
             "is_hero": seat == "hero",
             "is_active": True,
         }
@@ -335,6 +336,28 @@ def populate_local_stacks(
             )
         )
 
+        stack_candidates = []
+
+        for reading in stack_result.get("raw") or []:
+            if not isinstance(reading, dict):
+                continue
+
+            value = reading.get("stack_bb")
+
+            if value is None:
+                continue
+
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+
+            if value <= 0.0:
+                continue
+
+            if value not in stack_candidates:
+                stack_candidates.append(value)
+
         player.update({
             "stack_bb": (
                 float(stack_bb)
@@ -351,6 +374,7 @@ def populate_local_stacks(
                 "mode",
                 "unknown",
             ),
+            "stack_candidates": stack_candidates,
         })
 
         seat_ms = (

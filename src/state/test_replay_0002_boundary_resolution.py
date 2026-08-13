@@ -3,7 +3,10 @@ import json
 
 from pathlib import Path
 
-from src.vision.stack_reader import read_stack
+from src.vision.stack_reader import (
+    read_stack,
+    read_stack_independent_consensus,
+)
 from src.state.boundary_stack_observation import (
     BoundaryStackObservation,
 )
@@ -48,9 +51,25 @@ def read_real_stack(seat, frame_index):
     w = int(r["width"])
     h = int(r["height"])
 
-    result = read_stack(
-        image[y:y+h, x:x+w]
+    crop = image[y:y+h, x:x+w]
+
+    independent = (
+        read_stack_independent_consensus(crop)
+        or {}
     )
+
+    if (
+        independent.get("stack_bb") is not None
+        and float(
+            independent.get("confidence") or 0.0
+        ) >= 0.95
+        and int(
+            independent.get("votes") or 0
+        ) >= 3
+    ):
+        result = independent
+    else:
+        result = read_stack(crop)
 
     return path, result
 
@@ -61,12 +80,12 @@ def main():
     #
     # Real Replay 0002 chronology:
     #
-    #   UTG+1 raises to 6 BB
+    #   UTG+1 raises to 2 BB
     #   LJ raises to 7 BB
     #   Hero calls 7 BB
     #
     # UTG+1 therefore owes a response to the final 7 BB price.
-    # Its already-accounted live commitment is 6 BB.
+    # Its already-accounted live commitment is 2 BB.
     #
     # Frame 79 is the first locally observed flop frame, so its
     # stack is terminal evidence for the preflop betting round.
@@ -82,7 +101,7 @@ def main():
     print("===== REAL REPLAY 0002 UTG+1 BOUNDARY READ =====")
     print(result)
 
-    assert result["stack_bb"] == 93.41, result
+    assert result["stack_bb"] == 53.41, result
     assert float(result["confidence"]) >= 0.90, result
     assert int(result["votes"]) >= 2, result
 
@@ -90,8 +109,8 @@ def main():
         street="PREFLOP",
         seat=seat,
 
-        # Last authoritative stack after UTG+1's own 6 BB raise.
-        previous_stack_bb=93.41,
+        # Last authoritative stack after UTG+1's own 2 BB raise.
+        previous_stack_bb=53.41,
 
         observed_stack_bb=float(
             result["stack_bb"]
@@ -120,8 +139,8 @@ def main():
         betting_open=True,
         current_price_bb=7.0,
 
-        # UTG+1 already has 6 BB live in the pot.
-        prior_live_commitment_bb=6.0,
+        # UTG+1 already has 2 BB live in the pot.
+        prior_live_commitment_bb=2.0,
     )
 
     print()
@@ -150,7 +169,7 @@ def main():
         owes_action=False,
         betting_open=True,
         current_price_bb=7.0,
-        prior_live_commitment_bb=6.0,
+        prior_live_commitment_bb=2.0,
     )
 
     assert negative.resolved is False
@@ -197,11 +216,9 @@ def main():
             "seat": "seat_top",
             "previous": 28.36,
             "prior_live": 1.0,
-            # Frame 79 has the correct numeric value but an untrusted
-            # segmentation disagreement. Replay 0002 frame 70 provides
-            # an independently trusted 0.98 / 2-vote observation of the
-            # same unchanged terminal stack before the flop boundary.
-            "frame": 70,
+            # The exact boundary frame now independently resolves
+            # the displayed 28.36 BB with strong consensus.
+            "frame": 79,
             "expected": "FOLD",
         },
     ]

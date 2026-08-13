@@ -113,7 +113,7 @@ def main():
             1,
             "seat_mid_right",
             "BET_OR_RAISE",
-            delta_bb=6.0,
+            delta_bb=2.0,
             ts=1.0,
         )
     )
@@ -124,10 +124,10 @@ def main():
     assert utg1 is not None
     assert utg1.position == "UTG+1"
     assert utg1.action == "RAISE"
-    assert utg1.raise_to_bb == 6.0
+    assert utg1.raise_to_bb == 2.0
 
     # LJ adds 7 BB from zero live preflop commitment.
-    # With current price 6 BB, that should resolve as a raise to 7.
+    # With current price 2 BB, that should resolve as a raise to 7.
     lj = tracker.ingest(
         inferred(
             2,
@@ -188,7 +188,7 @@ def main():
 
     expected = [
         ("UTG", "FOLD", None, None),
-        ("UTG+1", "RAISE", None, 6.0),
+        ("UTG+1", "RAISE", None, 2.0),
         ("LJ", "RAISE", None, 7.0),
         ("HJ", "CALL", 7.0, None),
     ]
@@ -209,7 +209,7 @@ def main():
     print()
     print(
         "PASS Replay 0002 preflop semantics: "
-        "UTG folds, UTG+1 raises to 6, "
+        "UTG folds, UTG+1 raises to 2, "
         "LJ raises to 7, HJ Hero calls 7"
     )
 
