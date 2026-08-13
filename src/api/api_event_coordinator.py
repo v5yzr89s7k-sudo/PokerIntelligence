@@ -2984,20 +2984,52 @@ def main():
             else []
         )
 
-        enrich_stack_change_measurements(
-            changes,
-            img,
-            state,
-            prechange_image=prechange_image,
-            prior_occupied_bet_regions=(
-                previous_occupied_bet_regions
-            ),
-            prior_commitment_seats=prior_commitment_seats,
-            event_street=event_street,
-            recent_stack_observations=recent_stack_observations,
-            frame_path=str(frame or ""),
-            frame_ts=time.time(),
-        )
+        if state.get("terminal_action_frozen"):
+            # The hand ownership boundary has already been established.
+            # Do not allow subsequent table activity to settle into old-hand
+            # stack transitions or mutate canonical player stacks.
+            #
+            # Terminal-pot/result processing remains active independently.
+            pending_stack_reads = (
+                state.get("pending_stack_reads")
+                or {}
+            )
+
+            if pending_stack_reads:
+                state["pending_stack_reads"] = {}
+
+                print(
+                    "[TERMINAL_STACK_QUARANTINE] "
+                    f"retired_pending={len(pending_stack_reads)}",
+                    flush=True,
+                )
+
+            # Strip stack-transition candidates from this frame before the
+            # downstream observation/debug pipeline sees them as old-hand
+            # player commitments.
+            if hasattr(changes, "stack_changed_seats"):
+                changes.stack_changed_seats = []
+
+            print(
+                "[TERMINAL_STACK_QUARANTINE] "
+                "settlement=skipped",
+                flush=True,
+            )
+        else:
+            enrich_stack_change_measurements(
+                changes,
+                img,
+                state,
+                prechange_image=prechange_image,
+                prior_occupied_bet_regions=(
+                    previous_occupied_bet_regions
+                ),
+                prior_commitment_seats=prior_commitment_seats,
+                event_street=event_street,
+                recent_stack_observations=recent_stack_observations,
+                frame_path=str(frame or ""),
+                frame_ts=time.time(),
+            )
 
         log_observation(changes)
 
