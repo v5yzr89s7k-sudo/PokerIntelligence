@@ -2,6 +2,7 @@ from pathlib import Path
 import re
 import json
 import time
+import os
 import subprocess
 import cv2
 import sys
@@ -41,7 +42,9 @@ from src.state.recent_stack_observations import (
 )
 from src.vision.window_capture import find_acr_table_window, capture_window_crop
 from src.api.canonical_frame import to_canonical_frame
+from src.api.paced_replay_capture import PacedReplayCapture
 from src.vision.action_sequence_recorder import ActionSequenceRecorder
+from src.vision.winner_detector import detect_winner
 from src.vision.stack_reader import (
     read_stack,
     read_stack_independent_consensus,
@@ -165,6 +168,12 @@ def fresh_state():
         "terminal_pot_pending": False,
         "terminal_pot_request_id": None,
         "terminal_pot_started_ts": None,
+        # Hand ownership ends before terminal-pot bookkeeping necessarily
+        # finishes. Once frozen, new table activity may not become old-hand
+        # action evidence.
+        "terminal_action_frozen": False,
+        "terminal_freeze_reason": None,
+        "winner_seat": None,
         "initial_pot_queued": False,
         "last_local_board_count": 0,
         "last_local_hero_visible": False,
@@ -645,10 +654,130 @@ def enrich_stack_change_measurements(
             and float(item["stack_bb"]) > 0.0
         ]
 
+        # Add strong independent segmentation evidence before deciding
+        # whether continuity resolution is needed. Previously the >=2
+        # candidate gate considered only ordinary OCR, so a reliable
+        # independent fallback could never make the resolver eligible.
+        independent = read_stack_independent_consensus(
+            crop
+        )
+
+        independent_value = independent.get(
+            "stack_bb"
+        )
+        independent_votes = int(
+            independent.get("votes") or 0
+        )
+        independent_confidence = float(
+            independent.get("confidence") or 0.0
+        )
+
+        if (
+            independent_value is not None
+            and independent_votes >= 3
+            and independent_confidence >= 0.95
+        ):
+            independent_value = float(
+                independent_value
+            )
+
+            if (
+                independent_value > 0.0
+                and independent_value not in candidate_values
+            ):
+                candidate_values.append(
+                    independent_value
+                )
+
         unique_candidates = {
             round(value, 6)
             for value in candidate_values
         }
+
+        # A single ordinary OCR candidate may still be authoritative when a
+        # genuinely independent segmentation family strongly confirms the
+        # exact same numeric value. This is confirmation, not disagreement
+        # resolution, so it must happen before the >=2-candidate continuity
+        # branch below.
+        independent_confirms_ordinary = bool(
+            independent_value is not None
+            and independent_votes >= 3
+            and independent_confidence >= 0.95
+            and any(
+                abs(
+                    float(value)
+                    - float(independent_value)
+                )
+                <= 0.001
+                for value in (
+                    float(item["stack_bb"])
+                    for item in raw_readings
+                    if item.get("stack_bb") is not None
+                    and float(item["stack_bb"]) > 0.0
+                )
+            )
+        )
+
+        if (
+            independent_confirms_ordinary
+            and previous is not None
+        ):
+            confirmed_value = float(
+                independent_value
+            )
+
+            previous_value = float(previous)
+
+            has_commitment_evidence = bool(
+                seat in bet_evidence_seats
+                or seat in prior_occupied_bet_regions
+                or seat in prior_commitment_seats
+                or "bet_region_appeared"
+                in set(entry.get("trigger_sources") or [])
+            )
+
+            maximum_drop_bb = (
+                max(12.0, previous_value * 0.35)
+                if has_commitment_evidence
+                else 3.0
+            )
+
+            confirmed_delta = (
+                previous_value - confirmed_value
+            )
+
+            if (
+                confirmed_delta >= 0.0
+                and confirmed_delta <= maximum_drop_bb
+            ):
+                reading["stack_bb"] = confirmed_value
+                reading["stack_text"] = (
+                    f"{confirmed_value:g} BB"
+                )
+                reading["confidence"] = max(
+                    float(
+                        reading.get("confidence")
+                        or 0.0
+                    ),
+                    independent_confidence,
+                )
+                reading["votes"] = max(
+                    int(reading.get("votes") or 0),
+                    independent_votes,
+                )
+                reading["mode"] = (
+                    "independent_confirmed"
+                )
+
+                print(
+                    "[STACK_INDEPENDENT_CONFIRM] "
+                    f"seat={seat} "
+                    f"previous={previous_value:.2f} "
+                    f"current={confirmed_value:.2f} "
+                    f"delta={confirmed_delta:.2f} "
+                    f"votes={independent_votes}",
+                    flush=True,
+                )
 
         if (
             previous is not None
@@ -673,11 +802,38 @@ def enrich_stack_change_measurements(
                 else 3.0
             )
 
+            if seat == "hero":
+                print(
+                    "[STACK_RESOLVER_INPUT] "
+                    f"seat={seat} "
+                    f"previous={previous_value:.2f} "
+                    f"ordinary={reading.get('stack_bb')} "
+                    f"ordinary_confidence={float(reading.get('confidence') or 0.0):.2f} "
+                    f"ordinary_votes={int(reading.get('votes') or 0)} "
+                    f"independent={independent_value} "
+                    f"independent_confidence={independent_confidence:.2f} "
+                    f"independent_votes={independent_votes} "
+                    f"candidates={candidate_values} "
+                    f"max_drop={maximum_drop_bb:.2f}",
+                    flush=True,
+                )
+
             resolution = resolve_stack_candidates(
                 candidate_values,
                 previous_stack_bb=previous_value,
                 maximum_drop_bb=maximum_drop_bb,
             )
+
+            if seat == "hero":
+                print(
+                    "[STACK_RESOLVER_OUTPUT] "
+                    f"seat={seat} "
+                    f"resolved={resolution.resolved} "
+                    f"value={resolution.value} "
+                    f"distance={resolution.distance} "
+                    f"reason={resolution.reason}",
+                    flush=True,
+                )
 
             original_value = reading.get("stack_bb")
 
@@ -1220,8 +1376,61 @@ def parse_tournament_level(title):
     }
 
 
+_PACED_REPLAY = None
+
+
+def _paced_replay():
+    global _PACED_REPLAY
+
+    session = os.environ.get(
+        "POKER_REPLAY_SESSION"
+    )
+
+    if not session:
+        return None
+
+    if _PACED_REPLAY is None:
+        start_frame = int(
+            os.environ.get(
+                "POKER_REPLAY_START_FRAME",
+                "1",
+            )
+        )
+
+        end_text = os.environ.get(
+            "POKER_REPLAY_END_FRAME"
+        )
+
+        end_frame = (
+            int(end_text)
+            if end_text
+            else None
+        )
+
+        _PACED_REPLAY = PacedReplayCapture(
+            session,
+            start_frame=start_frame,
+            end_frame=end_frame,
+        )
+
+        print(
+            "[REPLAY_MODE] "
+            f"session={session} "
+            f"start={start_frame} "
+            f"end={end_frame}",
+            flush=True,
+        )
+
+    return _PACED_REPLAY
+
+
 def capture():
     global _CACHED_WINDOW
+
+    replay = _paced_replay()
+
+    if replay is not None:
+        return replay.capture()
 
     if _CACHED_WINDOW is None:
         _CACHED_WINDOW = find_acr_table_window()
@@ -2117,12 +2326,19 @@ def apply_pot_result(state, result):
         print(f"[POT] out-of-range result pot={pot_bb}", flush=True)
         return state, False
 
+    is_terminal = bool(
+        state.get("terminal_pot_pending")
+        and request_id
+        == state.get("terminal_pot_request_id")
+    )
+
     emit({
         "type": "pot_update",
         "pot_bb": round(pot_bb, 2),
         "raw_text": result.get("raw_text"),
         "source_request_id": request_id,
         "confidence": result.get("confidence"),
+        "terminal": is_terminal,
     })
 
     print(
@@ -2816,6 +3032,70 @@ def main():
         ):
             state = queue_pot_request(state, frame)
 
+        # ------------------------------------------------------------
+        # Terminal action-ownership boundary
+        # ------------------------------------------------------------
+        #
+        # WINNER is the strongest local terminal signal. Freeze the old hand
+        # immediately and preserve the winning canonical seat. Terminal-pot
+        # bookkeeping may continue after this point, but no new betting
+        # evidence may become part of this hand.
+        #
+        # If WINNER was missed, the first local board-clear transition after
+        # a confirmed river provides the fallback ownership boundary.
+        if (
+            state.get("phase") != "WAITING"
+            and not state.get("terminal_action_frozen")
+        ):
+            winner = detect_winner(img)
+
+            if winner.get("visible"):
+                winner_seat = winner.get("seat")
+
+                state["terminal_action_frozen"] = True
+                state["terminal_freeze_reason"] = (
+                    "winner_detected"
+                )
+                state["winner_seat"] = winner_seat
+
+                emit({
+                    "type": "winner_detected",
+                    "seat": winner_seat,
+                    "confidence": winner.get(
+                        "confidence"
+                    ),
+                    "score": winner.get("score"),
+                    "ts": time.time(),
+                })
+
+                print(
+                    "[TERMINAL_ACTION_FREEZE] "
+                    "reason=winner_detected "
+                    f"seat={winner_seat} "
+                    f"score={float(winner.get('score') or 0.0):.4f}",
+                    flush=True,
+                )
+
+            elif (
+                str(state.get("phase") or "").upper()
+                == "RIVER"
+                and int(
+                    state.get("confirmed_board_len")
+                    or 0
+                ) >= 5
+                and int(count or 0) == 0
+            ):
+                state["terminal_action_frozen"] = True
+                state["terminal_freeze_reason"] = (
+                    "river_board_clear"
+                )
+
+                print(
+                    "[TERMINAL_ACTION_FREEZE] "
+                    "reason=river_board_clear",
+                    flush=True,
+                )
+
         sequence_recorder.record(
             frame=img,
             changes=changes,
@@ -2831,14 +3111,30 @@ def main():
             flush=True,
         )
 
-        observations = observer.ingest_changes(
-            changes,
-            street=event_street,
-        )
+        if state.get("terminal_action_frozen"):
+            observations = []
+
+            print(
+                "[TERMINAL_ACTION_QUARANTINE] "
+                f"reason={state.get('terminal_freeze_reason') or 'terminal'} "
+                "observations=0",
+                flush=True,
+            )
+        else:
+            observations = observer.ingest_changes(
+                changes,
+                street=event_street,
+            )
+
         timeline.add_many(observations)
         timeline.write_json(TIMELINE_JSON)
         correlator.ingest(observations)
-        CORRELATOR_JSON.write_text(json.dumps(correlator.summary(), indent=2))
+        CORRELATOR_JSON.write_text(
+            json.dumps(
+                correlator.summary(),
+                indent=2,
+            )
+        )
 
         if state.get("phase") != "WAITING":
             table_context = load_table_context()

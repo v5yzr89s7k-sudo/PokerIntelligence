@@ -446,12 +446,84 @@ class ActionEpisodeManager:
 
             ep = self.active_by_seat.get(seat)
 
-            # Stack regions are visually noisy. A stack change by itself is not
-            # enough evidence to begin a poker-action episode. It may only
-            # strengthen an episode already opened by direct chip evidence.
+            # Raw stack-region motion is visually noisy and must not originate
+            # a poker-action episode. However, the production stack pipeline can
+            # now emit a settled quantitative transition after OCR continuity,
+            # candidate resolution, settlement, and transition validation.
+            #
+            # STACK_CHANGED observations reaching this manager have already
+            # passed the coordinator's production settlement/validation gate.
+            #
+            # That evidence is stronger than raw motion and must not be discarded
+            # merely because a bet-region "appeared" transition was missed.
             if obs.type == STACK_CHANGED:
                 if ep is None or ep.closed or ep.street != street:
                     if self._attach_late_stack(obs):
+                        continue
+
+                    payload = obs.payload or {}
+
+                    previous_stack = payload.get(
+                        "previous_stack_bb"
+                    )
+                    current_stack = payload.get(
+                        "current_stack_bb"
+                    )
+                    delta_bb = payload.get(
+                        "delta_bb"
+                    )
+                    confidence = payload.get(
+                        "stack_read_confidence"
+                    )
+
+                    try:
+                        confidence = float(confidence)
+                    except (TypeError, ValueError):
+                        confidence = 0.0
+
+                    try:
+                        delta_bb = float(delta_bb)
+                    except (TypeError, ValueError):
+                        delta_bb = 0.0
+
+                    trusted_transition = bool(
+                        previous_stack is not None
+                        and current_stack is not None
+                        and delta_bb > 0.0
+                        and confidence >= 0.75
+                        and str(
+                            payload.get(
+                                "stack_read_mode"
+                            )
+                            or ""
+                        ).lower()
+                        not in {
+                            "",
+                            "unknown",
+                            "unresolved",
+                            "empty",
+                        }
+                    )
+
+                    if trusted_transition:
+                        ep = self._open_episode(
+                            seat,
+                            street,
+                            obs.ts,
+                        )
+
+                        ep.add(obs)
+
+                        print(
+                            "[EPISODE] open_from_validated_stack "
+                            f"episode={ep.episode_id} "
+                            f"seat={seat} "
+                            f"street={street} "
+                            f"delta={delta_bb:.2f} "
+                            f"confidence={confidence:.2f}",
+                            flush=True,
+                        )
+
                         continue
 
                     self._cache_pending_stack(obs)

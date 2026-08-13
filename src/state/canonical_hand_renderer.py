@@ -356,26 +356,75 @@ def render_canonical_hand(hand: CanonicalHand) -> str:
         ])
 
         for pot in hand.pots:
-            pot_type = str(pot.get("pot_type") or "pot").replace("_", " ").title()
-            amount = _format_bb(pot.get("amount_bb"))
-            winners = []
+            pot_type_raw = str(
+                pot.get("pot_type") or "pot"
+            )
+            pot_type = (
+                pot_type_raw
+                .replace("_", " ")
+                .title()
+            )
+            amount = _format_bb(
+                pot.get("amount_bb")
+            )
+
+            winner_labels = []
 
             for seat in pot.get("winners") or []:
                 player = hand.players.get(seat)
+
                 if player:
-                    winners.append(
-                        player.position
-                        if player.position != "unknown"
-                        else player.name
+                    position = str(
+                        player.position or "unknown"
                     )
+
+                    name = str(
+                        player.name or seat
+                    )
+
+                    if (
+                        position
+                        and position != "unknown"
+                        and name
+                    ):
+                        winner_labels.append(
+                            f"{position} ({name})"
+                        )
+                    elif name:
+                        winner_labels.append(name)
+                    else:
+                        winner_labels.append(seat)
                 else:
-                    winners.append(seat)
+                    winner_labels.append(seat)
+
+            if pot_type_raw == "final_pot":
+                if winner_labels:
+                    lines.append(
+                        "Winner: "
+                        + ", ".join(
+                            winner_labels
+                        )
+                    )
+
+                if amount:
+                    lines.append(
+                        f"Final Pot: {amount}"
+                    )
+
+                continue
 
             line = pot_type
+
             if amount:
                 line += f": {amount}"
-            if winners:
-                line += f" — Winner: {', '.join(winners)}"
+
+            if winner_labels:
+                line += (
+                    " — Winner: "
+                    + ", ".join(
+                        winner_labels
+                    )
+                )
 
             lines.append(line)
 

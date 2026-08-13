@@ -179,6 +179,8 @@ def default_state():
         "pending_pot_updates": [],
         "pending_high_pot": None,
         "pending_terminal_events": [],
+        "winner_seat": None,
+        "final_pot_bb": None,
         "timeline": [],
     }
 
@@ -584,6 +586,12 @@ def handle_table_snapshot(state, event):
                     flush=True,
                 )
 
+            elif event_type == "winner_detected":
+                state = handle_winner_detected(
+                    state,
+                    pending_event,
+                )
+
             elif event_type == "pot_update":
                 state = handle_pot_update(
                     state,
@@ -736,7 +744,14 @@ def handle_hero_cards(state, event):
     state["canonical_snapshot_ready"] = False
     state["pending_board_events"] = []
     state["pending_inferred_actions"] = []
-    state["pending_stack_baseline_observations"] = []
+    # Preserve trusted pre-change baselines captured during the short
+    # local-hand-start / canonical-hand-start race. They are already scoped
+    # to the emerging hand by hand_token and will be replayed once the
+    # authoritative table snapshot is available.
+    state["pending_stack_baseline_observations"] = list(
+        state.get("pending_stack_baseline_observations")
+        or []
+    )
     state["pending_stack_updates"] = []
     state["pending_pot_updates"] = []
     state["pending_terminal_events"] = []
@@ -761,11 +776,25 @@ def handle_stack_baseline_observation(state, event):
     the sole owner of authoritative stack state.
     """
     if state.get("phase") == "WAITING":
+        # A local hand-start token may already exist before Hero-card API
+        # confirmation moves canonical state to PREFLOP. Trusted pre-change
+        # stack evidence from that short race belongs to the emerging hand
+        # and must survive into the existing snapshot buffer.
+        #
+        # Ordinary between-hand WAITING observations remain rejected.
+        if not state.get("hand_token"):
+            print(
+                "[SKIP] stack_baseline_observation while waiting",
+                flush=True,
+            )
+            return state
+
         print(
-            "[SKIP] stack_baseline_observation while waiting",
+            "[BUFFER_ELIGIBLE] stack_baseline_observation "
+            "during emerging-hand WAITING "
+            f"seat={event.get('seat')}",
             flush=True,
         )
-        return state
 
     seat = event.get("seat")
     observed_stack_bb = event.get("observed_stack_bb")
@@ -918,6 +947,78 @@ def handle_stack_update(state, event):
     return state
 
 
+def handle_winner_detected(state, event):
+    """
+    Preserve the canonical winning seat at the visual terminal boundary.
+
+    WINNER detection is result evidence only here. Coordinator-side action
+    ownership freezing is handled separately.
+    """
+    if state.get("phase") == "WAITING":
+        print(
+            "[SKIP] winner_detected while waiting",
+            flush=True,
+        )
+        return state
+
+    seat = str(
+        event.get("seat") or ""
+    ).strip()
+
+    if not seat:
+        print(
+            "[SKIP] winner_detected without seat",
+            flush=True,
+        )
+        return state
+
+    players = state.get("players") or []
+
+    known_seats = {
+        str(player.get("seat") or "")
+        for player in players
+        if player.get("seat")
+    }
+
+    # Once the authoritative snapshot exists, do not allow an arbitrary
+    # detector label to become canonical result ownership.
+    if (
+        state.get("canonical_snapshot_ready")
+        and known_seats
+        and seat not in known_seats
+    ):
+        print(
+            "[WINNER_REJECT] "
+            f"seat={seat} "
+            "reason=seat_not_in_canonical_snapshot",
+            flush=True,
+        )
+        return state
+
+    existing = state.get("winner_seat")
+
+    if existing and existing != seat:
+        print(
+            "[WINNER_REJECT] "
+            f"existing={existing} "
+            f"observed={seat} "
+            "reason=winner_conflict",
+            flush=True,
+        )
+        return state
+
+    state["winner_seat"] = seat
+
+    print(
+        "[WINNER_DETECTED] "
+        f"seat={seat} "
+        f"confidence={float(event.get('confidence') or 0.0):.2f}",
+        flush=True,
+    )
+
+    return state
+
+
 def handle_pot_update(state, event):
     """
     Validate an observed ACR pot before allowing it to mutate CanonicalHand.
@@ -938,6 +1039,33 @@ def handle_pot_update(state, event):
 
     try:
         observed = round(float(pot_bb), 2)
+
+        # A terminal pot observation is requested specifically to settle the
+        # completed hand. It is not an ordinary in-street estimate and must
+        # not be held behind expected-pot/high-spike confirmation.
+        if event.get("terminal"):
+            canonical = canonical_load()
+
+            accepted = canonical.set_observed_pot(
+                observed
+            )
+
+            canonical_save(canonical)
+
+            state["final_pot_bb"] = round(
+                float(accepted),
+                2,
+            )
+            state["pending_high_pot"] = None
+
+            print(
+                "[CANONICAL_TERMINAL_POT] "
+                f"accepted={float(accepted):.2f} "
+                "source=terminal_table_pot",
+                flush=True,
+            )
+
+            return state
     except (TypeError, ValueError):
         print("[SKIP] invalid pot_update", event)
         return state
@@ -1512,6 +1640,37 @@ def handle_hand_complete(state, event):
 
     state = record_timeline(state, f"hand_complete {result}")
     canonical = canonical_load()
+
+    winner_seat = state.get("winner_seat")
+    final_pot_bb = state.get("final_pot_bb")
+
+    # Structured terminal result must be attached before finish/archive.
+    # CanonicalHand already owns the pot-result representation.
+    if (
+        winner_seat
+        or final_pot_bb is not None
+    ):
+        canonical.add_pot_result(
+            pot_type="final_pot",
+            amount_bb=(
+                float(final_pot_bb)
+                if final_pot_bb is not None
+                else None
+            ),
+            winners=(
+                [winner_seat]
+                if winner_seat
+                else []
+            ),
+        )
+
+        print(
+            "[CANONICAL_FINAL_RESULT] "
+            f"winner={winner_seat or 'unknown'} "
+            f"pot={final_pot_bb}",
+            flush=True,
+        )
+
     canonical.finish(
         result=result,
         ended_ts=event.get("ts") or time.time(),
@@ -1732,6 +1891,12 @@ def handle_event(state, event):
 
     if t == "stack_update":
         return handle_stack_update(state, event)
+
+    if t == "winner_detected":
+        return handle_winner_detected(
+            state,
+            event,
+        )
 
     if t == "pot_update":
         return handle_pot_update(state, event)
