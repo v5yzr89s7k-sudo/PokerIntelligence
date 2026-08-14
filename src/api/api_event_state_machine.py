@@ -1892,6 +1892,12 @@ def handle_event(state, event):
     if t == "stack_update":
         return handle_stack_update(state, event)
 
+    if t == "boundary_stack_result":
+        return handle_boundary_stack_result(
+            state,
+            event,
+        )
+
     if t == "winner_detected":
         return handle_winner_detected(
             state,

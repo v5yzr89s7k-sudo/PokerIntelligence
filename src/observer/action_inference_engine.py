@@ -231,6 +231,18 @@ class ActionInferenceEngine:
         confidence = min(episode_confidence, 0.45)
         reason = "insufficient evidence"
 
+        maturity_reason = str(
+            episode.get("maturity_reason")
+            or ""
+        )
+
+        quantitative_stack_commitment = bool(
+            STACK_CHANGED in kinds
+            and episode.get("evidence_mature")
+            and maturity_reason
+            == "quantitative_stack_commitment"
+        )
+
         if seat == "table" and kinds == {POT_CHANGED}:
             action = TABLE_EVENT
             confidence = min(max(episode_confidence, 0.40), 0.60)
@@ -238,11 +250,16 @@ class ActionInferenceEngine:
 
         elif (
             STACK_CHANGED in kinds
-            and BET_REGION_OCCUPIED in kinds
             and prior_committed
             and (
-                not timeline
-                or commitment_sequence
+                (
+                    BET_REGION_OCCUPIED in kinds
+                    and (
+                        not timeline
+                        or commitment_sequence
+                    )
+                )
+                or quantitative_stack_commitment
             )
         ):
             action = CALL_OR_RAISE
@@ -257,10 +274,16 @@ class ActionInferenceEngine:
 
         elif (
             STACK_CHANGED in kinds
-            and BET_REGION_OCCUPIED in kinds
+            and not prior_committed
             and (
-                not timeline
-                or commitment_sequence
+                (
+                    BET_REGION_OCCUPIED in kinds
+                    and (
+                        not timeline
+                        or commitment_sequence
+                    )
+                )
+                or quantitative_stack_commitment
             )
         ):
             action = BET_OR_RAISE

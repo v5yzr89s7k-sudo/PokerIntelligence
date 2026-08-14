@@ -252,6 +252,94 @@ class BettingRoundTracker:
         self.decisions.append(decision)
         return decision
 
+    def _last_full_raise_increment_bb(
+        self,
+        street,
+    ):
+        """
+        Reconstruct the most recent full betting increment from canonical
+        same-street chronology.
+
+        The big blind establishes the initial live price preflop.
+        BET and RAISE actions subsequently advance the live price.
+        """
+        street = str(
+            street or ""
+        ).upper()
+
+        live_price = 0.0
+        last_increment = 0.0
+
+        for existing in self.hand.actions:
+            if str(
+                getattr(existing, "street", "")
+                or ""
+            ).upper() != street:
+                continue
+
+            action_name = str(
+                getattr(existing, "action", "")
+                or ""
+            ).upper()
+
+            amount = getattr(
+                existing,
+                "amount_bb",
+                None,
+            )
+
+            raise_to = getattr(
+                existing,
+                "raise_to_bb",
+                None,
+            )
+
+            if (
+                action_name == "POST_BIG_BLIND"
+                and amount is not None
+            ):
+                new_price = float(amount)
+
+                if new_price > live_price:
+                    last_increment = (
+                        new_price - live_price
+                    )
+                    live_price = new_price
+
+                continue
+
+            if (
+                action_name == "BET"
+                and amount is not None
+            ):
+                new_price = float(amount)
+
+                if new_price > live_price:
+                    last_increment = (
+                        new_price - live_price
+                    )
+                    live_price = new_price
+
+                continue
+
+            if (
+                action_name == "RAISE"
+                and raise_to is not None
+            ):
+                new_price = float(raise_to)
+
+                if new_price > live_price:
+                    last_increment = (
+                        new_price - live_price
+                    )
+                    live_price = new_price
+
+        return round(
+            max(0.0, last_increment),
+            2,
+        )
+
+
     def _classify_inferred_action(
         self,
         episode_id: int,
@@ -483,6 +571,50 @@ class BettingRoundTracker:
             )
             tolerance = 0.05
 
+            stack_confidence = float(
+                stack_change.get(
+                    "stack_read_confidence"
+                )
+                or 0.0
+            )
+
+            stack_mode = str(
+                stack_change.get(
+                    "stack_read_mode"
+                )
+                or ""
+            ).lower()
+
+            trusted_stack_sizing = bool(
+                stack_confidence >= 0.95
+                and stack_mode
+                not in {
+                    "",
+                    "unknown",
+                    "unresolved",
+                    "empty",
+                }
+            )
+
+            last_full_increment = (
+                self._last_full_raise_increment_bb(
+                    self.hand.current_street
+                )
+            )
+
+            minimum_full_raise_to = (
+                round(
+                    current_price
+                    + last_full_increment,
+                    2,
+                )
+                if (
+                    current_price > tolerance
+                    and last_full_increment > tolerance
+                )
+                else None
+            )
+
             if canonical_action in {
                 BET_OR_RAISE,
                 CALL_OR_RAISE,
@@ -503,12 +635,27 @@ class BettingRoundTracker:
                         "price; resolved as CALL"
                     )
 
+                elif (
+                    canonical_action == CALL_OR_RAISE
+                    and trusted_stack_sizing
+                    and minimum_full_raise_to is not None
+                    and target_commitment
+                    < minimum_full_raise_to - tolerance
+                ):
+                    canonical_action = CALL
+                    amount_bb = delta_bb
+                    reason = (
+                        "trusted stack-derived commitment exceeded "
+                        "the live price but did not reach the minimum "
+                        "full raise-to amount; resolved as CALL"
+                    )
+
                 else:
                     canonical_action = RAISE
                     raise_to_bb = target_commitment
                     reason = (
-                        "total street commitment exceeded the live "
-                        "price; resolved as RAISE"
+                        "total street commitment established a "
+                        "raise-sized live commitment; resolved as RAISE"
                     )
 
             elif canonical_action == RAISE:
