@@ -182,6 +182,7 @@ def default_state():
         "pending_inferred_actions": [],
         "pending_stack_baseline_observations": [],
         "pending_stack_updates": [],
+        "unresolved_stack_candidates": {},
         "pending_pot_updates": [],
         "pending_high_pot": None,
         "pending_terminal_events": [],
@@ -1387,6 +1388,83 @@ def handle_hero_fold(state, event):
     return state
 
 
+def handle_stack_candidate_opened(state, event):
+    seat = str(event.get("seat") or "")
+    street = str(event.get("street") or "").upper()
+    event_token = str(event.get("hand_token") or "")
+    current_token = str(state.get("hand_token") or "")
+
+    if not seat or not street:
+        return state
+
+    if (
+        event_token
+        and current_token
+        and event_token != current_token
+    ):
+        return state
+
+    candidates = dict(
+        state.get("unresolved_stack_candidates")
+        or {}
+    )
+
+    candidates[f"{street}:{seat}"] = {
+        "seat": seat,
+        "street": street,
+        "sources": list(
+            event.get("sources") or []
+        ),
+        "ts": event.get("ts"),
+    }
+
+    state["unresolved_stack_candidates"] = candidates
+
+    print(
+        "[STACK_CANDIDATE_STATE] "
+        f"opened seat={seat} street={street}",
+        flush=True,
+    )
+
+    return state
+
+
+def handle_stack_candidate_closed(state, event):
+    seat = str(event.get("seat") or "")
+    street = str(event.get("street") or "").upper()
+    event_token = str(event.get("hand_token") or "")
+    current_token = str(state.get("hand_token") or "")
+
+    if (
+        event_token
+        and current_token
+        and event_token != current_token
+    ):
+        return state
+
+    candidates = dict(
+        state.get("unresolved_stack_candidates")
+        or {}
+    )
+
+    if seat and street:
+        candidates.pop(
+            f"{street}:{seat}",
+            None,
+        )
+
+    state["unresolved_stack_candidates"] = candidates
+
+    print(
+        "[STACK_CANDIDATE_STATE] "
+        f"closed seat={seat} street={street} "
+        f"reason={event.get('reason') or 'candidate_removed'}",
+        flush=True,
+    )
+
+    return state
+
+
 def handle_inferred_action(state, event):
     if state.get("phase") == "WAITING":
         print("[SKIP] inferred_action while waiting", event)
@@ -1434,7 +1512,30 @@ def handle_inferred_action(state, event):
         return state
 
     tracker = tracker_for_hand(canonical)
-    added = tracker.ingest(event)
+
+    action_street = str(
+        event.get("street") or ""
+    ).upper()
+
+    unsettled_stack_evidence_seats = sorted({
+        str(item.get("seat") or "")
+        for item in (
+            state.get("unresolved_stack_candidates")
+            or {}
+        ).values()
+        if (
+            str(item.get("street") or "").upper()
+            == action_street
+            and item.get("seat")
+        )
+    })
+
+    tracker_event = dict(event)
+    tracker_event[
+        "unsettled_stack_evidence_seats"
+    ] = unsettled_stack_evidence_seats
+
+    added = tracker.ingest(tracker_event)
 
     status = write_betting_round_status(
         tracker,
@@ -2023,6 +2124,18 @@ def handle_event(state, event):
 
     if t == "stack_update":
         return handle_stack_update(state, event)
+
+    if t == "stack_candidate_opened":
+        return handle_stack_candidate_opened(
+            state,
+            event,
+        )
+
+    if t == "stack_candidate_closed":
+        return handle_stack_candidate_closed(
+            state,
+            event,
+        )
 
     if t == "boundary_stack_result":
         return handle_boundary_stack_result(

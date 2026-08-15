@@ -717,6 +717,14 @@ class BettingRoundTracker:
                     prior_committed
                 )
 
+                commitment_evidence.update(
+                    item.get(
+                        "unsettled_stack_evidence_seats",
+                        [],
+                    )
+                    or []
+                )
+
                 unresolved_skipped = [
                     skipped_seat
                     for skipped_seat in skipped_seats

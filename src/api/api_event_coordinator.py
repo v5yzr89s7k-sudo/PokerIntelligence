@@ -364,6 +364,37 @@ def prechange_stack_observation(
     }
 
 
+def close_pending_stack_candidate(
+    state,
+    pending,
+    seat,
+    reason="candidate_removed",
+):
+    """
+    Remove one unresolved stack candidate and publish its closure.
+
+    This publishes perception lifecycle only. Poker semantics remain
+    downstream in the state machine / betting tracker.
+    """
+    entry = pending.pop(seat, None)
+
+    if not entry:
+        return None
+
+    emit({
+        "type": "stack_candidate_closed",
+        "hand_token": state.get("hand_token"),
+        "seat": seat,
+        "street": entry.get("origin_street"),
+        "reason": reason,
+        "sources": list(
+            entry.get("trigger_sources") or []
+        ),
+    })
+
+    return entry
+
+
 def enrich_stack_change_measurements(
     changes,
     img,
@@ -529,6 +560,16 @@ def enrich_stack_change_measurements(
                 flush=True,
             )
 
+            emit({
+                "type": "stack_candidate_opened",
+                "hand_token": state.get("hand_token"),
+                "seat": seat,
+                "street": entry.get("origin_street"),
+                "sources": list(
+                    entry.get("trigger_sources") or []
+                ),
+            })
+
         # If the stack transition began before Hero cards completed,
         # promote the transition to the current street as soon as the
         # hand becomes active.
@@ -593,7 +634,7 @@ def enrich_stack_change_measurements(
                     f"waited={waited_seconds * 1000.0:.1f}ms",
                     flush=True,
                 )
-                pending.pop(seat, None)
+                close_pending_stack_candidate(state, pending, seat)
 
             continue
 
@@ -630,12 +671,12 @@ def enrich_stack_change_measurements(
         )
 
         if not region:
-            pending.pop(seat, None)
+            close_pending_stack_candidate(state, pending, seat)
             continue
 
         crop = _crop_geometry_region(img, region)
         if crop.size == 0:
-            pending.pop(seat, None)
+            close_pending_stack_candidate(state, pending, seat)
             continue
 
         reading = read_stack(crop)
@@ -908,7 +949,7 @@ def enrich_stack_change_measurements(
             )
 
             if not retrying:
-                pending.pop(seat, None)
+                close_pending_stack_candidate(state, pending, seat)
 
 
             # Persist failed Hero OCR crops for inspection.
@@ -996,32 +1037,38 @@ def enrich_stack_change_measurements(
                 entry.get("trigger_sources") or []
             )
 
-            # A bet-region appearance is independent physical evidence that
-            # chips were committed, but ACR may update the displayed stack
-            # after the chips themselves appear. In that narrow case an
-            # initial trusted zero-delta OCR read means "not visible yet",
-            # not "no wager occurred".
+            # Physical visual evidence can lead the displayed stack update.
+            # A bet-region appearance is strong independent commitment
+            # evidence, while stack motion is a weaker change candidate, but
+            # either may legitimately precede a settled numeric stack delta.
             #
-            # Keep the candidate alive only inside the existing bounded retry
-            # budget. Do not use raw visual commitment evidence to authorize
-            # large stack collapses; semantic commitment evidence remains the
-            # validator's separate safety input.
-            physical_commitment_pending = bool(
+            # Therefore a trusted "no_stack_change" read does not immediately
+            # disprove an already-open physical candidate. Keep it unresolved
+            # only inside the existing bounded retry / age budget. This does
+            # not authorize any wager or stack update; semantic validation
+            # remains authoritative before emission.
+            physical_candidate_pending = bool(
                 validation.reason == "no_stack_change"
-                and "bet_region_appeared" in trigger_sources
+                and bool(
+                    {
+                        "stack_motion",
+                        "bet_region_appeared",
+                    }
+                    & set(trigger_sources)
+                )
             )
 
             retrying = bool(
                 (
                     validation.decision != STACK_REJECT
-                    or physical_commitment_pending
+                    or physical_candidate_pending
                 )
                 and attempts < maximum_ocr_attempts
                 and pending_age < maximum_pending_seconds
             )
 
             if not retrying:
-                pending.pop(seat, None)
+                close_pending_stack_candidate(state, pending, seat)
 
             print(
                 "[STACK_PIPELINE]",
@@ -1049,23 +1096,50 @@ def enrich_stack_change_measurements(
         delta = validation.delta_bb
 
         # Zero deltas are visual noise. Negative deltas represent chips
-        # returning to the stack or an OCR disagreement, not a wager.
+        # A sub-threshold read does not by itself disprove the visual
+        # stack candidate. The stack transition may still be developing
+        # across frames. Preserve unresolved evidence while the existing
+        # OCR retry / pending-age budget remains available.
         if delta < minimum_delta_bb:
-            pending.pop(seat, None)
+            attempts = int(
+                entry.get("ocr_attempts") or 0
+            )
+            pending_age = (
+                now - float(
+                    entry.get("first_change_ts")
+                    or now
+                )
+            )
+
+            retrying = (
+                attempts < maximum_ocr_attempts
+                and pending_age < maximum_pending_seconds
+            )
+
+            if not retrying:
+                close_pending_stack_candidate(
+                    state,
+                    pending,
+                    seat,
+                    reason="subthreshold_exhausted",
+                )
 
             print(
                 "[STACK_PIPELINE]",
                 f"seat={seat}",
                 "movement=yes",
-                "validation=ocr_failed",
+                "validation=no_stack_change",
                 "emitted=no",
+                f"retrying={retrying}",
                 flush=True,
             )
 
             print(
                 f"[STACK_SETTLE_SKIP] seat={seat} "
                 f"previous={previous:.2f} current={current:.2f} "
-                f"delta={delta:.2f} reason=non_commitment",
+                f"delta={delta:.2f} "
+                f"reason=subthreshold_pending "
+                f"retrying={retrying}",
                 flush=True,
             )
             continue
@@ -1155,7 +1229,7 @@ def enrich_stack_change_measurements(
             entry["last_change_ts"] = now
 
             if attempts >= 3:
-                pending.pop(seat, None)
+                close_pending_stack_candidate(state, pending, seat)
 
                 print(
                     "[STACK_BATCH_DROP] "
@@ -1175,7 +1249,7 @@ def enrich_stack_change_measurements(
 
             settled_details[seat] = measurement
             settled_seats.append(seat)
-            pending.pop(seat, None)
+            close_pending_stack_candidate(state, pending, seat)
 
             print(
                 "[STACK_PIPELINE]",
