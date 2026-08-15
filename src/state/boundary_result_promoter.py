@@ -69,16 +69,21 @@ def promote_boundary_observation(
             reason="player does not owe action on preserved street state",
         )
 
-    # record_response() is the correct existing mutation primitive only
-    # while aggression is open. Unopened-round pending_to_act reconciliation
-    # remains intentionally unsupported in this first integration.
-    if not status.get("betting_open"):
+    # Unopened PREFLOP reconciliation remains intentionally unsupported
+    # because blind-specific semantics cannot be resolved from an unchanged
+    # boundary stack alone. Postflop unopened streets may proceed to the
+    # existing boundary resolver, which can resolve an owing player with a
+    # trusted unchanged stack as CHECK.
+    if (
+        not status.get("betting_open")
+        and street == "PREFLOP"
+    ):
         return BoundaryPromotionResult(
             street=street,
             seat=seat,
             resolved=False,
             action=None,
-            reason="unopened-street boundary promotion not yet supported",
+            reason="unopened preflop boundary promotion not supported",
         )
 
     player = hand.players.get(seat)
@@ -169,10 +174,16 @@ def promote_boundary_observation(
         ts=observation.get("frame_ts"),
     )
 
-    commitment_tracker.record_response(
-        street,
-        seat,
-    )
+    if status.get("betting_open"):
+        commitment_tracker.record_response(
+            street,
+            seat,
+        )
+    else:
+        commitment_tracker.consume_pending_action(
+            street,
+            seat,
+        )
 
     commitment_tracker.record_action(
         street,

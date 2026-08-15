@@ -197,12 +197,85 @@ def test_non_owing_player_does_not_mutate():
     assert result.resolved is False
     assert len(hand.actions) == before_actions
 
+def test_unopened_postflop_unchanged_stack_promotes_check():
+    hand, tracker = make_case()
+
+    # Move the same hand to FLOP and initialize the preserved
+    # postflop traversal queue.
+    hand.set_board(
+        ["8d", "8h", "As"],
+        ts=10.0,
+    )
+
+    tracker.reset_street("FLOP")
+    tracker.initialize_street_order(
+        "FLOP",
+        hand.players_to_act,
+    )
+    tracker.sync_queue(
+        "FLOP",
+        hand.players_to_act,
+    )
+
+    seat = hand.players_to_act[0]
+    player = hand.players[seat]
+
+    # Trusted boundary observation shows no stack decrease.
+    observed_stack = player.last_confirmed_stack_bb
+
+    before_owing = tracker.players_owing_action(
+        "FLOP"
+    )
+
+    assert seat in before_owing, before_owing
+
+    result = promote_boundary_observation(
+        hand=hand,
+        commitment_tracker=tracker,
+        street="FLOP",
+        seat=seat,
+        observation={
+            "seat": seat,
+            "stack_bb": observed_stack,
+            "confidence": 0.98,
+            "votes": 4,
+            "mode": "independent_segmentation",
+            "frame_path": "/tmp/flop_boundary.png",
+            "frame_ts": 11.0,
+        },
+    )
+
+    assert result.resolved is True, result
+    assert result.action == "CHECK", result
+
+    checks = [
+        action
+        for action in hand.actions
+        if action.street == "FLOP"
+        and action.seat == seat
+        and action.action == "CHECK"
+    ]
+
+    assert len(checks) == 1, checks
+
+    after_owing = tracker.players_owing_action(
+        "FLOP"
+    )
+
+    assert seat not in after_owing, after_owing
+
+    print(
+        "PASS unopened postflop boundary: "
+        "trusted unchanged stack resolves CHECK "
+        "and consumes traversal obligation"
+    )
 
 if __name__ == "__main__":
     test_boundary_fold_promotes_and_consumes_response()
     test_boundary_call_promotes_exact_missing_amount()
     test_untrusted_observation_does_not_mutate()
     test_non_owing_player_does_not_mutate()
+    test_unopened_postflop_unchanged_stack_promotes_check()
 
     print(
         "PASS boundary result promoter: "

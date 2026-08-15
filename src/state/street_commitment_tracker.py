@@ -176,6 +176,52 @@ class StreetCommitmentTracker:
 
         return list(state.needs_response_from)
 
+    def reconcile_eligible_seats(
+        self,
+        street,
+        eligible_seats,
+    ):
+        """
+        Filter existing street obligations against current player eligibility.
+
+        This is deliberately filter-only. It never rebuilds or reorders a
+        street queue, so players whose current-street action was already
+        consumed cannot be resurrected by a late historical result.
+        """
+        state = self._state(street)
+        eligible = set(eligible_seats or [])
+
+        state.pending_to_act = [
+            seat
+            for seat in state.pending_to_act
+            if seat in eligible
+        ]
+
+        state.needs_response_from = [
+            seat
+            for seat in state.needs_response_from
+            if seat in eligible
+        ]
+
+        return self.players_owing_action(street)
+
+    def consume_pending_action(self, street, seat):
+        """
+        Consume one player's unopened-street traversal obligation.
+
+        This is distinct from record_response(), which owns the response
+        queue created by open aggression.
+        """
+        state = self._state(street)
+
+        state.pending_to_act = [
+            pending_seat
+            for pending_seat in state.pending_to_act
+            if pending_seat != seat
+        ]
+
+        return list(state.pending_to_act)
+
     def record_response(self, street, seat):
         """
         Mark one player as having responded to the current aggression.

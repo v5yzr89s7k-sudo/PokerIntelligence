@@ -62,6 +62,12 @@ def tracker_for_hand(canonical):
         # loaded from disk.
         _ACTIVE_TRACKER.hand = canonical
 
+        # CanonicalHand may have advanced streets even when no inferred
+        # player action occurred on the new street. Keep the persistent
+        # betting tracker synchronized so the new street's action
+        # obligations remain authoritative for boundary reconciliation.
+        _ACTIVE_TRACKER._sync_street()
+
     return _ACTIVE_TRACKER
 
 
@@ -179,6 +185,7 @@ def default_state():
         "pending_pot_updates": [],
         "pending_high_pot": None,
         "pending_terminal_events": [],
+        "pending_boundary_results": [],
         "winner_seat": None,
         "final_pot_bb": None,
         "timeline": [],
@@ -1249,6 +1256,55 @@ def handle_board(state, event):
     state = record_timeline(state, f"board {next_phase} {' '.join(board)}")
     print(f"[STATE] board -> {next_phase}", board)
 
+    pending_boundary = list(
+        state.get("pending_boundary_results") or []
+    )
+
+    if pending_boundary:
+        state["pending_boundary_results"] = []
+
+        pending_boundary.sort(
+            key=lambda item: float(
+                item.get("ts") or 0.0
+            )
+        )
+
+        still_pending = []
+
+        for pending_result in pending_boundary:
+            old = str(
+                pending_result.get("street") or ""
+            ).upper()
+
+            expected = {
+                "PREFLOP": "FLOP",
+                "FLOP": "TURN",
+                "TURN": "RIVER",
+            }.get(old)
+
+            if expected == next_phase:
+                print(
+                    "[BOUNDARY_RESULT_REPLAY] "
+                    f"old={old} "
+                    f"current={next_phase} "
+                    f"request={str(pending_result.get('request_id') or '')[:8]}",
+                    flush=True,
+                )
+
+                state = handle_boundary_stack_result(
+                    state,
+                    pending_result,
+                )
+            else:
+                still_pending.append(
+                    pending_result
+                )
+
+        if still_pending:
+            state["pending_boundary_results"] = (
+                still_pending
+            )
+
     return state
 
 
@@ -1753,6 +1809,41 @@ def handle_boundary_stack_result(state, result):
     }.get(old_street)
 
     if expected_current != current_street:
+        if old_street == current_street:
+            pending = list(
+                state.get("pending_boundary_results") or []
+            )
+
+            request_id = str(
+                result.get("request_id") or ""
+            )
+
+            already_pending = any(
+                str(item.get("request_id") or "")
+                == request_id
+                for item in pending
+            )
+
+            if not already_pending:
+                pending.append(dict(result))
+                pending.sort(
+                    key=lambda item: float(
+                        item.get("ts") or 0.0
+                    )
+                )
+
+            state["pending_boundary_results"] = pending
+
+            print(
+                "[BOUNDARY_RESULT_DEFER] "
+                f"old={old_street} "
+                f"current={current_street} "
+                f"request={request_id[:8]}",
+                flush=True,
+            )
+
+            return state
+
         print(
             "[BOUNDARY_RESULT_SKIP] "
             "reason=street_relationship_mismatch "
@@ -1848,6 +1939,47 @@ def handle_boundary_stack_result(state, result):
             )
 
     if promoted:
+        current_street = str(
+            canonical.current_street or ""
+        ).upper()
+
+        if (
+            current_street
+            and current_street != old_street
+        ):
+            eligible_current = [
+                seat
+                for seat, player
+                in canonical.players.items()
+                if player.active
+                and not player.folded
+                and not player.all_in
+            ]
+
+            # Preserve already-consumed current-street actions. Historical
+            # boundary results may only remove newly ineligible players;
+            # they must never rebuild the live action queue.
+            canonical.players_to_act = [
+                seat
+                for seat in canonical.players_to_act
+                if seat in eligible_current
+            ]
+
+            remaining = (
+                tracker.commitment_tracker
+                .reconcile_eligible_seats(
+                    current_street,
+                    eligible_current,
+                )
+            )
+
+            print(
+                "[BOUNDARY_CURRENT_QUEUE_RECONCILE] "
+                f"street={current_street} "
+                f"remaining={remaining}",
+                flush=True,
+            )
+
         canonical_save(canonical)
 
     old_status = (
