@@ -147,6 +147,7 @@ def fresh_state():
         "phase": "WAITING",
         "hero_read": False,
         "confirmed_board_len": 0,
+        "confirmed_board": [],
         "stable_board_count": 0,
         "stable_seen": 0,
         "last_api_attempt_ts": 0,
@@ -2156,6 +2157,31 @@ def apply_board_result(state, result):
         return state, False
 
     board_to_emit = board[:expected_len]
+
+    confirmed_board = list(
+        state.get("confirmed_board") or []
+    )
+
+    if confirmed_board:
+        prefix_len = min(
+            len(confirmed_board),
+            confirmed,
+        )
+
+        expected_prefix = confirmed_board[:prefix_len]
+        observed_prefix = board_to_emit[:prefix_len]
+
+        if observed_prefix != expected_prefix:
+            print(
+                "[BOARD] prefix mutation rejected "
+                f"confirmed={expected_prefix} "
+                f"observed={observed_prefix} "
+                f"expected_len={expected_len}",
+                flush=True,
+            )
+            return state, False
+
+    state["confirmed_board"] = list(board_to_emit)
     state["confirmed_board_len"] = expected_len
 
     if state.get("hero_decision_active"):
