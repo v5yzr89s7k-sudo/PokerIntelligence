@@ -13,7 +13,9 @@ def base_state(request_id):
         "phase": "FLOP",
         "hero_decision_active": False,
         "last_hero_action_complete_phase": None,
+        "hand_token": "board-prefix-test",
         "board_request_id": request_id,
+        "board_request_expected_len": 4,
     })
 
     return state
@@ -24,6 +26,7 @@ def test_matching_prefix_accepts_turn():
 
     result = {
         "request_id": "turn-ok",
+        "hand_token": "board-prefix-test",
         "ok": True,
         "expected_len": 4,
         "board": ["Jd", "9s", "Tc", "9h"],
@@ -44,6 +47,7 @@ def test_mutated_prefix_rejected():
 
     result = {
         "request_id": "turn-bad",
+        "hand_token": "board-prefix-test",
         "ok": True,
         "expected_len": 4,
         "board": ["Jh", "9s", "Tc", "9h"],
