@@ -17,7 +17,7 @@ from src.events.detectors.seat_occupancy_detector import (
     SEAT_ORDER,
 )
 from src.vision.dealer_detector import detect_dealer_button
-from src.vision.stack_reader import read_stack
+from src.vision.stack_reader import read_stack, read_stack_independent_consensus
 from src.api.snapshot_cache import (
     load_cache,
     save_cache,
@@ -753,11 +753,44 @@ def _read_local_stacks(cards, cache_snapshot):
                 },
             })
         else:
-            stack_readings[seat] = {
-                **result,
-                "stack_bb": None,
-                "stack_text": "",
-            }
+            independent = (
+                read_stack_independent_consensus(
+                    stack_crop
+                )
+                or {}
+            )
+
+            independent_trusted = (
+                independent.get("stack_bb") is not None
+                and float(independent.get("stack_bb")) > 0.0
+                and float(
+                    independent.get("confidence") or 0.0
+                ) >= 0.95
+                and int(
+                    independent.get("votes") or 0
+                ) >= 3
+            )
+
+            if independent_trusted:
+                stack_readings[seat] = independent
+
+                cache_updates.append({
+                    "seat": seat,
+                    "stack_crop": stack_crop,
+                    "payload": {
+                        "stack_bb": independent["stack_bb"],
+                        "stack_text": independent["stack_text"],
+                        "confidence": independent["confidence"],
+                        "votes": independent["votes"],
+                        "mode": independent["mode"],
+                    },
+                })
+            else:
+                stack_readings[seat] = {
+                    **result,
+                    "stack_bb": None,
+                    "stack_text": "",
+                }
 
     stack_ms = (
         perf_counter() - stack_t0
