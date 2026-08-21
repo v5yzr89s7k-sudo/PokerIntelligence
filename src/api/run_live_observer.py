@@ -6,6 +6,8 @@ import subprocess
 import sys
 import time
 import signal
+import json
+import shutil
 
 ROOT = Path(__file__).resolve().parents[2]
 LIVE = ROOT / "runtime/live"
@@ -14,6 +16,12 @@ EVENT_LOG = LIVE / "api_events.jsonl"
 STATE_CURSOR = LIVE / "api_event_state_machine_cursor.txt"
 CURRENT_HAND = LIVE / "current_hand.txt"
 DEBUG_LOG = LIVE / "observer_debug.log"
+CURRENT_REPLAY_FRAME = LIVE / "current_replay_frame.json"
+HAND_PROGRESSION_ROOT = ROOT / "runtime/debug/hand_progression"
+
+SCK_SOURCE = ROOT / "src/capture/sck_sampler.swift"
+SCK_BINARY = ROOT / "runtime/bin/poker_intelligence_sck_sampler"
+SCK_SOCKET = Path("/tmp/poker_intelligence_frame.sock")
 
 DRAIN_TIMEOUT_SECONDS = 10.0
 DRAIN_POLL_SECONDS = 0.10
@@ -24,6 +32,110 @@ stopping = False
 debug_handle = None
 last_displayed_content = None
 terminal_display_active = False
+hand_progression_sequence = 0
+
+
+RUNTIME_PROCESS_MARKERS = (
+    "src/api/api_event_coordinator.py",
+    "src/api/api_event_state_machine.py",
+    "src/api/api_snapshot_worker.py",
+    "src/api/api_board_worker.py",
+    "src/api/api_hero_worker.py",
+    "src/api/api_pot_worker.py",
+    "src/api/api_bet_amount_worker.py",
+    "src/api/api_boundary_stack_worker.py",
+    "src/api/api_stack_worker.py",
+)
+
+
+def find_orphan_runtime_processes():
+    """
+    Return Poker Intelligence runtime processes that are alive before this
+    runner starts its own children.
+
+    The flock prevents concurrent runners, but it cannot protect against
+    orphan workers left behind after an abnormal runner death.
+    """
+    result = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,command="],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    current_pid = os.getpid()
+    matches = []
+
+    for raw in result.stdout.splitlines():
+        line = raw.strip()
+
+        if not line:
+            continue
+
+        parts = line.split(None, 2)
+
+        if len(parts) < 3:
+            continue
+
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+
+        command = parts[2]
+
+        if pid == current_pid:
+            continue
+
+        marker = next(
+            (
+                item
+                for item in RUNTIME_PROCESS_MARKERS
+                if item in command
+            ),
+            None,
+        )
+
+        if marker is None:
+            continue
+
+        matches.append({
+            "pid": pid,
+            "ppid": ppid,
+            "command": command,
+            "marker": marker,
+        })
+
+    return matches
+
+
+def assert_clean_runtime_process_state():
+    """
+    Refuse startup if orphan runtime consumers already exist.
+
+    This check intentionally occurs before reset_runtime(). Never truncate
+    shared request/result files while stale consumers are still alive.
+    """
+    orphans = find_orphan_runtime_processes()
+
+    if not orphans:
+        return
+
+    details = "\n".join(
+        f"  pid={item['pid']} "
+        f"ppid={item['ppid']} "
+        f"{item['marker']}"
+        for item in orphans
+    )
+
+    raise SystemExit(
+        "Orphan Poker Intelligence runtime processes detected.\n"
+        "Refusing to start because multiple consumers would corrupt "
+        "request/result ordering.\n"
+        f"{details}\n"
+        "Stop the stale runtime processes before retrying."
+    )
 
 
 def acquire_single_instance():
@@ -65,10 +177,17 @@ def reset_runtime():
         "hero_results.jsonl",
         "pot_requests.jsonl",
         "pot_results.jsonl",
+        "bet_amount_requests.jsonl",
+        "bet_amount_results.jsonl",
         "boundary_stack_requests.jsonl",
         "boundary_stack_results.jsonl",
+        "stack_requests.jsonl",
+        "stack_results.jsonl",
         "perception_latency.jsonl",
         "observer_debug.log",
+        "current_replay_frame.json",
+        "replay_latency.jsonl",
+        "coordinator_timing.jsonl",
     ]:
         (LIVE / name).write_text("")
 
@@ -137,6 +256,21 @@ def start(name, args):
     procs.append((name, process))
 
 
+def start_native(name, args, env=None):
+    debug(f"starting {name}: {args}")
+
+    process = subprocess.Popen(
+        [str(arg) for arg in args],
+        cwd=ROOT,
+        stdout=debug_handle,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        env=env,
+    )
+
+    procs.append((name, process))
+
+
 def get_process(name):
     for process_name, process in procs:
         if process_name == name:
@@ -159,6 +293,83 @@ def terminate_process(name, timeout=5.0):
         debug(f"killing unresponsive {name}")
         process.kill()
         process.wait()
+
+
+def build_sck_sampler():
+    SCK_BINARY.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    cmd = [
+        "swiftc",
+        "-parse-as-library",
+        str(SCK_SOURCE),
+        "-o",
+        str(SCK_BINARY),
+    ]
+
+    debug(
+        "compiling ScreenCaptureKit sampler: "
+        + " ".join(cmd)
+    )
+
+    result = subprocess.run(
+        cmd,
+        cwd=ROOT,
+        stdout=debug_handle,
+        stderr=subprocess.STDOUT,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "ScreenCaptureKit sampler compilation failed; "
+            f"see {DEBUG_LOG.relative_to(ROOT)}"
+        )
+
+
+def start_sck_sampler():
+    try:
+        SCK_SOCKET.unlink()
+    except FileNotFoundError:
+        pass
+
+    build_sck_sampler()
+
+    start_native(
+        "sck_sampler",
+        [SCK_BINARY],
+    )
+
+    deadline = time.monotonic() + 10.0
+
+    while time.monotonic() < deadline:
+        process = get_process(
+            "sck_sampler"
+        )
+
+        if (
+            process is None
+            or process.poll() is not None
+        ):
+            raise RuntimeError(
+                "ScreenCaptureKit sampler exited before "
+                "creating its socket; "
+                f"see {DEBUG_LOG.relative_to(ROOT)}"
+            )
+
+        if SCK_SOCKET.exists():
+            debug(
+                "ScreenCaptureKit sampler socket ready"
+            )
+            return
+
+        time.sleep(0.05)
+
+    raise RuntimeError(
+        "timed out waiting for ScreenCaptureKit "
+        f"socket {SCK_SOCKET}"
+    )
 
 
 def event_count():
@@ -253,6 +464,134 @@ def read_current_hand():
         return ""
 
 
+def record_hand_progression(content):
+    """
+    Replay-debug audit trail.
+
+    Every distinct current_hand.txt version is paired with the most recently
+    released replay frame. Normal live observation is intentionally untouched.
+    """
+    global hand_progression_sequence
+
+    replay_session = os.environ.get(
+        "POKER_REPLAY_SESSION"
+    )
+
+    if not replay_session:
+        return
+
+    if not content:
+        return
+
+    if not CURRENT_REPLAY_FRAME.exists():
+        return
+
+    try:
+        frame_state = json.loads(
+            CURRENT_REPLAY_FRAME.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        frame_number = int(
+            frame_state["frame"]
+        )
+
+        frame_path = Path(
+            frame_state["frame_path"]
+        )
+
+        if not frame_path.exists():
+            debug(
+                "hand progression frame missing: "
+                f"{frame_path}"
+            )
+            return
+
+        session_name = (
+            Path(replay_session).name
+            or "replay"
+        )
+
+        out = (
+            HAND_PROGRESSION_ROOT
+            / session_name
+        )
+
+        out.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        hand_progression_sequence += 1
+        sequence = hand_progression_sequence
+
+        stem = (
+            f"{sequence:03d}_"
+            f"frame_{frame_number:04d}"
+        )
+
+        image_destination = (
+            out / f"{stem}.png"
+        )
+
+        text_destination = (
+            out / f"{stem}_current_hand.txt"
+        )
+
+        metadata_destination = (
+            out / f"{stem}_meta.json"
+        )
+
+        shutil.copy2(
+            frame_path,
+            image_destination,
+        )
+
+        text_destination.write_text(
+            content.rstrip() + "\n",
+            encoding="utf-8",
+        )
+
+        metadata = {
+            "sequence": sequence,
+            "frame": frame_number,
+            "source_frame": str(
+                frame_path
+            ),
+            "image": image_destination.name,
+            "current_hand": (
+                text_destination.name
+            ),
+            "captured_at": (
+                datetime.now().isoformat()
+            ),
+            **frame_state,
+        }
+
+        metadata_destination.write_text(
+            json.dumps(
+                metadata,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        debug(
+            "[HAND_PROGRESSION] "
+            f"sequence={sequence:03d} "
+            f"frame={frame_number:04d} "
+            f"text={text_destination.name}"
+        )
+
+    except Exception as exc:
+        debug(
+            "could not record hand progression: "
+            f"{exc}"
+        )
+
+
 def render_live_display(force=False):
     global last_displayed_content
 
@@ -262,6 +601,9 @@ def render_live_display(force=False):
         return
 
     last_displayed_content = content
+
+    if not force:
+        record_hand_progression(content)
 
     clear_terminal()
 
@@ -312,11 +654,14 @@ def stop_all(*_):
 
     # Stop all event producers before measuring the final queue length.
     terminate_process("coordinator")
+    terminate_process("sck_sampler")
     terminate_process("snapshot_worker")
     terminate_process("board_worker")
     terminate_process("hero_worker")
     terminate_process("pot_worker")
+    terminate_process("bet_amount_worker")
     terminate_process("boundary_stack_worker")
+    terminate_process("stack_worker")
 
     # Leave the state machine alive until all durable events are consumed.
     drain_state_machine()
@@ -352,6 +697,11 @@ signal.signal(signal.SIGTERM, stop_all)
 
 single_instance_lock = acquire_single_instance()
 
+# flock prevents a second runner, but orphan workers can outlive a runner
+# after abnormal termination. Detect them before truncating shared runtime
+# files or starting another set of consumers.
+assert_clean_runtime_process_state()
+
 reset_runtime()
 open_debug_log()
 
@@ -361,13 +711,51 @@ start("board_worker", ["src/api/api_board_worker.py"])
 start("hero_worker", ["src/api/api_hero_worker.py"])
 start("pot_worker", ["src/api/api_pot_worker.py"])
 start(
+    "bet_amount_worker",
+    ["src/api/api_bet_amount_worker.py"],
+)
+start(
     "boundary_stack_worker",
     ["src/api/api_boundary_stack_worker.py"],
+)
+start(
+    "stack_worker",
+    ["src/api/api_stack_worker.py"],
 )
 
 time.sleep(0.5)
 
-start("coordinator", ["src/api/api_event_coordinator.py"])
+replay_mode = bool(
+    os.environ.get(
+        "POKER_REPLAY_SESSION"
+    )
+)
+
+if replay_mode:
+    debug(
+        "replay mode: ScreenCaptureKit sampler disabled"
+    )
+
+    os.environ.pop(
+        "POKER_SCK_CAPTURE",
+        None,
+    )
+
+else:
+    debug(
+        "live mode: enabling ScreenCaptureKit acquisition"
+    )
+
+    start_sck_sampler()
+
+    os.environ[
+        "POKER_SCK_CAPTURE"
+    ] = "1"
+
+start(
+    "coordinator",
+    ["src/api/api_event_coordinator.py"],
+)
 
 enter_live_display()
 render_live_display(force=True)
@@ -375,7 +763,27 @@ render_live_display(force=True)
 while True:
     for name, process in procs:
         if process.poll() is not None:
-            debug(f"{name} exited with code {process.returncode}")
+            debug(
+                f"{name} exited with code "
+                f"{process.returncode}"
+            )
+
+            # In replay mode the coordinator owns replay EOF. A clean
+            # coordinator exit means all already-published asynchronous
+            # transport has settled and no more perception frames will arrive.
+            # Reuse the ordinary graceful shutdown path so producers stop
+            # before the state machine performs its final durable event drain.
+            if (
+                replay_mode
+                and name == "coordinator"
+                and process.returncode == 0
+            ):
+                debug(
+                    "replay coordinator completed cleanly; "
+                    "starting runner shutdown"
+                )
+                stop_all()
+                continue
 
             clear_terminal()
             print("=" * 64)

@@ -113,7 +113,7 @@ def main():
         "seat_lower_left": "SB",
         "seat_mid_left": "BB",
         "seat_upper_left": "UTG",
-        "seat_top": "UTG+1",
+        "seat_top": "LJ",
         "seat_mid_right": "HJ",
         "seat_lower_right": "CO",
     }
@@ -125,7 +125,7 @@ def main():
 
     print(
         "PASS Replay 0001 starting roster: "
-        "7 players, physical LJ slot preserved, Hero BTN"
+        "7 players, positions compressed correctly, Hero BTN"
     )
 
 

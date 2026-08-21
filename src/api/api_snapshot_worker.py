@@ -299,84 +299,150 @@ def process_event(event, processed_hero_events):
         event.get("hand_token") or ""
     )
 
-    # Hero-card recognition can complete before six temporal
-    # participant frames have accumulated. Wait briefly for the
-    # coordinator's shared evidence instead of failing immediately.
-    # Do not block the opening snapshot waiting for participant evidence.
-    # Use whatever evidence already exists immediately.
-    shared_evidence = read_evidence(
-        PARTICIPANT_EVIDENCE_PATH
+    # Keep table occupancy and hand participation separate.
+    #
+    # roster_seats:
+    #     every occupied starting seat that snapshot enrichment should read.
+    #
+    # dealt_in_seats:
+    #     only players actually dealt cards in this hand; these seats own
+    #     poker positions, blinds, betting order, and action chronology.
+    requested_roster_seats = list(
+        event.get("roster_seats") or []
     )
 
-    shared_token = str(
-        shared_evidence.get("hand_token") or ""
+    requested_dealt_in_seats = list(
+        event.get("dealt_in_seats") or []
     )
-    expected_token = str(hand_token or "")
 
-    if (
-        shared_token
-        and shared_token == expected_token
-        and int(shared_evidence.get("frame_count") or 0) >= 6
-    ):
-        freezer = ParticipantFreezer.from_evidence(
-            shared_evidence
+    if requested_roster_seats:
+        roster_seats = list(
+            dict.fromkeys(
+                requested_roster_seats
+            )
         )
 
-        dealt_in_seats = freezer.freeze(
-            hero_is_dealt=True,
-            frozen_ts=event_ts or time.time(),
+        dealt_in_seats = list(
+            dict.fromkeys(
+                requested_dealt_in_seats
+                or requested_roster_seats
+            )
         )
-        participant_diagnostic = freezer.snapshot()
+
+        participant_diagnostic = {
+            "source": "canonical_starting_roster",
+            "hand_token": hand_token,
+            "frame_count": None,
+            "roster_seats": list(roster_seats),
+            "dealt_in_seats": list(dealt_in_seats),
+        }
 
         print(
-            f"[PARTICIPANT_FREEZE] source=shared "
-            f"frames={participant_diagnostic['frame_count']} "
-            f"seats={dealt_in_seats}",
+            "[PARTICIPANT_FREEZE] "
+            "source=canonical_starting_roster "
+            f"roster={roster_seats} "
+            f"dealt={dealt_in_seats}",
             flush=True,
         )
+
     else:
-        try:
-            dealt_in_seats, participant_diagnostic = (
-                freeze_temporal_participants(
-                    frame,
-                    geometry,
+        # Backward-compatible fallback for callers that do not yet provide
+        # the explicit roster/dealt-in split.
+        shared_evidence = read_evidence(
+            PARTICIPANT_EVIDENCE_PATH
+        )
+
+        shared_token = str(
+            shared_evidence.get("hand_token") or ""
+        )
+        expected_token = str(hand_token or "")
+
+        if (
+            shared_token
+            and shared_token == expected_token
+            and int(shared_evidence.get("frame_count") or 0) >= 6
+        ):
+            freezer = ParticipantFreezer.from_evidence(
+                shared_evidence
+            )
+
+            dealt_in_seats = freezer.freeze(
+                hero_is_dealt=True,
+                frozen_ts=event_ts or time.time(),
+            )
+            participant_diagnostic = freezer.snapshot()
+
+            print(
+                f"[PARTICIPANT_FREEZE] source=shared "
+                f"frames={participant_diagnostic['frame_count']} "
+                f"seats={dealt_in_seats}",
+                flush=True,
+            )
+        else:
+            try:
+                dealt_in_seats, participant_diagnostic = (
+                    freeze_temporal_participants(
+                        frame,
+                        geometry,
+                    )
                 )
-            )
-            print(
-                "[PARTICIPANT_FREEZE] source=historical",
-                flush=True,
-            )
-        except Exception as exc:
-            print(
-                f"[PARTICIPANT_FREEZE] failed "
-                f"{type(exc).__name__}: {exc}",
-                flush=True,
-            )
-            dealt_in_seats = []
-            participant_diagnostic = {
-                "error": str(exc),
-                "shared_hand_token": shared_token,
-                "expected_hand_token": expected_token,
-                "shared_frame_count": int(
-                    shared_evidence.get("frame_count") or 0
-                ),
-            }
+
+                print(
+                    "[PARTICIPANT_FREEZE] source=historical",
+                    flush=True,
+                )
+
+            except Exception as exc:
+                print(
+                    f"[PARTICIPANT_FREEZE] failed "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
+                dealt_in_seats = []
+
+                participant_diagnostic = {
+                    "error": str(exc),
+                    "shared_hand_token": shared_token,
+                    "expected_hand_token": expected_token,
+                    "shared_frame_count": int(
+                        shared_evidence.get("frame_count") or 0
+                    ),
+                }
+
+        roster_seats = list(
+            dealt_in_seats
+        )
 
     print(
-        f"[PARTICIPANTS] count={len(dealt_in_seats)} "
-        f"seats={dealt_in_seats}",
+        "[PARTICIPANTS] "
+        f"roster_count={len(roster_seats)} "
+        f"roster={roster_seats} "
+        f"dealt_count={len(dealt_in_seats)} "
+        f"dealt={dealt_in_seats}",
         flush=True,
     )
 
 
+    # Snapshot enrichment reads every occupied starting seat so the TABLE
+    # section receives all seated players in one atomic result.
     snapshot, elapsed_ms = run_snapshot(
         frame,
-        dealt_in_seats=dealt_in_seats,
+        dealt_in_seats=roster_seats,
     )
 
     if snapshot:
-        snapshot["dealt_in_seats"] = dealt_in_seats
-        snapshot["participant_diagnostic"] = participant_diagnostic
+        # V2 used roster_seats only as its read inventory. Restore the actual
+        # hand participants before any poker semantics are calculated.
+        snapshot["roster_seats"] = list(
+            roster_seats
+        )
+        snapshot["dealt_in_seats"] = list(
+            dealt_in_seats
+        )
+        snapshot["participant_diagnostic"] = (
+            participant_diagnostic
+        )
 
     if not snapshot:
         latency_end(

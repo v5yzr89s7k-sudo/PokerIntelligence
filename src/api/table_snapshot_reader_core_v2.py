@@ -624,6 +624,100 @@ def _cache_player(entry, card):
     }
 
 
+def retry_unresolved_opponent_names(
+    fresh_players,
+    missing_name_cards,
+    dealer,
+):
+    """
+    Retry each unresolved opponent exactly once using only that
+    physical-seat crop.
+
+    This is a bounded recovery path for a per-seat timeout or unreadable
+    primary result. It never re-requests already resolved opponents and
+    never substitutes cached identity for fresh evidence.
+    """
+    retry_api_ms = 0.0
+    retry_parse_ms = 0.0
+    retry_image_bytes = 0
+    retry_count = 0
+
+    still_blank = []
+
+    for card in missing_name_cards:
+        seat = card["seat"]
+
+        if seat == "hero":
+            continue
+
+        retry_count += 1
+
+        try:
+            result = _request_cards_api(
+                [card],
+                dealer,
+            )
+        except Exception as exc:
+            print(
+                "[SNAPSHOT_NAME_RETRY_FAILURE] "
+                f"seat={seat} "
+                f"error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            still_blank.append(seat)
+            continue
+
+        retry_api_ms += float(
+            result.get("api_ms") or 0.0
+        )
+        retry_parse_ms += float(
+            result.get("parse_ms") or 0.0
+        )
+        retry_image_bytes += int(
+            result.get("image_bytes") or 0
+        )
+
+        recovered = None
+
+        for player in result.get("players") or []:
+            if (
+                player.get("seat") == seat
+                and player.get("name")
+            ):
+                recovered = player
+                break
+
+        if recovered is None:
+            still_blank.append(seat)
+            continue
+
+        current = fresh_players.get(seat)
+
+        if current is None:
+            fresh_players[seat] = recovered
+        else:
+            # Retry owns identity recovery only. Local stack OCR remains
+            # authoritative for stack values later in snapshot assembly.
+            current["name"] = _normalize_name(
+                recovered.get("name")
+            )
+
+        print(
+            "[SNAPSHOT_NAME_RETRY_RECOVERED] "
+            f"seat={seat} "
+            f"name={fresh_players[seat].get('name')!r}",
+            flush=True,
+        )
+
+    return {
+        "still_blank": sorted(still_blank),
+        "api_ms": retry_api_ms,
+        "parse_ms": retry_parse_ms,
+        "image_bytes": retry_image_bytes,
+        "count": retry_count,
+    }
+
+
 def preserve_unresolved_opponent_names(
     fresh_players,
     missing_name_cards,
@@ -975,19 +1069,47 @@ def read_table_snapshot_v2(frame, dealt_in_seats=None):
         ]
 
         if missing_name_cards:
-            still_blank = preserve_unresolved_opponent_names(
+            retry_result = retry_unresolved_opponent_names(
                 fresh_players,
                 missing_name_cards,
+                dealer,
             )
 
-            print(
-                "[SNAPSHOT_NAME_UNRESOLVED]",
-                {
-                    "requested": still_blank,
-                    "policy": "leave_blank_without_verified_fingerprint",
-                },
-                flush=True,
+            retry_count = int(
+                retry_result.get("count") or 0
             )
+            retry_api_ms = float(
+                retry_result.get("api_ms") or 0.0
+            )
+            retry_parse_ms = float(
+                retry_result.get("parse_ms") or 0.0
+            )
+            retry_image_bytes = int(
+                retry_result.get("image_bytes") or 0
+            )
+
+            still_blank = retry_result.get(
+                "still_blank"
+            ) or []
+
+            if still_blank:
+                still_blank = preserve_unresolved_opponent_names(
+                    fresh_players,
+                    [
+                        card
+                        for card in missing_name_cards
+                        if card["seat"] in still_blank
+                    ],
+                )
+
+                print(
+                    "[SNAPSHOT_NAME_UNRESOLVED]",
+                    {
+                        "requested": still_blank,
+                        "policy": "leave_blank_without_verified_fingerprint",
+                    },
+                    flush=True,
+                )
 
         # Hero identity is stable across hands. A changing visual fingerprint
         # must not erase a previously confirmed Hero name.

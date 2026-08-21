@@ -373,7 +373,9 @@ def main():
     )
 
     metadata = {
-        "format_version": 1,
+        # Format v2 records the chronology-aware event-stream era.
+        # Existing v1 fixtures remain immutable historical evidence.
+        "format_version": 2,
         "hand_number": number,
         "recorded_at": started.isoformat(),
         "completed_at": datetime.now().isoformat(),

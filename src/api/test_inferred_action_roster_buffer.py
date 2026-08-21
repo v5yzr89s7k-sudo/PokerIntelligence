@@ -5,7 +5,7 @@ import src.api.api_event_state_machine as sm
 from src.state.canonical_hand_store import CanonicalHandStore
 
 
-def test_inferred_action_waits_for_roster_snapshot():
+def test_inferred_action_publishes_from_fast_table_context():
     original_store = sm.CANONICAL_STORE
 
     try:
@@ -73,7 +73,7 @@ def test_inferred_action_waits_for_roster_snapshot():
                 },
             )
 
-            assert state["canonical_snapshot_ready"] is False
+            assert state["canonical_snapshot_ready"] is True
 
             state = sm.handle_inferred_action(
                 state,
@@ -102,9 +102,11 @@ def test_inferred_action_waits_for_roster_snapshot():
             ).read_text()
 
             # Product invariant:
-            # no betting action may be published before the roster snapshot.
-            assert "opens to 2.2 BB" not in rendered_before_snapshot
-            assert len(state["pending_inferred_actions"]) == 1
+            # a qualified action must reach current_hand.txt immediately from
+            # fast local context. GPT snapshot latency is not on the action
+            # publication path.
+            assert "opens to 2.2 BB" in rendered_before_snapshot
+            assert state["pending_inferred_actions"] == []
 
             state = sm.handle_table_snapshot(
                 state,
@@ -125,6 +127,9 @@ def test_inferred_action_waits_for_roster_snapshot():
             assert "Villain" in rendered_after_snapshot
             assert "100 BB" in rendered_after_snapshot
             assert "opens to 2.2 BB" in rendered_after_snapshot
+            assert rendered_after_snapshot.count(
+                "opens to 2.2 BB"
+            ) == 1
 
             assert (
                 rendered_after_snapshot.index("Villain")

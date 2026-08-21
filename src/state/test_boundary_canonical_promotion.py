@@ -150,7 +150,7 @@ def test_boundary_promotion_is_idempotent():
     assert len(matches) == 1
 
 
-def test_boundary_raise_is_rejected():
+def test_boundary_raise_requires_explicit_sizing():
     hand = make_hand()
 
     hand.set_board(
@@ -158,26 +158,50 @@ def test_boundary_raise_is_rejected():
         ts=200.0,
     )
 
+    live_queue_before = list(hand.players_to_act)
+    live_bet_before = hand.current_bet_bb
+    live_aggressor_before = hand.last_aggressor_seat
+
     try:
         hand.add_boundary_action(
             street="PREFLOP",
             seat="villain",
             action="RAISE",
-            raise_to_bb=10.0,
         )
     except ValueError as exc:
-        assert "unsupported_boundary_action" in str(exc)
+        assert (
+            "boundary_raise_requires_explicit_raise_to_bb"
+            in str(exc)
+        )
     else:
         raise AssertionError(
-            "boundary RAISE must remain unsupported"
+            "historical RAISE without explicit sizing must fail"
         )
+
+    action = hand.add_boundary_action(
+        street="PREFLOP",
+        seat="villain",
+        action="RAISE",
+        raise_to_bb=10.0,
+        confidence=0.98,
+        source="deferred_inferred_action",
+    )
+
+    assert action.street == "PREFLOP"
+    assert action.action == "RAISE"
+    assert action.raise_to_bb == 10.0
+
+    assert hand.current_street == "FLOP"
+    assert hand.players_to_act == live_queue_before
+    assert hand.current_bet_bb == live_bet_before
+    assert hand.last_aggressor_seat == live_aggressor_before
 
 
 if __name__ == "__main__":
     test_old_street_fold_does_not_corrupt_live_street()
     test_old_street_call_updates_only_historical_commitment()
     test_boundary_promotion_is_idempotent()
-    test_boundary_raise_is_rejected()
+    test_boundary_raise_requires_explicit_sizing()
 
     print(
         "PASS boundary canonical promotion: "

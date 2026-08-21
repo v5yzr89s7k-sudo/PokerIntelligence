@@ -15,7 +15,8 @@ sys.path.insert(0, str(ROOT))
 from src.events.detectors.action_buttons_detector import action_buttons_visible
 from src.events.detectors.hero_turn_detector import HeroBlinkBuffer
 from src.events.detectors.seat_occupancy_detector import occupied_seats
-from src.events.local_event_detector import LocalEventDetector
+from src.events.local_event_detector import ChangeSet, LocalEventDetector
+from src.events.detectors.bet_region_detector import bet_region_occupancy
 from src.events.participant_evidence_collector import (
     ParticipantEvidenceCollector,
 )
@@ -43,6 +44,7 @@ from src.state.recent_stack_observations import (
 from src.vision.window_capture import find_acr_table_window, capture_window_crop
 from src.api.canonical_frame import to_canonical_frame
 from src.api.paced_replay_capture import PacedReplayCapture
+from src.capture.sck_frame_source import SCKFrameSource
 from src.vision.action_sequence_recorder import ActionSequenceRecorder
 from src.vision.winner_detector import detect_winner
 from src.vision.stack_reader import (
@@ -106,6 +108,7 @@ def collect_participant_evidence(
 
 
 EVENT_LOG = ROOT / "runtime/live/api_events.jsonl"
+COORDINATOR_TIMING = ROOT / "runtime/live/coordinator_timing.jsonl"
 COORD_STATE = ROOT / "runtime/live/api_event_coordinator_state.json"
 STATE_MACHINE_STATE = (
     ROOT / "runtime/live/api_event_state_machine_state.json"
@@ -131,6 +134,21 @@ HERO_REQUESTS = ROOT / "runtime/live/hero_requests.jsonl"
 HERO_RESULTS = ROOT / "runtime/live/hero_results.jsonl"
 POT_REQUESTS = ROOT / "runtime/live/pot_requests.jsonl"
 POT_RESULTS = ROOT / "runtime/live/pot_results.jsonl"
+BET_AMOUNT_REQUESTS = ROOT / "runtime/live/bet_amount_requests.jsonl"
+BET_AMOUNT_RESULTS = ROOT / "runtime/live/bet_amount_results.jsonl"
+
+STACK_REQUESTS = ROOT / "runtime/live/stack_requests.jsonl"
+STACK_RESULTS = ROOT / "runtime/live/stack_results.jsonl"
+
+# One semantic interval owns settled-stack timing everywhere:
+# initial settlement, retry scheduling, and deterministic replay
+# result visibility.
+STACK_SETTLE_SECONDS = 0.45
+
+# A missing board result may not monopolize board transport indefinitely.
+# This coordinator ownership deadline is intentionally separate from the
+# OpenAI client's lower-level network timeout.
+BOARD_REQUEST_TIMEOUT_SECONDS = 5.0
 
 BOUNDARY_STACK_REQUESTS = (
     ROOT / "runtime/live/boundary_stack_requests.jsonl"
@@ -160,11 +178,17 @@ def fresh_state():
         "hand_token": None,
         "board_request_id": None,
         "board_request_expected_len": None,
+        "board_request_ts": None,
         "hero_request_id": None,
         "hero_request_token": None,
         "hero_request_ts": None,
         "pot_request_id": None,
         "pot_request_ts": None,
+        "pot_request_purpose": None,
+        "pot_request_forced_baseline_bb": None,
+        "pending_bet_amount_requests": {},
+        "deferred_bet_amount_results": {},
+        "initial_bet_inventory_done": False,
         "last_valid_river_frame": None,
         "terminal_pot_pending": False,
         "terminal_pot_request_id": None,
@@ -179,6 +203,14 @@ def fresh_state():
         "last_local_board_count": 0,
         "last_local_hero_visible": False,
         "pending_stack_reads": {},
+        "pending_stack_worker_requests": {},
+        # Starting-stack OCR gets one immediate bootstrap attempt. Seats whose
+        # value remains ambiguous are retried incrementally from subsequent
+        # clean PREFLOP frames instead of waiting for a stack-motion event to
+        # accidentally recover their baseline.
+        "pending_startup_stack_seats": [],
+        "startup_stack_retry_index": 0,
+        "startup_stack_last_retry_ts": 0.0,
         "bootstrap_occupancy_diagnosed": False,
         "last_boundary_stack_request_key": None,
     }
@@ -364,6 +396,326 @@ def prechange_stack_observation(
     }
 
 
+def queue_one_startup_stack_async(
+    state,
+    frame_path,
+    *,
+    local_board_count=0,
+):
+    """
+    Non-blocking replacement for retry_one_startup_stack().
+
+    Queue at most one unresolved starting-stack baseline read. OCR executes
+    exclusively in api_stack_worker. No action semantics are created here.
+    """
+    if not state.get("hand_token"):
+        return state
+
+    if local_board_count not in (0, None):
+        return state
+
+    now = time.time()
+
+    last_attempt = float(
+        state.get(
+            "startup_stack_last_attempt_ts",
+            0.0,
+        )
+        or 0.0
+    )
+
+    if (
+        now - last_attempt
+        < 0.25
+    ):
+        return state
+
+    pending_transport = state.setdefault(
+        "pending_stack_worker_requests",
+        {},
+    )
+
+    # Never queue multiple startup-baseline OCR jobs concurrently.
+    if any(
+        item.get("purpose") == "baseline"
+        for item in pending_transport.values()
+    ):
+        return state
+
+    unresolved = list(
+        state.get("pending_startup_stack_seats")
+        or []
+    )
+
+    if not unresolved:
+        return state
+
+    seat = unresolved[0]
+
+    request_id = queue_stack_worker_request(
+        state,
+        seat=seat,
+        street=state.get(
+            "phase",
+            "PREFLOP",
+        ),
+        frame_path=str(frame_path or ""),
+        purpose="baseline",
+    )
+
+    if request_id:
+        state[
+            "startup_stack_last_attempt_ts"
+        ] = now
+
+        print(
+            "[STARTUP_STACK_ASYNC] queued",
+            f"seat={seat}",
+            f"request={request_id[:8]}",
+            flush=True,
+        )
+
+    return state
+
+
+def consume_startup_stack_worker_results(
+    state,
+    ready,
+):
+    """
+    Consume completed baseline OCR without creating a betting action.
+
+    Only trusted independent baseline evidence is allowed to promote the
+    starting-stack cache.
+    """
+    ready = dict(ready or {})
+
+    if not ready:
+        return state
+
+    retry_seats = list(
+        state.get("pending_startup_stack_seats")
+        or []
+    )
+
+    cache = state.setdefault(
+        "starting_stack_cache",
+        {},
+    )
+
+    for seat, item in ready.items():
+        request = item.get("request") or {}
+        result = item.get("result") or {}
+
+        if request.get("purpose") != "baseline":
+            continue
+
+        independent = dict(
+            result.get("independent") or {}
+        )
+
+        value = independent.get("stack_bb")
+        confidence = float(
+            independent.get("confidence")
+            or 0.0
+        )
+        votes = int(
+            independent.get("votes")
+            or 0
+        )
+
+        trusted = (
+            result.get("ok")
+            and value is not None
+            and confidence >= 0.90
+            and votes >= 2
+        )
+
+        if trusted:
+            cache[seat] = {
+                "stack_bb": float(value),
+                "stack_text": (
+                    independent.get("stack_text")
+                    or f"{float(value):g} BB"
+                ),
+                "confidence": confidence,
+                "votes": votes,
+                "mode": independent.get("mode"),
+                "source": "async_startup_stack",
+                "ts": result.get("ts")
+                or time.time(),
+            }
+
+            retry_seats = [
+                candidate
+                for candidate in retry_seats
+                if candidate != seat
+            ]
+
+            print(
+                "[STARTUP_STACK_ASYNC] accepted",
+                f"seat={seat}",
+                f"stack={float(value):.2f}",
+                f"confidence={confidence:.2f}",
+                f"votes={votes}",
+                flush=True,
+            )
+
+        else:
+            print(
+                "[STARTUP_STACK_ASYNC] retry",
+                f"seat={seat}",
+                f"value={value}",
+                f"confidence={confidence:.2f}",
+                f"votes={votes}",
+                flush=True,
+            )
+
+    state["pending_startup_stack_seats"] = (
+        retry_seats
+    )
+
+    return state
+
+
+def retry_one_startup_stack(
+    state,
+    img,
+    *,
+    local_board_count=0,
+):
+    """
+    Incrementally resolve one ambiguous starting stack from the current clean
+    PREFLOP frame.
+
+    This is perception-only recovery. It emits the existing trusted
+    stack_baseline_observation event; CanonicalHand remains the sole owner of
+    authoritative stack state.
+
+    Only one unresolved seat is attempted per eligible cycle so startup
+    recovery cannot turn into a serial OCR barrier on the live perception
+    path.
+    """
+    pending = list(
+        state.get("pending_startup_stack_seats")
+        or []
+    )
+
+    if not pending:
+        return state
+
+    if (
+        str(state.get("phase") or "WAITING").upper()
+        != "PREFLOP"
+    ):
+        return state
+
+    if int(local_board_count or 0) != 0:
+        return state
+
+    if state.get("terminal_action_frozen"):
+        return state
+
+    canonical_values = _canonical_stack_values()
+
+    # Retire seats that have already been resolved by the snapshot, a prior
+    # startup retry, or the ordinary action stack pipeline.
+    pending = [
+        seat
+        for seat in pending
+        if canonical_values.get(seat) is None
+    ]
+
+    state["pending_startup_stack_seats"] = pending
+
+    if not pending:
+        print(
+            "[STARTUP_STACK_RETRY] complete",
+            flush=True,
+        )
+        return state
+
+    now = time.time()
+
+    # Keep this deliberately paced. One local independent read every 250 ms
+    # is enough to sample changing render/antialias states without making
+    # stack OCR the coordinator's dominant hot-path cost.
+    last_retry_ts = float(
+        state.get("startup_stack_last_retry_ts")
+        or 0.0
+    )
+
+    if now - last_retry_ts < 0.25:
+        return state
+
+    index = int(
+        state.get("startup_stack_retry_index")
+        or 0
+    )
+
+    if index >= len(pending):
+        index = 0
+
+    seat = pending[index]
+
+    state["startup_stack_last_retry_ts"] = now
+
+    baseline = prechange_stack_observation(
+        img,
+        seat,
+    )
+
+    if baseline is None:
+        state["startup_stack_retry_index"] = (
+            (index + 1) % len(pending)
+        )
+
+        print(
+            "[STARTUP_STACK_RETRY] "
+            f"seat={seat} result=unresolved "
+            f"remaining={pending}",
+            flush=True,
+        )
+
+        return state
+
+    emit({
+        "type": "stack_baseline_observation",
+        "hand_token": state.get("hand_token"),
+        "seat": seat,
+        "observed_stack_bb": baseline[
+            "observed_stack_bb"
+        ],
+        "confidence": baseline["confidence"],
+        "votes": baseline["votes"],
+        "mode": baseline["mode"],
+        "origin_street": "PREFLOP",
+        "source": "startup_retry",
+    })
+
+    pending.pop(index)
+    state["pending_startup_stack_seats"] = pending
+
+    if pending:
+        state["startup_stack_retry_index"] = (
+            index % len(pending)
+        )
+    else:
+        state["startup_stack_retry_index"] = 0
+
+    print(
+        "[STARTUP_STACK_RESOLVED] "
+        f"seat={seat} "
+        f"stack={baseline['observed_stack_bb']:.2f} "
+        f"confidence={baseline['confidence']:.2f} "
+        f"votes={baseline['votes']} "
+        f"remaining={pending}",
+        flush=True,
+    )
+
+    return state
+
+
 def close_pending_stack_candidate(
     state,
     pending,
@@ -395,6 +747,438 @@ def close_pending_stack_candidate(
     return entry
 
 
+def emit_fast_actor_observations(
+    state,
+    changes,
+    *,
+    street=None,
+):
+    """
+    Publish seat-attributed local chronology evidence immediately.
+
+    This is intentionally independent of stack OCR, episode settlement,
+    action classification, and bet sizing. A confirmed bet-region appearance
+    proves that action has reached that seat.
+
+    Same-frame stack-motion seats are attached as conservative blockers so
+    chronology never skips through unresolved commitment evidence.
+    """
+    current_street = str(
+        street
+        or state.get("phase")
+        or "WAITING"
+    ).upper()
+
+    if current_street == "WAITING":
+        return
+
+    if state.get("terminal_action_frozen"):
+        return
+
+    actor_seats = list(dict.fromkeys(
+        getattr(changes, "bet_region_appeared", [])
+        or []
+    ))
+
+    if not actor_seats:
+        return
+
+    same_frame_blockers = list(dict.fromkeys(
+        getattr(changes, "stack_changed_seats", [])
+        or []
+    ))
+
+    for seat in actor_seats:
+        if not seat:
+            continue
+
+        emit({
+            "type": "actor_observed",
+            "hand_token": state.get("hand_token"),
+            "seat": seat,
+            "street": current_street,
+            "source": "bet_region_appeared",
+            "blocked_seats": same_frame_blockers,
+            "ts": time.time(),
+        })
+
+        print(
+            "[ACTOR_OBSERVED_EMIT] "
+            f"street={current_street} "
+            f"seat={seat} "
+            f"blocked={same_frame_blockers}",
+            flush=True,
+        )
+
+
+def emit_physical_actor_completions(
+    changes,
+    state,
+    *,
+    street=None,
+):
+    """
+    Publish neutral seat-specific physical completion evidence.
+
+    Opponent card disappearance proves that the seat's visible-card
+    state completed, but does not itself assign FOLD. The state
+    machine and betting-round tracker own chronological admission
+    and poker semantics.
+    """
+    current_street = str(
+        street
+        or state.get("phase")
+        or "WAITING"
+    ).upper()
+
+    if current_street == "WAITING":
+        return
+
+    if state.get("terminal_action_frozen"):
+        return
+
+    seats = list(dict.fromkeys(
+        getattr(
+            changes,
+            "opponent_hole_cards_disappeared_seats",
+            [],
+        )
+        or []
+    ))
+
+    for seat in seats:
+        if not seat or seat == "hero":
+            continue
+
+        emit({
+            "type": "physical_actor_completed",
+            "hand_token": state.get("hand_token"),
+            "seat": seat,
+            "street": current_street,
+            "source": "opponent_card_disappearance",
+            "evidence": [
+                "opponent_cards_visible_before",
+                "opponent_cards_absent_after",
+                "calibrated_acr_card_back",
+            ],
+            "ts": time.time(),
+        })
+
+        print(
+            "[PHYSICAL_ACTOR_EMIT] "
+            f"street={current_street} "
+            f"seat={seat}",
+            flush=True,
+        )
+
+
+def queue_stack_worker_request(
+    state,
+    *,
+    seat,
+    street,
+    frame_path,
+    purpose="settled",
+):
+    if not seat or not frame_path:
+        return None
+
+    # Settled stack transitions belong to an active canonical hand.
+    #
+    # A candidate may survive visually into the post-hand/reset frame, but
+    # once coordinator state is WAITING or the hand token is gone it must not
+    # create new quantitative transport carrying stale old-street semantics.
+    #
+    # Baseline/startup reads have a separate lifecycle and are intentionally
+    # not subject to this guard.
+    if (
+        str(purpose or "settled") == "settled"
+        and not state.get("hand_token")
+    ):
+        print(
+            "[STACK_WORKER] skip unowned settled request "
+            f"seat={seat} "
+            f"street={str(street or 'WAITING').upper()} "
+            f"phase={str(state.get('phase') or 'WAITING').upper()} "
+            "reason=no_hand_token",
+            flush=True,
+        )
+        return None
+
+    request_id = uuid.uuid4().hex
+
+    request = {
+        "type": "stack_request",
+        "request_id": request_id,
+        "hand_token": state.get("hand_token"),
+        "seat": seat,
+        "street": str(
+            street or "WAITING"
+        ).upper(),
+        "frame": str(frame_path),
+        "purpose": str(
+            purpose or "settled"
+        ),
+        "ts": time.time(),
+    }
+
+    append_jsonl(
+        STACK_REQUESTS,
+        request,
+    )
+
+    pending = state.setdefault(
+        "pending_stack_worker_requests",
+        {},
+    )
+
+    pending[request_id] = {
+        "seat": request["seat"],
+        "street": request["street"],
+        "frame": request["frame"],
+        "purpose": request["purpose"],
+        "hand_token": request["hand_token"],
+        "queued_ts": request["ts"],
+    }
+
+    log_latency(
+        "queued",
+        request_id=request_id,
+        worker="stack",
+        hand_token=request["hand_token"],
+        seat=request["seat"],
+        street=request["street"],
+        purpose=request["purpose"],
+        frame=request["frame"],
+    )
+
+    print(
+        "[STACK_WORKER] queued",
+        f"request={request_id[:8]}",
+        f"seat={seat}",
+        f"street={request['street']}",
+        f"purpose={request['purpose']}",
+        flush=True,
+    )
+
+    return request_id
+
+
+def find_stack_worker_result(request_id):
+    if (
+        not request_id
+        or not STACK_RESULTS.exists()
+    ):
+        return None
+
+    try:
+        lines = (
+            STACK_RESULTS
+            .read_text()
+            .splitlines()
+        )
+    except Exception:
+        return None
+
+    for raw in reversed(lines):
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+
+        if (
+            result.get("request_id")
+            == request_id
+        ):
+            return result
+
+    return None
+
+
+def collect_ready_stack_worker_results(
+    state,
+    *,
+    replay_frame_ts=None,
+    replay_records=None,
+    replay_eof=False,
+):
+    pending = state.setdefault(
+        "pending_stack_worker_requests",
+        {},
+    )
+
+    ready = {}
+
+    for request_id, request in list(
+        pending.items()
+    ):
+        result = find_stack_worker_result(
+            request_id
+        )
+
+        if result is None:
+            continue
+
+        # Live mode preserves immediate asynchronous result consumption.
+        #
+        # Deterministic replay is different: worker wall-clock completion may
+        # not choose the recorded frame on which candidate ownership mutates.
+        # A settled result becomes semantically visible only on the first
+        # recorded frame at/after the sampled frame's settlement deadline.
+        if (
+            replay_frame_ts is not None
+            and replay_records
+            and request.get("purpose") == "settled"
+        ):
+            seat = request.get("seat")
+
+            entry = (
+                state.get("pending_stack_reads")
+                or {}
+            ).get(seat) or {}
+
+            sample_ts = entry.get(
+                "last_stack_sample_ts"
+            )
+
+            if sample_ts is not None:
+                # A completed settled-stack result may become semantically
+                # visible only after BOTH:
+                #
+                #   1. the sampled frame has satisfied the quantitative
+                #      settlement interval, and
+                #   2. the physical candidate has itself stopped changing
+                #      for the same interval.
+                #
+                # Otherwise collect_ready_stack_worker_results() can retire
+                # durable transport ownership while the downstream stack
+                # processor is still required to skip the candidate on its
+                # last_change_ts settlement gate.
+                sample_release_deadline = (
+                    float(sample_ts)
+                    + STACK_SETTLE_SECONDS
+                )
+
+                last_change_ts = entry.get(
+                    "last_change_ts"
+                )
+
+                candidate_release_deadline = (
+                    float(last_change_ts)
+                    + STACK_SETTLE_SECONDS
+                    if last_change_ts is not None
+                    else sample_release_deadline
+                )
+
+                release_deadline = max(
+                    sample_release_deadline,
+                    candidate_release_deadline,
+                )
+
+                release_ts = None
+
+                for record in replay_records:
+                    record_ts = float(
+                        record["ts"]
+                    )
+
+                    if (
+                        record_ts
+                        + 1e-9
+                        >= release_deadline
+                    ):
+                        release_ts = record_ts
+                        break
+
+                # Ordinary replay may publish this completed result only
+                # on a recorded frame at or beyond the semantic release
+                # deadline.
+                #
+                # At replay EOF there may be no such later recorded frame.
+                # EOF owns that finite-work boundary: a completed result may
+                # proceed to the ordinary exact-request ownership checks
+                # below, but only when the recording truly contains no
+                # eligible semantic frame. This does not alter normal replay
+                # timing and is never used by live capture.
+                if release_ts is None:
+                    if not replay_eof:
+                        continue
+                elif (
+                    float(replay_frame_ts)
+                    + 1e-9
+                    < release_ts
+                ):
+                    continue
+
+        # Settled-stack transport may be retired only when the semantic
+        # candidate still owns this exact request. A completed worker result
+        # that cannot yet be acknowledged must remain durably transport-owned
+        # rather than disappearing between transport and candidate semantics.
+        if request.get("purpose") == "settled":
+            seat = request.get("seat")
+
+            entry = (
+                state.get("pending_stack_reads")
+                or {}
+            ).get(seat) or {}
+
+            expected_request_id = entry.get(
+                "stack_worker_request_id"
+            )
+
+            if (
+                expected_request_id
+                and expected_request_id != request_id
+            ):
+                continue
+
+        pending.pop(request_id, None)
+
+        current_token = state.get(
+            "hand_token"
+        )
+
+        if (
+            request.get("hand_token")
+            != current_token
+            or result.get("hand_token")
+            != current_token
+        ):
+            print(
+                "[STACK_WORKER] ignored stale result",
+                f"request={request_id[:8]}",
+                flush=True,
+            )
+            continue
+
+        seat = request.get("seat")
+
+        if not seat:
+            continue
+
+        log_latency(
+            "coordinator_consumed",
+            request_id=request_id,
+            worker="stack",
+            hand_token=current_token,
+            seat=seat,
+            street=request.get("street"),
+            purpose=request.get("purpose"),
+            ok=result.get("ok"),
+            elapsed_ms=result.get(
+                "elapsed_ms"
+            ),
+        )
+
+        ready[seat] = {
+            "request_id": request_id,
+            "request": request,
+            "result": result,
+        }
+
+    return ready
+
+
 def enrich_stack_change_measurements(
     changes,
     img,
@@ -404,9 +1188,14 @@ def enrich_stack_change_measurements(
     prior_occupied_bet_regions=None,
     prior_commitment_seats=None,
     event_street=None,
+    old_street_owing_seats=None,
     recent_stack_observations=None,
     frame_path="",
     frame_ts=None,
+    stack_worker_results=None,
+    queue_stack_ocr=False,
+    replay_records=None,
+    replay_eof=False,
 ):
     """
     Convert noisy stack-region movement into one settled quantitative
@@ -416,8 +1205,21 @@ def enrich_stack_change_measurements(
     STACK_SETTLE_SECONDS. Only then is that seat OCR-read and published as
     a STACK_CHANGED observation.
     """
-    now = time.time()
-    settle_seconds = 0.45
+    # Stack settlement is poker-semantic timing.
+    #
+    # Live mode falls back to wall time. Deterministic replay supplies the
+    # recorded timestamp of the current frame so CPU/API latency cannot change
+    # which replay frame crosses the settlement threshold.
+    now = (
+        float(frame_ts)
+        if frame_ts is not None
+        else time.time()
+    )
+    settle_seconds = STACK_SETTLE_SECONDS
+
+    stack_worker_results = dict(
+        stack_worker_results or {}
+    )
     minimum_delta_bb = 0.05
 
     prior_occupied_bet_regions = set(
@@ -425,6 +1227,10 @@ def enrich_stack_change_measurements(
     )
     prior_commitment_seats = set(
         prior_commitment_seats or []
+    )
+
+    old_street_owing_seats = set(
+        old_street_owing_seats or []
     )
 
     # Quantitative stack transitions must be supported by at least two
@@ -529,12 +1335,21 @@ def enrich_stack_change_measurements(
                 "last_change_ts": now,
                 "max_mean_diff": 0.0,
                 # Street belongs to candidate onset, not eventual OCR
-                # settlement time. event_street may provisionally lead the
-                # API-confirmed canonical phase when a valid local board is
-                # already visible.
+                # settlement time. Local board visibility may provisionally
+                # lead canonical confirmation for genuinely new next-street
+                # actions. However, a seat that still owes action on the
+                # confirmed old street must remain attached to that old street
+                # across the visual boundary.
                 "origin_street": (
-                    event_street
-                    or state.get("phase", "WAITING")
+                    str(
+                        state.get("phase")
+                        or "WAITING"
+                    ).upper()
+                    if seat in old_street_owing_seats
+                    else (
+                        event_street
+                        or state.get("phase", "WAITING")
+                    )
                 ),
                 "trigger_sources": [],
             },
@@ -545,11 +1360,46 @@ def enrich_stack_change_measurements(
         if seat in raw_changed_seats:
             sources.add("stack_motion")
 
+        fresh_commitment_evidence = bool(
+            seat in bet_evidence_seats
+            and "bet_region_appeared" not in sources
+        )
+
         if seat in bet_evidence_seats:
             sources.add("bet_region_appeared")
 
         entry["trigger_sources"] = sorted(sources)
         entry["last_change_ts"] = now
+
+        # A candidate may begin from weak stack-motion evidence before chips
+        # are actually committed. If stronger same-street bet-region evidence
+        # arrives later, any retry frame selected from the earlier physical
+        # episode is stale. Preserve candidate identity/street ownership, but
+        # restart settlement scheduling from this newer commitment evidence.
+        if (
+            not is_new_candidate
+            and fresh_commitment_evidence
+        ):
+            entry.pop(
+                "retry_not_before_ts",
+                None,
+            )
+            entry.pop(
+                "retry_frame_path",
+                None,
+            )
+            entry.pop(
+                "retry_frame_ts",
+                None,
+            )
+
+            print(
+                "[STACK_CANDIDATE_REARM] "
+                f"seat={seat} "
+                f"street={entry.get('origin_street')} "
+                "reason=fresh_commitment_evidence",
+                flush=True,
+            )
 
         if is_new_candidate:
             print(
@@ -593,7 +1443,16 @@ def enrich_stack_change_measurements(
     proposed_transitions = []
 
     for seat, entry in list(pending.items()):
-        if now - float(entry["last_change_ts"]) < settle_seconds:
+        eof_completed_result = bool(
+            replay_eof
+            and seat in stack_worker_results
+        )
+
+        if (
+            now - float(entry["last_change_ts"])
+            < settle_seconds
+            and not eof_completed_result
+        ):
             continue
 
         # A quantitative transition requires a trusted prior value from
@@ -671,15 +1530,152 @@ def enrich_stack_change_measurements(
         )
 
         if not region:
-            close_pending_stack_candidate(state, pending, seat)
+            close_pending_stack_candidate(
+                state,
+                pending,
+                seat,
+            )
             continue
 
-        crop = _crop_geometry_region(img, region)
-        if crop.size == 0:
-            close_pending_stack_candidate(state, pending, seat)
-            continue
+        crop = None
 
-        reading = read_stack(crop)
+        if queue_stack_ocr:
+            worker_item = stack_worker_results.pop(
+                seat,
+                None,
+            )
+
+            if worker_item is None:
+                # A request is already running. Never execute OCR or queue
+                # duplicate work while capture continues.
+                if entry.get("stack_worker_request_id"):
+                    continue
+
+                # Replay/live semantic retry gate.
+                #
+                # Worker completion may indicate that another quantitative
+                # sample is needed, but completion latency must not itself
+                # choose when the next sample is published. The candidate
+                # carries an explicit semantic deadline.
+                retry_not_before_ts = entry.get(
+                    "retry_not_before_ts"
+                )
+
+                if (
+                    retry_not_before_ts is not None
+                    and now < float(retry_not_before_ts)
+                ):
+                    continue
+
+                request_frame_path = frame_path
+                request_frame_ts = now
+
+                retry_frame_path = entry.get(
+                    "retry_frame_path"
+                )
+                retry_frame_ts = entry.get(
+                    "retry_frame_ts"
+                )
+
+                if (
+                    replay_records
+                    and retry_frame_path
+                    and retry_frame_ts is not None
+                ):
+                    request_frame_path = str(
+                        retry_frame_path
+                    )
+                    request_frame_ts = float(
+                        retry_frame_ts
+                    )
+
+                request_id = queue_stack_worker_request(
+                    state,
+                    seat=seat,
+                    street=entry.get(
+                        "origin_street",
+                        state.get("phase", "WAITING"),
+                    ),
+                    frame_path=request_frame_path,
+                    purpose="settled",
+                )
+
+                if request_id:
+                    entry["stack_worker_request_id"] = (
+                        request_id
+                    )
+                    entry["last_stack_sample_ts"] = (
+                        request_frame_ts
+                    )
+                    entry.pop(
+                        "retry_not_before_ts",
+                        None,
+                    )
+                    entry.pop(
+                        "retry_frame_path",
+                        None,
+                    )
+                    entry.pop(
+                        "retry_frame_ts",
+                        None,
+                    )
+
+                continue
+
+            result = worker_item.get("result") or {}
+
+            expected_request_id = entry.get(
+                "stack_worker_request_id"
+            )
+
+            if (
+                expected_request_id
+                and worker_item.get("request_id")
+                != expected_request_id
+            ):
+                # Obsolete result from an earlier attempt.
+                continue
+
+            entry.pop(
+                "stack_worker_request_id",
+                None,
+            )
+
+            if result.get("ok"):
+                reading = dict(
+                    result.get("reading") or {}
+                )
+                independent = dict(
+                    result.get("independent") or {}
+                )
+            else:
+                reading = {}
+                independent = {}
+
+        else:
+            # Legacy synchronous mode remains available to the existing
+            # focused settlement regressions. Production main() will never
+            # use this branch.
+            crop = _crop_geometry_region(
+                img,
+                region,
+            )
+
+            if crop.size == 0:
+                close_pending_stack_candidate(
+                    state,
+                    pending,
+                    seat,
+                )
+                continue
+
+            reading = read_stack(crop)
+            independent = (
+                read_stack_independent_consensus(
+                    crop
+                )
+                or {}
+            )
 
         # Resolve competing OCR candidates against the last trusted
         # canonical stack.
@@ -700,10 +1696,6 @@ def enrich_stack_change_measurements(
         # whether continuity resolution is needed. Previously the >=2
         # candidate gate considered only ordinary OCR, so a reliable
         # independent fallback could never make the resolver eligible.
-        independent = read_stack_independent_consensus(
-            crop
-        )
-
         independent_value = independent.get(
             "stack_bb"
         )
@@ -924,6 +1916,11 @@ def enrich_stack_change_measurements(
                     flush=True,
                 )
 
+        # Default for all result paths, including OCR failure.
+        # The value is refined later only for trusted no_stack_change
+        # results backed by physical candidate evidence.
+        unchanged_physical_candidate = False
+
         current = reading.get("stack_bb")
         confidence = float(
             reading.get("confidence")
@@ -953,7 +1950,11 @@ def enrich_stack_change_measurements(
 
 
             # Persist failed Hero OCR crops for inspection.
-            if seat == "hero":
+            if (
+                seat == "hero"
+                and crop is not None
+                and getattr(crop, "size", 0)
+            ):
                 out = ROOT / "runtime" / "stack_debug"
                 out.mkdir(parents=True, exist_ok=True)
 
@@ -979,6 +1980,7 @@ def enrich_stack_change_measurements(
                 f"confidence={confidence:.2f} "
                 f"votes={votes} "
                 f"attempt={attempts} "
+                f"unchanged_physical={unchanged_physical_candidate} "
                 f"retrying={retrying}",
                 flush=True,
             )
@@ -1026,15 +2028,75 @@ def enrich_stack_change_measurements(
         )
 
         if validation.decision != STACK_ACCEPT:
-            attempts = int(entry.get("validation_attempts") or 0) + 1
-            entry["validation_attempts"] = attempts
+            trigger_sources = set(
+                entry.get("trigger_sources") or []
+            )
+
+            # A trusted unchanged stack is not a failed validation attempt
+            # while a physically evidenced candidate is still developing.
+            #
+            # The visual transition may precede the numeric stack display by
+            # several frames. Consuming validation_attempts here can exhaust
+            # the candidate before the post-action stack is ever sampled.
+            #
+            # Keep sampling newer frames. Genuine validation failures still
+            # consume the bounded retry budget below.
+            unchanged_physical_candidate = bool(
+                validation.reason == "no_stack_change"
+                and bool(
+                    {
+                        "stack_motion",
+                        "bet_region_appeared",
+                    }
+                    & trigger_sources
+                )
+            )
+
+            if unchanged_physical_candidate:
+                last_sample_ts = entry.get(
+                    "last_stack_sample_ts"
+                )
+
+                if last_sample_ts is not None:
+                    retry_not_before_ts = (
+                        float(last_sample_ts)
+                        + settle_seconds
+                    )
+
+                    entry["retry_not_before_ts"] = (
+                        retry_not_before_ts
+                    )
+
+                    if replay_records:
+                        target_record = next(
+                            (
+                                record
+                                for record in replay_records
+                                if float(record["ts"])
+                                >= retry_not_before_ts
+                            ),
+                            None,
+                        )
+
+                        if target_record is not None:
+                            entry["retry_frame_path"] = str(
+                                target_record["frame_path"]
+                            )
+                            entry["retry_frame_ts"] = float(
+                                target_record["ts"]
+                            )
+
+            attempts = int(
+                entry.get("validation_attempts")
+                or 0
+            )
+
+            if not unchanged_physical_candidate:
+                attempts += 1
+                entry["validation_attempts"] = attempts
 
             pending_age = (
                 now - float(entry.get("first_change_ts") or now)
-            )
-
-            trigger_sources = set(
-                entry.get("trigger_sources") or []
             )
 
             # Physical visual evidence can lead the displayed stack update.
@@ -1058,13 +2120,28 @@ def enrich_stack_change_measurements(
                 )
             )
 
+            # In asynchronous OCR mode, worker queue/execution latency must
+            # not consume the semantic lifetime of a physically evidenced
+            # stack candidate. Otherwise an unchanged first read can arrive
+            # after maximum_pending_seconds and kill the candidate before a
+            # newer post-action frame is ever sampled.
+            #
+            # The retry count remains the hard safety bound.
+            within_lifetime = bool(
+                queue_stack_ocr
+                or pending_age < maximum_pending_seconds
+            )
+
             retrying = bool(
                 (
                     validation.decision != STACK_REJECT
                     or physical_candidate_pending
                 )
-                and attempts < maximum_ocr_attempts
-                and pending_age < maximum_pending_seconds
+                and (
+                    unchanged_physical_candidate
+                    or attempts < maximum_ocr_attempts
+                )
+                and within_lifetime
             )
 
             if not retrying:
@@ -1249,7 +2326,6 @@ def enrich_stack_change_measurements(
 
             settled_details[seat] = measurement
             settled_seats.append(seat)
-            close_pending_stack_candidate(state, pending, seat)
 
             print(
                 "[STACK_PIPELINE]",
@@ -1266,6 +2342,11 @@ def enrich_stack_change_measurements(
                 flush=True,
             )
 
+            # Publish the quantitative disposition before releasing the
+            # chronology blocker. stack_candidate_closed causes the state
+            # machine to replay preserved later-actor observations, so closing
+            # first can fabricate a passive action for this seat before its
+            # real commitment reaches canonical state.
             emit({
                 "type": "stack_update",
                 "seat": seat,
@@ -1277,6 +2358,13 @@ def enrich_stack_change_measurements(
                 "stack_read_mode": measurement.get("stack_read_mode"),
                 "stack_text": measurement.get("stack_text"),
             })
+
+            close_pending_stack_candidate(
+                state,
+                pending,
+                seat,
+                reason="validated_stack_transition",
+            )
 
             print(
                 f"[STACK_TRANSITION] seat={seat} "
@@ -1291,6 +2379,60 @@ def enrich_stack_change_measurements(
     # only settled, quantitative stack transitions.
     changes.stack_changed_seats = settled_seats
     changes.stack_change_details = settled_details
+
+
+def process_stack_change_measurements_async(
+    changes,
+    img,
+    state,
+    *,
+    stack_worker_results=None,
+    prechange_image=None,
+    prior_occupied_bet_regions=None,
+    prior_commitment_seats=None,
+    event_street=None,
+    old_street_owing_seats=None,
+    recent_stack_observations=None,
+    frame_path="",
+    frame_ts=None,
+    replay_records=None,
+    replay_eof=False,
+):
+    """
+    Production stack-settlement path.
+
+    Candidate timing and semantic validation remain in the coordinator,
+    but pixel OCR is exclusively performed by api_stack_worker.
+    """
+    ready = dict(
+        stack_worker_results or {}
+    )
+
+    return enrich_stack_change_measurements(
+        changes,
+        img,
+        state,
+        prechange_image=prechange_image,
+        prior_occupied_bet_regions=(
+            prior_occupied_bet_regions
+        ),
+        prior_commitment_seats=(
+            prior_commitment_seats
+        ),
+        event_street=event_street,
+        old_street_owing_seats=(
+            old_street_owing_seats
+        ),
+        recent_stack_observations=(
+            recent_stack_observations
+        ),
+        frame_path=frame_path,
+        frame_ts=frame_ts,
+        stack_worker_results=ready,
+        queue_stack_ocr=True,
+        replay_records=replay_records,
+        replay_eof=replay_eof,
+    )
 
 
 def load_table_context():
@@ -1452,6 +2594,7 @@ def parse_tournament_level(title):
 
 
 _PACED_REPLAY = None
+_SCK_FRAME_SOURCE = None
 
 
 def _paced_replay():
@@ -1497,6 +2640,39 @@ def _paced_replay():
         )
 
     return _PACED_REPLAY
+
+
+def capture_sck_live():
+    global _SCK_FRAME_SOURCE
+
+    if _SCK_FRAME_SOURCE is None:
+        _SCK_FRAME_SOURCE = SCKFrameSource()
+        _SCK_FRAME_SOURCE.connect()
+
+        print(
+            "[SCK_CAPTURE] connected persistent "
+            "934x696 in-memory frame source",
+            flush=True,
+        )
+
+    img = _SCK_FRAME_SOURCE.read()
+
+    if img is None or img.size == 0:
+        return None, None
+
+    if img.shape[:2] != (696, 934):
+        raise RuntimeError(
+            "unexpected SCK frame shape "
+            f"{img.shape}; expected (696, 934, 3)"
+        )
+
+    # Phase B contract:
+    # ScreenCaptureKit acquisition is memory-only.
+    #
+    # Ordinary perception samples must never touch disk. A stable PNG
+    # is materialized lazily only when an asynchronous worker requires
+    # ownership of this exact frame.
+    return img, None
 
 
 def capture():
@@ -1638,6 +2814,59 @@ def maybe_emit_hero_decision(state, visible, hero_visible):
         state["hero_decision_active"] = False
 
     return state
+
+
+def materialize_worker_frame(
+    img,
+    *,
+    purpose,
+    request_id=None,
+):
+    """
+    Persist one immutable canonical frame for asynchronous worker ownership.
+
+    SCK acquisition remains entirely in memory. Disk I/O occurs only when a
+    worker actually requires a filesystem path. Every materialization receives
+    a unique filename so a later SCK sample can never overwrite pixels owned
+    by an in-flight request.
+    """
+    if img is None or img.size == 0:
+        return None
+
+    CAPTURE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    token = (
+        str(request_id or uuid.uuid4().hex)
+        .replace("/", "_")
+        .replace(" ", "_")
+    )
+
+    safe_purpose = (
+        str(purpose or "worker")
+        .replace("/", "_")
+        .replace(" ", "_")
+    )
+
+    frame_path = (
+        CAPTURE_DIR
+        / f"acr_table_sck_{safe_purpose}_{token}.png"
+    )
+
+    ok = cv2.imwrite(
+        str(frame_path),
+        img,
+    )
+
+    if not ok:
+        raise RuntimeError(
+            "could not materialize SCK worker frame "
+            f"{frame_path}"
+        )
+
+    return frame_path
 
 
 def queue_hero_request(state, frame):
@@ -1893,6 +3122,11 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
                 "source_request_id": pending_id,
                 "hand_token": request_token,
                 "canonical_frame": result.get("canonical_frame"),
+                # Hand-start physical occupancy owns poker topology.
+                # Card-back participant evidence remains diagnostic only;
+                # an early fold may already have removed visible card backs.
+                "roster_seats": list(starting_roster_seats),
+                "dealt_in_seats": list(starting_roster_seats),
             })
             state["snapshot_cached"] = True
 
@@ -1919,11 +3153,38 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
             stack_reader=read_stack,
         )
 
+        unresolved_startup_stacks = [
+            player.get("seat")
+            for player in local_players
+            if (
+                player.get("seat")
+                and player.get("stack_bb") is None
+            )
+        ]
+
+        state["pending_startup_stack_seats"] = list(
+            dict.fromkeys(unresolved_startup_stacks)
+        )
+        state["startup_stack_retry_index"] = 0
+        state["startup_stack_last_retry_ts"] = 0.0
+
+        if unresolved_startup_stacks:
+            print(
+                "[STARTUP_STACK_PENDING] "
+                f"seats={unresolved_startup_stacks}",
+                flush=True,
+            )
+
         participant_evidence = (
             PARTICIPANT_COLLECTOR.snapshot()
         )
 
-        if frozen_participants:
+        # Hand-start physical occupancy owns immutable poker topology.
+        #
+        # Card-back evidence remains useful diagnostic evidence, but it may
+        # already be narrower after an immediate fold and therefore must not
+        # remove a starting player from positions or action chronology.
+        if starting_roster_seats:
             emit({
                 "type": "table_context",
                 "hand_token": request_token,
@@ -1931,8 +3192,10 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
                     participant_evidence.get("frame_count")
                     or 0
                 ),
+                "roster_seats": list(starting_roster_seats),
+                "dealt_in_seats": list(starting_roster_seats),
+                "card_back_dealt_in_seats": list(frozen_participants),
                 "dealer_button_seat": dealer["dealer_button_seat"],
-                "dealt_in_seats": frozen_participants,
                 "positions": positions,
                 "hero_position": positions.get(
                     "hero",
@@ -2155,6 +3418,7 @@ def queue_board_request(state, expected_len, frame):
 
     state["board_request_id"] = request_id
     state["board_request_expected_len"] = expected_len
+    state["board_request_ts"] = queued_ts
 
     print(
         f"[BOARD] queued request={request_id[:8]} "
@@ -2294,21 +3558,60 @@ def maybe_read_board(state, count, frame):
         result = find_board_result(pending_id)
 
         if result is None:
+            request_ts = state.get(
+                "board_request_ts"
+            )
+            now = time.time()
+
+            pending_seconds = (
+                now - float(request_ts)
+                if request_ts is not None
+                else 0.0
+            )
+
+            if (
+                request_ts is None
+                or pending_seconds
+                < BOARD_REQUEST_TIMEOUT_SECONDS
+            ):
+                return state
+
+            print(
+                "[BOARD] pending request timed out "
+                f"request={pending_id[:8]} "
+                f"after={pending_seconds:.1f}s",
+                flush=True,
+            )
+
+            # Retire coordinator ownership only. Any late result from this
+            # request is no longer authoritative. Current local board
+            # perception may immediately queue replacement work.
+            state["board_request_id"] = None
+            state["board_request_expected_len"] = None
+            state["board_request_ts"] = None
+
+        else:
+            log_latency(
+                "coordinator_consumed",
+                request_id=pending_id,
+                worker="board",
+                ok=result.get("ok"),
+                elapsed_ms=result.get("elapsed_ms"),
+                expected_len=result.get("expected_len"),
+            )
+
+            state, _ = apply_board_result(
+                state,
+                result,
+            )
+
+            state["board_request_ts"] = None
             return state
 
-        log_latency(
-            "coordinator_consumed",
-            request_id=pending_id,
-            worker="board",
-            ok=result.get("ok"),
-            elapsed_ms=result.get("elapsed_ms"),
-            expected_len=result.get("expected_len"),
-        )
-
-        state, _ = apply_board_result(state, result)
-        return state
-
-    confirmed = state.get("confirmed_board_len", 0)
+    confirmed = state.get(
+        "confirmed_board_len",
+        0,
+    )
 
     if count not in (3, 4, 5):
         return state
@@ -2316,22 +3619,513 @@ def maybe_read_board(state, count, frame):
     if count <= confirmed:
         return state
 
-    expected_next = 3 if confirmed == 0 else confirmed + 1
+    expected_next = (
+        3
+        if confirmed == 0
+        else confirmed + 1
+    )
 
     if expected_next not in (3, 4, 5):
         return state
 
     now = time.time()
-    last_attempt = state.get("last_api_attempt_ts", 0)
+
+    last_attempt = state.get(
+        "last_api_attempt_ts",
+        0,
+    )
 
     if now - last_attempt < 1.25:
         return state
 
     state["last_api_attempt_ts"] = now
-    return queue_board_request(state, expected_next, frame)
+
+    return queue_board_request(
+        state,
+        expected_next,
+        frame,
+    )
 
 
-def queue_pot_request(state, frame):
+
+def queue_initial_bet_inventory(
+    state,
+    frame,
+    frame_path,
+):
+    """
+    Recover opponent wagers that are already visible when observation begins.
+
+    Static geometry is only the gating signal. Exact numeric sizing remains
+    asynchronous API perception.
+
+    Hero is deliberately excluded because Hero cards/UI contaminate the Hero
+    bet ROI at hand start.
+    """
+    if state.get("initial_bet_inventory_done"):
+        return state
+
+    # One-shot by contract. Even a malformed frame must not schedule this
+    # continuously on every capture.
+    state["initial_bet_inventory_done"] = True
+
+    if frame is None or frame.size == 0:
+        print(
+            "[BET_INITIAL_INVENTORY] "
+            "skipped reason=empty_frame",
+            flush=True,
+        )
+        return state
+
+    if not state.get("hand_token"):
+        print(
+            "[BET_INITIAL_INVENTORY] "
+            "skipped reason=no_hand_token",
+            flush=True,
+        )
+        return state
+
+    try:
+        canonical = to_canonical_frame(
+            frame,
+            GEOM,
+        )
+
+        static = bet_region_occupancy(
+            canonical,
+            GEOM,
+            baseline=None,
+        )
+
+    except Exception as exc:
+        print(
+            "[BET_INITIAL_INVENTORY] "
+            f"failed error={exc}",
+            flush=True,
+        )
+        return state
+
+    queued = []
+
+    for seat, info in static.items():
+        # Hero static occupancy is known to be contaminated by cards/UI.
+        if seat == "hero":
+            continue
+
+        if not bool(
+            (info or {}).get(
+                "legacy_occupied",
+                False,
+            )
+        ):
+            continue
+
+        state = queue_bet_amount_request(
+            state,
+            frame_path,
+            seat,
+            "PREFLOP",
+            source="initial_inventory",
+        )
+
+        queued.append(seat)
+
+    print(
+        "[BET_INITIAL_INVENTORY] "
+        f"queued={queued}",
+        flush=True,
+    )
+
+    return state
+
+
+def queue_bet_amount_request(
+    state,
+    frame,
+    seat,
+    street,
+    source="transition",
+):
+    """
+    Queue an asynchronous absolute visible-bet read.
+
+    This is perception evidence only. It does not classify the
+    poker action and does not mutate CanonicalHand.
+    """
+    if frame is None or not seat:
+        return state
+
+    request_id = uuid.uuid4().hex
+
+    request = {
+        "type": "bet_amount_request",
+        "request_id": request_id,
+        "hand_token": state.get("hand_token"),
+        "seat": seat,
+        "street": str(
+            street
+            or state.get("phase")
+            or "UNKNOWN"
+        ).upper(),
+        "frame": str(frame),
+        "source": str(source or "transition"),
+        "ts": time.time(),
+    }
+
+    append_jsonl(
+        BET_AMOUNT_REQUESTS,
+        request,
+    )
+
+    pending = state.setdefault(
+        "pending_bet_amount_requests",
+        {},
+    )
+
+    pending[request_id] = {
+        "seat": request["seat"],
+        "street": request["street"],
+        "frame": request["frame"],
+        "source": request["source"],
+        "queued_ts": request["ts"],
+    }
+
+    log_latency(
+        "queued",
+        request_id=request_id,
+        worker="bet_amount",
+        hand_token=request["hand_token"],
+        seat=request["seat"],
+        street=request["street"],
+        frame=request["frame"],
+    )
+
+    print(
+        "[BET_AMOUNT] queued",
+        f"request={request_id[:8]}",
+        f"seat={request['seat']}",
+        f"street={request['street']}",
+        f"source={request['source']}",
+        flush=True,
+    )
+
+    return state
+
+
+def find_bet_amount_result(request_id):
+    if (
+        not request_id
+        or not BET_AMOUNT_RESULTS.exists()
+    ):
+        return None
+
+    try:
+        lines = (
+            BET_AMOUNT_RESULTS
+            .read_text()
+            .splitlines()
+        )
+    except Exception:
+        return None
+
+    for line in reversed(lines):
+        try:
+            result = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        if (
+            result.get("request_id")
+            == request_id
+        ):
+            return result
+
+    return None
+
+
+def emit_bet_amount_observation(
+    state,
+    request_id,
+    request,
+    result,
+    bet_bb,
+):
+    current_token = state.get("hand_token")
+
+    emit({
+        "type": "bet_amount_observation",
+        "hand_token": current_token,
+        "seat": result.get("seat"),
+        "street": result.get("street"),
+        "bet_bb": round(float(bet_bb), 2),
+        "source": request.get(
+            "source",
+            "transition",
+        ),
+        "source_request_id": request_id,
+        "frame": result.get("frame"),
+        "elapsed_ms": result.get(
+            "elapsed_ms"
+        ),
+        "ts": result.get("ts")
+        or time.time(),
+    })
+
+    log_latency(
+        "coordinator_consumed",
+        request_id=request_id,
+        worker="bet_amount",
+        hand_token=current_token,
+        seat=result.get("seat"),
+        street=result.get("street"),
+        ok=True,
+        elapsed_ms=result.get("elapsed_ms"),
+    )
+
+    print(
+        "[BET_AMOUNT] observed",
+        f"seat={result.get('seat')}",
+        f"street={result.get('street')}",
+        f"bet={float(bet_bb):.2f}",
+        f"request={request_id[:8]}",
+        f"source={request.get('source', 'transition')}",
+        flush=True,
+    )
+
+
+def release_corroborated_bet_amount_results(
+    state,
+    changes,
+):
+    """
+    Release deferred transition-sourced absolute bet reads only after the
+    quantitative stack pipeline confirms that the same seat actually
+    committed chips on the same street.
+
+    This does not perform poker-action classification. It validates only
+    that the local visual transition corresponded to a real chip commitment.
+    """
+    deferred = state.setdefault(
+        "deferred_bet_amount_results",
+        {},
+    )
+
+    if not deferred:
+        return state
+
+    details = dict(
+        getattr(
+            changes,
+            "stack_change_details",
+            {},
+        )
+        or {}
+    )
+
+    confirmed_seats = set(
+        getattr(
+            changes,
+            "stack_changed_seats",
+            [],
+        )
+        or []
+    )
+
+    if not confirmed_seats:
+        return state
+
+    for request_id, item in list(deferred.items()):
+        seat = item.get("seat")
+
+        if seat not in confirmed_seats:
+            continue
+
+        detail = details.get(seat) or {}
+
+        try:
+            delta_bb = float(
+                detail.get("delta_bb")
+            )
+        except (TypeError, ValueError):
+            continue
+
+        if delta_bb <= 0.0:
+            continue
+
+        result = item.get("result") or {}
+        request = item.get("request") or {}
+
+        result_street = str(
+            result.get("street")
+            or request.get("street")
+            or ""
+        ).upper()
+
+        stack_street = str(
+            detail.get("origin_street")
+            or ""
+        ).upper()
+
+        if (
+            result_street
+            and stack_street
+            and result_street != stack_street
+        ):
+            continue
+
+        if (
+            request.get("hand_token")
+            != state.get("hand_token")
+        ):
+            deferred.pop(request_id, None)
+
+            print(
+                "[BET_AMOUNT] retired deferred result "
+                "reason=hand_changed "
+                f"request={request_id[:8]}",
+                flush=True,
+            )
+            continue
+
+        emit_bet_amount_observation(
+            state,
+            request_id,
+            request,
+            result,
+            item["bet_bb"],
+        )
+
+        deferred.pop(request_id, None)
+
+        print(
+            "[BET_AMOUNT] corroborated",
+            f"seat={seat}",
+            f"street={result_street}",
+            f"delta={delta_bb:.2f}",
+            f"request={request_id[:8]}",
+            flush=True,
+        )
+
+    return state
+
+
+def apply_bet_amount_result(
+    state,
+    result,
+):
+    request_id = result.get("request_id")
+
+    pending = state.setdefault(
+        "pending_bet_amount_requests",
+        {},
+    )
+
+    request = pending.pop(
+        request_id,
+        None,
+    )
+
+    if request is None:
+        return state, False
+
+    result_token = result.get("hand_token")
+    current_token = state.get("hand_token")
+
+    if (
+        not current_token
+        or not result_token
+        or result_token != current_token
+    ):
+        print(
+            "[BET_AMOUNT] ignored stale result "
+            "from another hand",
+            flush=True,
+        )
+        return state, False
+
+    if not result.get("ok"):
+        print(
+            "[BET_AMOUNT] worker result failed",
+            f"seat={result.get('seat')}",
+            f"street={result.get('street')}",
+            f"error={result.get('error') or 'unknown'}",
+            flush=True,
+        )
+        return state, False
+
+    try:
+        bet_bb = float(
+            result.get("bet_bb")
+        )
+    except (TypeError, ValueError):
+        print(
+            "[BET_AMOUNT] invalid numeric result",
+            f"value={result.get('bet_bb')!r}",
+            flush=True,
+        )
+        return state, False
+
+    if not 0.0 < bet_bb <= 1000.0:
+        print(
+            "[BET_AMOUNT] result out of range",
+            f"value={bet_bb}",
+            flush=True,
+        )
+        return state, False
+
+    source = str(
+        request.get("source")
+        or "transition"
+    )
+
+    # The initial inventory deliberately recovers wagers that were already
+    # present when observation began. No stack transition is guaranteed to
+    # remain observable, so a valid numeric API read is sufficient there.
+    if source == "initial_inventory":
+        emit_bet_amount_observation(
+            state,
+            request_id,
+            request,
+            result,
+            bet_bb,
+        )
+        return state, True
+
+    # Transition-sourced reads are provisional until the independent stack
+    # pipeline confirms a positive commitment by this seat. A bet-region
+    # appearance alone is not trustworthy enough to publish numeric evidence.
+    deferred = state.setdefault(
+        "deferred_bet_amount_results",
+        {},
+    )
+
+    deferred[request_id] = {
+        "request": dict(request),
+        "result": dict(result),
+        "bet_bb": round(bet_bb, 2),
+        "seat": result.get("seat"),
+        "street": result.get("street"),
+    }
+
+    print(
+        "[BET_AMOUNT] deferred",
+        f"seat={result.get('seat')}",
+        f"street={result.get('street')}",
+        f"bet={bet_bb:.2f}",
+        f"request={request_id[:8]}",
+        "reason=awaiting_stack_corroboration",
+        flush=True,
+    )
+
+    return state, True
+
+
+def queue_pot_request(
+    state,
+    frame,
+    purpose="observation",
+    forced_pot_baseline_bb=None,
+):
     if frame is None:
         return state
 
@@ -2347,6 +4141,14 @@ def queue_pot_request(state, frame):
 
     state["pot_request_id"] = request_id
     state["pot_request_ts"] = time.time()
+    state["pot_request_purpose"] = str(
+        purpose or "observation"
+    )
+    state["pot_request_forced_baseline_bb"] = (
+        float(forced_pot_baseline_bb)
+        if forced_pot_baseline_bb is not None
+        else None
+    )
 
     log_latency(
         "queued",
@@ -2387,8 +4189,18 @@ def apply_pot_result(state, result):
     if result.get("request_id") != request_id:
         return state, False
 
+    request_purpose = state.get(
+        "pot_request_purpose"
+    ) or "observation"
+
+    forced_pot_baseline_bb = state.get(
+        "pot_request_forced_baseline_bb"
+    )
+
     state["pot_request_id"] = None
     state["pot_request_ts"] = None
+    state["pot_request_purpose"] = None
+    state["pot_request_forced_baseline_bb"] = None
 
     result_token = result.get("hand_token")
     current_token = state.get("hand_token")
@@ -2439,6 +4251,8 @@ def apply_pot_result(state, result):
         "source_request_id": request_id,
         "confidence": result.get("confidence"),
         "terminal": is_terminal,
+        "purpose": request_purpose,
+        "forced_pot_baseline_bb": forced_pot_baseline_bb,
     })
 
     print(
@@ -2523,6 +4337,29 @@ def consume_ready_worker_results(state):
                 pot_result,
             )
             consumed = True
+
+    # Bet-amount reads are multi-request by design. Several seats may
+    # commit before the API worker completes an earlier request.
+    pending_bet_requests = dict(
+        state.get(
+            "pending_bet_amount_requests"
+        )
+        or {}
+    )
+
+    for request_id in pending_bet_requests:
+        bet_result = find_bet_amount_result(
+            request_id
+        )
+
+        if bet_result is None:
+            continue
+
+        state, _ = apply_bet_amount_result(
+            state,
+            bet_result,
+        )
+        consumed = True
 
     if consumed:
         save_state(state)
@@ -2872,6 +4709,567 @@ class CoordinatorRuntime:
     )
 
 
+
+def has_semantic_local_change(changes):
+    """
+    Cheap front-door semantic-frame decision.
+
+    Continuous raw samples still run LocalEventDetector so its
+    previous-frame state remains current. Only samples carrying a
+    meaningful observable transition enter the expensive coordinator
+    pipeline.
+    """
+
+    if changes is None:
+        return False
+
+    scalar_flags = (
+        "hero_changed",
+        "board_changed",
+        "pot_changed",
+        "dealer_changed",
+        "action_buttons_changed",
+        "hero_cards_appeared",
+        "hero_cards_cleared",
+    )
+
+    if any(
+        bool(getattr(changes, name, False))
+        for name in scalar_flags
+    ):
+        return True
+
+    sequence_flags = (
+        "stack_changed_seats",
+        "bet_region_appeared",
+        "bet_region_cleared",
+        "opponent_hole_card_changed_seats",
+        "opponent_hole_cards_disappeared_seats",
+    )
+
+    if any(
+        bool(getattr(changes, name, None))
+        for name in sequence_flags
+    ):
+        return True
+
+    return False
+
+
+def change_gate_has_pending_work(state):
+    """
+    Conservative V1 safety gate.
+
+    Never discard a quiet sample while stack settlement is unresolved.
+    Other async worker results are consumed before capture at the top of
+    the coordinator loop, so they do not require a full quiet-frame pass.
+    """
+
+    return bool(
+        state.get("pending_stack_reads")
+    )
+
+
+def _timed_stage(timings, name, fn):
+    started = time.perf_counter()
+    result = fn()
+    timings[name] = round(
+        (time.perf_counter() - started) * 1000.0,
+        3,
+    )
+    return result
+
+
+def _append_coordinator_timing(payload):
+    COORDINATOR_TIMING.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with COORDINATOR_TIMING.open("a") as handle:
+        handle.write(
+            json.dumps(
+                payload,
+                separators=(",", ":"),
+                default=str,
+            )
+            + "\n"
+        )
+        handle.flush()
+
+
+
+
+
+
+def replay_outstanding_transport(state):
+    """
+    Return durable asynchronous transport that must settle before a replay
+    coordinator may exit.
+
+    This intentionally excludes retry inventories such as
+    pending_startup_stack_seats and semantic candidates such as
+    pending_stack_reads. At replay EOF no new perception is allowed, so only
+    requests that were already published to workers are drainable work.
+    """
+    outstanding = {}
+
+    hero_request_id = state.get("hero_request_id")
+    if hero_request_id:
+        outstanding["hero"] = [hero_request_id]
+
+    board_request_id = state.get("board_request_id")
+    if board_request_id:
+        outstanding["board"] = [board_request_id]
+
+    pot_request_id = state.get("pot_request_id")
+    if pot_request_id:
+        outstanding["pot"] = [pot_request_id]
+
+    bet_requests = dict(
+        state.get("pending_bet_amount_requests")
+        or {}
+    )
+    if bet_requests:
+        outstanding["bet_amount"] = sorted(
+            bet_requests.keys()
+        )
+
+    stack_requests = dict(
+        state.get("pending_stack_worker_requests")
+        or {}
+    )
+    if stack_requests:
+        outstanding["stack"] = sorted(
+            stack_requests.keys()
+        )
+
+    return outstanding
+
+
+def replay_drain_complete(state):
+    return not replay_outstanding_transport(state)
+
+
+def replay_pending_stack_candidates(state):
+    """
+    Return hand-owned settled-stack candidates that still own finite
+    prerecorded quantitative work at replay EOF.
+
+    Tokenless/post-hand candidates are not semantic replay obligations.
+    Existing settled-stack ownership remains authoritative at EOF.
+    """
+    hand_token = state.get("hand_token")
+
+    if not hand_token:
+        return {}
+
+    return {
+        seat: dict(pending)
+        for seat, pending in (
+            state.get("pending_stack_reads")
+            or {}
+        ).items()
+        if (
+            isinstance(pending, dict)
+            and (
+                pending.get("hand_token") in {
+                    None,
+                    hand_token,
+                }
+            )
+        )
+    }
+
+
+def ingest_eof_stack_semantics(
+    changes,
+    state,
+    runtime,
+):
+    """
+    Carry validated replay-EOF stack evidence through the existing
+    semantic observer/episode/inference path without performing any
+    new perception.
+
+    This helper is replay-EOF only. Live/main-loop behavior remains
+    unchanged.
+    """
+    if changes is None:
+        return []
+
+    if not getattr(
+        changes,
+        "stack_changed_seats",
+        None,
+    ):
+        return []
+
+    if state.get("terminal_action_frozen"):
+        return []
+
+    street = str(
+        state.get("phase")
+        or "WAITING"
+    ).upper()
+
+    if street == "WAITING":
+        return []
+
+    observer = runtime.observer
+    timeline = runtime.timeline
+    correlator = runtime.correlator
+    episode_manager = runtime.episode_manager
+    episode_scheduler = runtime.episode_scheduler
+    inference_engine = runtime.inference_engine
+    action_qualifier = runtime.action_qualifier
+    commitment_tracker = runtime.commitment_tracker
+
+    observations = observer.ingest_changes(
+        changes,
+        street=street,
+    )
+
+    if not observations:
+        return []
+
+    print(
+        "[REPLAY_EOF_SEMANTIC]",
+        "stack_changed_seats=",
+        list(
+            getattr(
+                changes,
+                "stack_changed_seats",
+                [],
+            )
+            or []
+        ),
+        "observations=",
+        [
+            getattr(obs, "type", None)
+            for obs in observations
+        ],
+        flush=True,
+    )
+
+    timeline.add_many(observations)
+    timeline.write_json(TIMELINE_JSON)
+
+    correlator.ingest(observations)
+    CORRELATOR_JSON.write_text(
+        json.dumps(
+            correlator.summary(),
+            indent=2,
+        )
+    )
+
+    table_context = load_table_context()
+
+    current_commitment_street = street
+
+    table_context[
+        "prior_voluntary_commitment_seats"
+    ] = commitment_tracker.committed_players(
+        current_commitment_street
+    )
+
+    # EOF has no new perception frame. Preserve the most recent
+    # table context already established by the normal frame path.
+    table_context.setdefault(
+        "prior_occupied_bet_regions",
+        [],
+    )
+
+    episode_manager.set_table_context(
+        table_context
+    )
+
+    episode_manager.ingest(
+        observations
+    )
+
+    reinference_ids = (
+        episode_manager
+        .consume_reinference_episode_ids()
+    )
+
+    for episode_id in sorted(
+        reinference_ids
+    ):
+        if (
+            episode_id
+            in inference_engine.suppressed_episode_ids
+        ):
+            inference_engine.suppressed_episode_ids.discard(
+                episode_id
+            )
+
+            inference_engine.processed_episode_ids.discard(
+                episode_id
+            )
+
+            print(
+                "[INFERENCE_REOPEN]",
+                f"episode={episode_id}",
+                "reason=late_stack_after_suppression",
+                flush=True,
+            )
+
+        elif (
+            episode_id
+            in inference_engine.processed_episode_ids
+        ):
+            print(
+                "[INFERENCE_REOPEN_SKIP]",
+                f"episode={episode_id}",
+                "reason=already_published",
+                flush=True,
+            )
+
+    episode_manager.backfill_table_context(
+        table_context
+    )
+
+    EPISODES_JSON.write_text(
+        json.dumps(
+            episode_manager.summary(),
+            indent=2,
+        )
+    )
+
+    released_closed = (
+        episode_scheduler.release(
+            episode_manager.closed,
+            ready_for_inference=(
+                episode_ready_for_inference
+            ),
+            processed_episode_ids=(
+                inference_engine
+                .processed_episode_ids
+            ),
+        )
+    )
+
+    scheduler_status = (
+        episode_scheduler.status(
+            episode_manager.closed,
+            ready_for_inference=(
+                episode_ready_for_inference
+            ),
+            processed_episode_ids=(
+                inference_engine
+                .processed_episode_ids
+            ),
+        )
+    )
+
+    EPISODE_SCHEDULER_JSON.write_text(
+        json.dumps(
+            scheduler_status,
+            indent=2,
+        )
+        + "\n"
+    )
+
+    new_actions = (
+        inference_engine.ingest_closed(
+            released_closed
+        )
+    )
+
+    published = []
+
+    if new_actions:
+        qualified_actions = (
+            action_qualifier.qualify_many(
+                released_closed,
+                new_actions,
+            )
+        )
+
+        for action, qualification in qualified_actions:
+
+            if (
+                qualification is not None
+                and not qualification.publish
+            ):
+                print(
+                    "[ACTION_RETIRED]",
+                    f"episode={qualification.episode_id}",
+                    f"action={qualification.action}",
+                    f"reason={qualification.qualification_reason}",
+                    flush=True,
+                )
+                continue
+
+            if (
+                action.action
+                in {
+                    "BET_OR_RAISE",
+                    "CALL_OR_RAISE",
+                    "CALL",
+                }
+                and action.confidence >= 0.70
+            ):
+                commitment_tracker.record_commitment(
+                    action.street,
+                    action.seat,
+                )
+
+            emit({
+                "type": "inferred_action",
+                **action.to_dict(),
+            })
+
+            published.append(action)
+
+            print(
+                "[REPLAY_EOF_INFERRED]",
+                action.street,
+                action.seat,
+                action.action,
+                f"confidence={action.confidence:.2f}",
+                flush=True,
+            )
+
+        INFERRED_ACTIONS_JSON.write_text(
+            json.dumps(
+                inference_engine.to_dict(),
+                indent=2,
+            )
+        )
+
+        ACTION_QUALIFICATIONS_JSON.write_text(
+            json.dumps(
+                action_qualifier.to_dict(),
+                indent=2,
+            )
+            + "\n"
+        )
+
+    return published
+
+
+
+def drain_replay_stack_candidates_once(
+    state,
+    *,
+    final_frame_path,
+    final_frame_ts,
+    replay_records,
+):
+    """
+    Advance deterministic settled-stack work by one non-perception EOF cycle.
+
+    No LocalEventDetector work occurs here. Existing worker results are
+    reconciled and the ordinary recorded-time retry logic may publish the next
+    prerecorded stack sample. At most one request remains outstanding per
+    candidate because process_stack_change_measurements_async() retains its
+    existing ownership gate.
+    """
+    if not replay_pending_stack_candidates(state):
+        return state, False, ChangeSet()
+
+    ready = collect_ready_stack_worker_results(
+        state,
+        replay_frame_ts=float(
+            final_frame_ts
+        ),
+        replay_records=replay_records,
+        replay_eof=True,
+    )
+
+    settled = {
+        seat: item
+        for seat, item in ready.items()
+        if (
+            (item.get("request") or {}).get(
+                "purpose"
+            )
+            == "settled"
+        )
+    }
+
+    before_requests = set(
+        (
+            state.get(
+                "pending_stack_worker_requests"
+            )
+            or {}
+        ).keys()
+    )
+
+    before_candidates = set(
+        replay_pending_stack_candidates(
+            state
+        ).keys()
+    )
+
+    changes = ChangeSet()
+
+    # This frame is cycle context only. Retry frame selection remains owned by
+    # retry_frame_path/retry_frame_ts derived from replay_records.
+    img = cv2.imread(
+        str(final_frame_path)
+    )
+
+    if img is None:
+        raise RuntimeError(
+            "replay EOF stack drain requires "
+            f"recorded frame: {final_frame_path}"
+        )
+
+    if (
+        img.shape[1] != 934
+        or img.shape[0] != 696
+    ):
+        img = cv2.resize(
+            img,
+            (934, 696),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    process_stack_change_measurements_async(
+        changes,
+        img,
+        state,
+        stack_worker_results=settled,
+        prior_occupied_bet_regions=set(),
+        prior_commitment_seats=set(),
+        event_street=str(
+            state.get("phase")
+            or "WAITING"
+        ).upper(),
+        frame_path=str(final_frame_path),
+        frame_ts=float(final_frame_ts),
+        replay_records=replay_records,
+        replay_eof=True,
+    )
+
+    after_requests = set(
+        (
+            state.get(
+                "pending_stack_worker_requests"
+            )
+            or {}
+        ).keys()
+    )
+
+    after_candidates = set(
+        replay_pending_stack_candidates(
+            state
+        ).keys()
+    )
+
+    progressed = bool(
+        settled
+        or before_requests != after_requests
+        or before_candidates != after_candidates
+    )
+
+    return state, progressed, changes
+
+
 def main():
     print("api_event_coordinator running event-only mode. Ctrl+C to stop.")
     print(f"Events: {EVENT_LOG}")
@@ -2879,6 +5277,37 @@ def main():
     runtime = CoordinatorRuntime()
 
     local_detector = runtime.local_detector
+
+    # Live mode retains BetRegionStateTracker's monotonic real-time clock.
+    #
+    # Deterministic replay must use the original recorded frame timeline.
+    # PacedReplayCapture intentionally releases overdue frames immediately,
+    # so processing wall time cannot be allowed to alter debounce semantics.
+    replay = _paced_replay()
+
+    # Recorder-facing tournament-level metadata belongs to main().
+    # Initialize it unconditionally so frame recording is safe before
+    # Hero-card processing has established any hand-local metadata.
+    #
+    # Replay metadata is authoritative when present. Live mode refreshes
+    # from the current ACR window title on each perception frame below.
+    level = (
+        dict(replay.tournament_level or {})
+        if replay is not None
+        else {}
+    )
+
+    if replay is not None:
+        local_detector.bet_region_tracker.clock = (
+            lambda: replay.current_recorded_elapsed
+        )
+
+        print(
+            "[REPLAY_CLOCK] temporal perception uses "
+            "recorded frame time",
+            flush=True,
+        )
+
     hero_blink_buffer = runtime.hero_blink_buffer
     previous_blink_visible = False
 
@@ -2924,7 +5353,137 @@ def main():
         json.dumps(inference_engine.to_dict(), indent=2)
     )
 
+    replay_eof_started = None
+    replay_eof_quiet_started = None
+
     while True:
+        # Replay EOF is a transport-drain phase, not another perception frame.
+        #
+        # PacedReplayCapture deliberately keeps the final frame available after
+        # exhaustion so asynchronous work can settle. Do not feed that same
+        # frame through LocalEventDetector repeatedly: doing so can create
+        # duplicate observations and makes replay completion nondeterministic.
+        if replay is not None and replay.exhausted:
+            if replay_eof_started is None:
+                replay_eof_started = time.monotonic()
+
+                print(
+                    "[REPLAY_EOF] final recorded frame released; "
+                    "freezing perception and draining transport",
+                    flush=True,
+                )
+
+            state, consumed_result, _ = (
+                consume_ready_worker_results(state)
+            )
+
+            # Replay EOF freezes new perception, but deterministic settled-stack
+            # candidates may still own finite work against frames that were
+            # already recorded. Drain that work without feeding the final frame
+            # through LocalEventDetector again.
+            stack_candidates = (
+                replay_pending_stack_candidates(
+                    state
+                )
+            )
+
+            if stack_candidates:
+                final_record = (
+                    replay.records[-1]
+                    if replay.records
+                    else None
+                )
+
+                if final_record is not None:
+                    state, stack_progressed, eof_stack_changes = (
+                        drain_replay_stack_candidates_once(
+                            state,
+                            final_frame_path=(
+                                final_record["frame_path"]
+                            ),
+                            final_frame_ts=(
+                                final_record["ts"]
+                            ),
+                            replay_records=replay.records,
+                        )
+                    )
+
+                    if stack_progressed:
+                        replay_eof_quiet_started = None
+
+                    if getattr(
+                        eof_stack_changes,
+                        "stack_changed_seats",
+                        None,
+                    ):
+                        ingest_eof_stack_semantics(
+                            eof_stack_changes,
+                            state,
+                            runtime,
+                        )
+
+            save_state(state)
+
+            outstanding = replay_outstanding_transport(
+                state
+            )
+
+            stack_candidates = (
+                replay_pending_stack_candidates(
+                    state
+                )
+            )
+
+            if outstanding or stack_candidates:
+                replay_eof_quiet_started = None
+
+                print(
+                    "[REPLAY_DRAIN] "
+                    f"outstanding={outstanding} "
+                    f"stack_candidates={sorted(stack_candidates)}",
+                    flush=True,
+                )
+
+                # Worker results are file-backed and asynchronous. Poll without
+                # advancing replay perception or semantic detector time.
+                time.sleep(0.02)
+                continue
+
+            if replay_eof_quiet_started is None:
+                replay_eof_quiet_started = (
+                    time.monotonic()
+                )
+
+                print(
+                    "[REPLAY_DRAIN] transport empty; "
+                    "starting quiet period",
+                    flush=True,
+                )
+
+                time.sleep(0.10)
+                continue
+
+            quiet_seconds = (
+                time.monotonic()
+                - replay_eof_quiet_started
+            )
+
+            if quiet_seconds < 0.25:
+                time.sleep(0.05)
+                continue
+
+            print(
+                "[REPLAY_COMPLETE] "
+                "transport drained; coordinator exiting cleanly",
+                flush=True,
+            )
+
+            return
+
+        iteration_started = time.perf_counter()
+        frame_timings = {}
+        iteration_frame = None
+
         state, consumed_result, board_emitted_fast = (
             consume_ready_worker_results(state)
         )
@@ -2935,14 +5494,75 @@ def main():
             time.sleep(0.01 if not board_emitted_fast else 0.05)
             continue
 
-        frame = capture()
+        capture_started = time.perf_counter()
 
-        img = cv2.imread(str(frame)) if frame else None
+        use_sck_capture = bool(
+            replay is None
+            and os.environ.get(
+                "POKER_SCK_CAPTURE",
+                "0",
+            ) == "1"
+        )
+
+        if use_sck_capture:
+            img, frame = capture_sck_live()
+        else:
+            frame = capture()
+            img = None
+
+        frame_timings["capture"] = round(
+            (time.perf_counter() - capture_started) * 1000.0,
+            3,
+        )
+
+        if replay is not None:
+            iteration_frame = replay.current_index
+
+        if use_sck_capture:
+            # SCK already supplies the exact canonical 934x696 BGR
+            # image. Preserve profiler schema while recording that
+            # these stages no longer perform work.
+            frame_timings["imread"] = 0.0
+            frame_timings["resize"] = 0.0
+
+        else:
+            imread_started = time.perf_counter()
+
+            img = (
+                cv2.imread(str(frame))
+                if frame
+                else None
+            )
+
+            frame_timings["imread"] = round(
+                (
+                    time.perf_counter()
+                    - imread_started
+                )
+                * 1000.0,
+                3,
+            )
+
+            if img is not None:
+                resize_started = time.perf_counter()
+
+                img = cv2.resize(
+                    img,
+                    (934, 696),
+                )
+
+                frame_timings["resize"] = round(
+                    (
+                        time.perf_counter()
+                        - resize_started
+                    )
+                    * 1000.0,
+                    3,
+                )
+
         if img is None:
             time.sleep(0.5)
             continue
-
-        img = cv2.resize(img, (934, 696))
 
         participant_frame_buffer.append(
             (
@@ -2954,10 +5574,15 @@ def main():
         # Continuously accumulate hand-start participant evidence while
         # the coordinator is already processing live frames. This is
         # intentionally lightweight and independent of API latency.
+        participant_started = time.perf_counter()
         collect_participant_evidence(
             img,
             frame,
             state,
+        )
+        frame_timings["participant_evidence"] = round(
+            (time.perf_counter() - participant_started) * 1000.0,
+            3,
         )
 
         prechange_image = (
@@ -2966,7 +5591,73 @@ def main():
             else None
         )
 
+        detector_started = time.perf_counter()
         changes = local_detector.detect(img)
+        frame_timings["local_detector"] = round(
+            (time.perf_counter() - detector_started) * 1000.0,
+            3,
+        )
+
+        # Change-Gated Perception V1.
+        #
+        # Initially replay-only. Raw sampling and LocalEventDetector still
+        # run on EVERY source frame so consecutive-frame transition evidence
+        # is preserved. A quiet frame simply does not enter the expensive
+        # semantic pipeline unless unresolved stack settlement needs it.
+        change_gate_enabled = bool(
+            replay is not None
+            and os.environ.get(
+                "POKER_CHANGE_GATE",
+                "0",
+            ) == "1"
+        )
+
+        semantic_change = has_semantic_local_change(
+            changes
+        )
+
+        settlement_needed = (
+            change_gate_has_pending_work(state)
+        )
+
+        if (
+            change_gate_enabled
+            and str(
+                state.get("phase")
+                or "WAITING"
+            ).upper() != "WAITING"
+            and not semantic_change
+            and not settlement_needed
+        ):
+            frame_timings["change_gate"] = 0.0
+
+            _append_coordinator_timing({
+                "frame": iteration_frame,
+                "street": state.get("phase"),
+                "iteration_ms": round(
+                    (
+                        time.perf_counter()
+                        - iteration_started
+                    )
+                    * 1000.0,
+                    3,
+                ),
+                "stages_ms": frame_timings,
+                "acquisition_mode": (
+                    "sck"
+                    if use_sck_capture
+                    else (
+                        "replay"
+                        if replay is not None
+                        else "legacy"
+                    )
+                ),
+                "change_gate": "discarded_quiet",
+            })
+
+            continue
+
+        frame_timings["change_gate"] = 1.0
 
         local_board_count = int(
             getattr(changes, "board_count", 0)
@@ -2988,12 +5679,36 @@ def main():
             local_board_count,
         )
 
+        old_street_owing_seats = set()
+
         if event_street != previous_canonical_street:
+            boundary_status = load_betting_round_status()
+
+            if (
+                str(
+                    (boundary_status or {}).get("hand_token")
+                    or ""
+                )
+                == str(state.get("hand_token") or "")
+                and str(
+                    (boundary_status or {}).get("street")
+                    or ""
+                ).upper()
+                == previous_canonical_street
+            ):
+                old_street_owing_seats = set(
+                    (boundary_status or {}).get(
+                        "players_owing_action"
+                    )
+                    or []
+                )
+
             state, _ = maybe_queue_boundary_stack_request(
                 state,
                 previous_street=previous_canonical_street,
                 next_street=event_street,
                 frames=list(boundary_frame_buffer),
+                status=boundary_status,
             )
 
         if event_street != str(
@@ -3060,6 +5775,12 @@ def main():
                 flush=True,
             )
 
+            state = queue_initial_bet_inventory(
+                state,
+                img,
+                frame,
+            )
+
         current_hand_token = state.get("hand_token")
 
         if current_hand_token != recent_stack_hand_token:
@@ -3075,6 +5796,47 @@ def main():
         current_stack_street = str(
             state.get("phase") or "WAITING"
         ).upper()
+
+        # Chronology is the latency-critical product path.
+        #
+        # Publish confirmed local actor evidence immediately after local
+        # perception and BEFORE startup-stack recovery, settled stack OCR,
+        # quantitative action processing, bet sizing, pot work, or any other
+        # enrichment. Nothing optional may sit in front of action chronology.
+        actor_started = time.perf_counter()
+        emit_fast_actor_observations(
+            state,
+            changes,
+            street=current_stack_street,
+        )
+
+        emit_physical_actor_completions(
+            changes,
+            state,
+            street=current_stack_street,
+        )
+        frame_timings["fast_actor"] = round(
+            (time.perf_counter() - actor_started) * 1000.0,
+            3,
+        )
+
+        # Complete ambiguous starting stacks proactively, but only AFTER the
+        # chronology fast path above has had the opportunity to publish this
+        # frame's physical action evidence.
+        startup_started = time.perf_counter()
+        state = retry_one_startup_stack(
+            state,
+            img,
+            local_board_count=getattr(
+                changes,
+                "board_count",
+                0,
+            ),
+        )
+        frame_timings["startup_stack_retry"] = round(
+            (time.perf_counter() - startup_started) * 1000.0,
+            3,
+        )
 
         prior_commitment_seats = (
             commitment_tracker.committed_players(
@@ -3116,22 +5878,117 @@ def main():
                 flush=True,
             )
         else:
-            enrich_stack_change_measurements(
+            # Collect completed OCR evidence once, immediately before
+            # settled-stack reconciliation. Candidate timing, continuity,
+            # validation, and action semantics remain unchanged.
+            stack_collect_started = time.perf_counter()
+            ready_stack_worker_results = (
+                collect_ready_stack_worker_results(
+                    state,
+                    replay_frame_ts=(
+                        (
+                            replay.first_recorded_ts
+                            + replay.current_recorded_elapsed
+                        )
+                        if replay is not None
+                        else None
+                    ),
+                    replay_records=(
+                        replay.records
+                        if replay is not None
+                        else None
+                    ),
+                )
+            )
+            frame_timings["stack_result_collect"] = round(
+                (
+                    time.perf_counter()
+                    - stack_collect_started
+                )
+                * 1000.0,
+                3,
+            )
+
+            settled_stack_worker_results = {
+                seat: item
+                for seat, item
+                in ready_stack_worker_results.items()
+                if (
+                    (item.get("request") or {}).get(
+                        "purpose"
+                    )
+                    == "settled"
+                )
+            }
+
+            stack_reconcile_started = time.perf_counter()
+            process_stack_change_measurements_async(
                 changes,
                 img,
                 state,
+                stack_worker_results=(
+                    settled_stack_worker_results
+                ),
                 prechange_image=prechange_image,
                 prior_occupied_bet_regions=(
                     previous_occupied_bet_regions
                 ),
                 prior_commitment_seats=prior_commitment_seats,
                 event_street=event_street,
+                old_street_owing_seats=old_street_owing_seats,
                 recent_stack_observations=recent_stack_observations,
                 frame_path=str(frame or ""),
-                frame_ts=time.time(),
+                frame_ts=(
+                    (
+                        replay.first_recorded_ts
+                        + replay.current_recorded_elapsed
+                    )
+                    if replay is not None
+                    else time.time()
+                ),
+                replay_records=(
+                    replay.records
+                    if replay is not None
+                    else None
+                ),
+            )
+            frame_timings["stack_reconciliation"] = round(
+                (
+                    time.perf_counter()
+                    - stack_reconcile_started
+                )
+                * 1000.0,
+                3,
+            )
+
+            state = release_corroborated_bet_amount_results(
+                state,
+                changes,
             )
 
         log_observation(changes)
+
+        # Absolute visible-bet sizing is asynchronous and never blocks the
+        # local Hero/action path. The worker returns numeric evidence only.
+        if (
+            state.get("phase") != "WAITING"
+            and state.get("hand_token")
+            and not state.get("terminal_action_frozen")
+        ):
+            for bet_seat in list(
+                getattr(
+                    changes,
+                    "bet_region_appeared",
+                    [],
+                )
+                or []
+            ):
+                state = queue_bet_amount_request(
+                    state,
+                    frame,
+                    bet_seat,
+                    event_street,
+                )
 
         # Queue the first pot read as soon as the state machine has
         # initialized CanonicalHand from the authoritative table snapshot.
@@ -3152,9 +6009,28 @@ def main():
             and not state.get("initial_pot_queued")
             and state.get("pot_request_id") is None
         ):
-            state = queue_pot_request(state, frame)
+            forced_pot_baseline_bb = (
+                state_machine_state.get(
+                    "forced_pot_baseline_bb"
+                )
+            )
+
+            state = queue_pot_request(
+                state,
+                frame,
+                purpose="initial",
+                forced_pot_baseline_bb=(
+                    forced_pot_baseline_bb
+                ),
+            )
+
             state["initial_pot_queued"] = True
-            print("[POT] initial canonical request queued", flush=True)
+
+            print(
+                "[POT] initial canonical request queued "
+                f"forced_baseline={forced_pot_baseline_bb}",
+                flush=True,
+            )
 
         if (
             state.get("phase") != "WAITING"
@@ -3179,7 +6055,12 @@ def main():
             state.get("phase") != "WAITING"
             and not state.get("terminal_action_frozen")
         ):
+            winner_started = time.perf_counter()
             winner = detect_winner(img)
+            frame_timings["winner_detection"] = round(
+                (time.perf_counter() - winner_started) * 1000.0,
+                3,
+            )
 
             if winner.get("visible"):
                 winner_seat = winner.get("seat")
@@ -3228,11 +6109,21 @@ def main():
                     flush=True,
                 )
 
+        observer_pipeline_started = time.perf_counter()
+
+        if replay is None:
+            level = parse_tournament_level(
+                _CACHED_WINDOW.title
+                if _CACHED_WINDOW is not None
+                else ""
+            )
+
         sequence_recorder.record(
             frame=img,
             changes=changes,
             state=state,
             source_frame=frame,
+            tournament_level=level,
         )
 
         print(
@@ -3568,6 +6459,15 @@ def main():
                     + "\n"
                 )
 
+        frame_timings["observer_pipeline"] = round(
+            (
+                time.perf_counter()
+                - observer_pipeline_started
+            )
+            * 1000.0,
+            3,
+        )
+
         # Preserve this frame's confirmed bet occupancy as context for the
         # next perception frame.
         previous_occupied_bet_regions = set(
@@ -3581,16 +6481,69 @@ def main():
         state["last_local_hero_visible"] = bool(hero_visible)
         state["last_local_board_count"] = int(count or 0)
 
-        state = maybe_read_hero(state, hero_visible, count, frame)
+        hero_read_started = time.perf_counter()
+        state = maybe_read_hero(
+            state,
+            hero_visible,
+            count,
+            frame,
+        )
+        frame_timings["hero_read_coordination"] = round(
+            (time.perf_counter() - hero_read_started) * 1000.0,
+            3,
+        )
 
         before_board_len = state.get("confirmed_board_len", 0)
+
+        board_started = time.perf_counter()
         state = maybe_read_board(state, count, frame)
+        frame_timings["board_coordination"] = round(
+            (time.perf_counter() - board_started) * 1000.0,
+            3,
+        )
         board_emitted_this_cycle = state.get("confirmed_board_len", 0) != before_board_len
 
-        # Do not mix a street transition and a Hero turn event in the same observation cycle.
-        # Let the state machine consume the board event first, then evaluate Hero turn on the next frame.
+        # Do not mix a street transition and a Hero turn event in the same
+        # observation cycle. Preserve the existing synchronization window so
+        # downstream state consumes the board before subsequent action evidence
+        # can be attributed to the new street.
         if board_emitted_this_cycle:
+            persist_started = time.perf_counter()
             save_state(state)
+            frame_timings["state_persist"] = round(
+                (time.perf_counter() - persist_started) * 1000.0,
+                3,
+            )
+
+            frame_timings["board_sync_sleep"] = 500.0
+
+            _append_coordinator_timing({
+                "ts": time.time(),
+                "frame": iteration_frame,
+                "frame_path": str(frame or ""),
+                "street": state.get("phase"),
+                "board_count": int(count or 0),
+                "iteration_ms": round(
+                    (
+                        time.perf_counter()
+                        - iteration_started
+                    )
+                    * 1000.0,
+                    3,
+                ),
+                "early_exit": "board_transition",
+                "stages_ms": frame_timings,
+                "acquisition_mode": (
+                    "sck"
+                    if use_sck_capture
+                    else (
+                        "replay"
+                        if replay is not None
+                        else "legacy"
+                    )
+                ),
+            })
+
             time.sleep(0.5)
             continue
 
@@ -3598,15 +6551,16 @@ def main():
         # Reuses the coordinator's existing captured frame.
         blink_visible = False
 
-        if hero_visible and frame:
-            blink_frame = cv2.imread(str(frame))
+        blink_started = time.perf_counter()
 
-            if blink_frame is not None:
-                blink_frame = cv2.resize(blink_frame, (934, 696))
-                blink_visible = hero_blink_buffer.update(
-                    blink_frame,
-                    GEOM,
-                )
+        if hero_visible:
+            # `img` is already the canonical 934x696 frame for this exact
+            # observation cycle. Reuse it instead of rereading and resizing
+            # the same frame from disk.
+            blink_visible = hero_blink_buffer.update(
+                img,
+                GEOM,
+            )
         else:
             hero_blink_buffer.reset()
 
@@ -3620,6 +6574,11 @@ def main():
                 flush=True,
             )
             previous_blink_visible = blink_visible
+
+        frame_timings["hero_blink"] = round(
+            (time.perf_counter() - blink_started) * 1000.0,
+            3,
+        )
 
         hero_turn_visible = blink_visible or buttons_visible
 
@@ -3654,14 +6613,52 @@ def main():
                 hero_visible,
             )
 
-        state = maybe_complete_early(state, count, hero_visible)
+        completion_started = time.perf_counter()
+
+        state = maybe_complete_early(
+            state,
+            count,
+            hero_visible,
+        )
         state = maybe_complete_hand(
             state,
             count,
             frame=frame,
         )
 
+        frame_timings["hand_completion"] = round(
+            (
+                time.perf_counter()
+                - completion_started
+            )
+            * 1000.0,
+            3,
+        )
+
+        persist_started = time.perf_counter()
         save_state(state)
+        frame_timings["state_persist"] = round(
+            (time.perf_counter() - persist_started) * 1000.0,
+            3,
+        )
+
+        _append_coordinator_timing({
+            "ts": time.time(),
+            "frame": iteration_frame,
+            "frame_path": str(frame or ""),
+            "street": state.get("phase"),
+            "board_count": int(count or 0),
+            "iteration_ms": round(
+                (
+                    time.perf_counter()
+                    - iteration_started
+                )
+                * 1000.0,
+                3,
+            ),
+            "early_exit": None,
+            "stages_ms": frame_timings,
+        })
 
         # Poll worker result files aggressively only while requests are pending.
         # This removes avoidable coordinator delay without increasing API calls.

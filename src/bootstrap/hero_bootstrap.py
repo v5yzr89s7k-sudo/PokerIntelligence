@@ -213,7 +213,7 @@ class HeroBootstrap:
         positions = assign_positions(
             position_players,
             dealer["dealer_button_seat"],
-            preserve_physical_slots=True,
+            preserve_physical_slots=False,
         )
         position_assignment_ms = (
             time.perf_counter() - stage_started
@@ -271,7 +271,16 @@ def populate_local_stacks(
 ):
     """
     Populate existing local player records using stack OCR.
+
+    Expensive seat OCR is independent by physical seat. Run those reads
+    concurrently, then apply the existing trust/candidate semantics in
+    deterministic roster order.
     """
+    from concurrent.futures import (
+        ThreadPoolExecutor,
+        as_completed,
+    )
+
     total_started = time.perf_counter()
 
     players_by_seat = {
@@ -279,36 +288,93 @@ def populate_local_stacks(
         for player in local_players
     }
 
-    for seat, player in players_by_seat.items():
-        seat_started = time.perf_counter()
+    default_result = {
+        "stack_bb": None,
+        "stack_text": "",
+        "confidence": 0.0,
+        "mode": "unavailable",
+    }
 
-        stack_result = {
-            "stack_bb": None,
-            "stack_text": "",
-            "confidence": 0.0,
-            "mode": "unavailable",
-        }
+    crops = {}
 
+    for seat in players_by_seat:
         region = (
             (geometry.get("stack_regions") or {})
             .get(seat)
         )
 
-        if canonical_image is not None and region:
-            stack_crop = crop_geometry_region(
-                canonical_image,
-                region,
-            )
+        if canonical_image is None or not region:
+            continue
 
-            if stack_crop is not None and stack_crop.size:
-                try:
-                    stack_result = stack_reader(stack_crop)
-                except Exception as exc:
-                    print(
-                        f"[LOCAL_STACK] seat={seat} "
-                        f"failed={type(exc).__name__}: {exc}",
-                        flush=True,
-                    )
+        stack_crop = crop_geometry_region(
+            canonical_image,
+            region,
+        )
+
+        if (
+            stack_crop is not None
+            and stack_crop.size
+        ):
+            crops[seat] = stack_crop
+
+    stack_results = {
+        seat: dict(default_result)
+        for seat in players_by_seat
+    }
+
+    seat_elapsed_ms = {
+        seat: 0.0
+        for seat in players_by_seat
+    }
+
+    def read_one(seat, crop):
+        started = time.perf_counter()
+
+        try:
+            result = stack_reader(crop)
+        except Exception as exc:
+            print(
+                f"[LOCAL_STACK] seat={seat} "
+                f"failed={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            result = dict(default_result)
+
+        elapsed_ms = (
+            time.perf_counter() - started
+        ) * 1000.0
+
+        return seat, result, elapsed_ms
+
+    if crops:
+        with ThreadPoolExecutor(
+            max_workers=len(crops)
+        ) as executor:
+
+            futures = {
+                executor.submit(
+                    read_one,
+                    seat,
+                    crop,
+                ): seat
+                for seat, crop in crops.items()
+            }
+
+            for future in as_completed(futures):
+                seat, result, elapsed_ms = (
+                    future.result()
+                )
+
+                stack_results[seat] = result
+                seat_elapsed_ms[seat] = elapsed_ms
+
+    # Preserve original deterministic player order and all pre-existing
+    # trust/candidate semantics.
+    for seat, player in players_by_seat.items():
+        stack_result = stack_results.get(
+            seat,
+            default_result,
+        )
 
         stack_bb = stack_result.get("stack_bb")
         confidence = float(
@@ -377,14 +443,10 @@ def populate_local_stacks(
             "stack_candidates": stack_candidates,
         })
 
-        seat_ms = (
-            time.perf_counter() - seat_started
-        ) * 1000.0
-
         print(
             f"[LOCAL_STACK] "
             f"seat={seat} "
-            f"elapsed={seat_ms:.1f}ms "
+            f"elapsed={seat_elapsed_ms.get(seat, 0.0):.1f}ms "
             f"stack={stack_bb if trusted else None} "
             f"confidence={confidence:.2f} "
             f"votes={votes} "
@@ -399,7 +461,8 @@ def populate_local_stacks(
     print(
         "[LATENCY_WATERFALL] "
         f"local_stack_bootstrap={total_ms:.1f}ms "
-        f"seats={len(local_players)}",
+        f"seats={len(local_players)} "
+        "mode=parallel",
         flush=True,
     )
 

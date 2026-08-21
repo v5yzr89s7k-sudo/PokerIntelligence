@@ -145,6 +145,170 @@ class BettingRoundTracker:
 
         return skipped
 
+    def advance_to_observed_actor(
+        self,
+        seat: str,
+        *,
+        ts=None,
+        blocked_seats=None,
+    ) -> List[CanonicalAction]:
+        """
+        Advance chronology to a newly observed actor without classifying
+        that actor's quantitative action.
+
+        Seats preceding the observed actor are passive only when no
+        independent unresolved commitment evidence blocks the gap.
+        """
+        self._sync_street()
+
+        queue = list(self.hand.players_to_act or [])
+
+        if seat not in queue:
+            return []
+
+        actor_index = queue.index(seat)
+
+        if actor_index <= 0:
+            return []
+
+        skipped_seats = queue[:actor_index]
+        blocked = set(blocked_seats or [])
+
+        unresolved = [
+            skipped_seat
+            for skipped_seat in skipped_seats
+            if skipped_seat in blocked
+        ]
+
+        if unresolved:
+            print(
+                "[ACTION_CURSOR_BLOCKED]",
+                f"street={self.hand.current_street}",
+                f"actor={seat}",
+                f"skipped={skipped_seats}",
+                f"blocked={unresolved}",
+                flush=True,
+            )
+            return []
+
+        # Consume only the seats proven passive by the later actor.
+        # Leave the observed actor at the head of the queue so the normal
+        # inferred-action path still owns its semantic action and sizing.
+        self.hand.players_to_act = queue[actor_index:]
+
+        inferred = self._infer_skipped_actions(
+            skipped_seats,
+            ts=ts,
+        )
+
+        for skipped_seat in skipped_seats:
+            self.commitment_tracker.consume_pending_action(
+                self.hand.current_street,
+                skipped_seat,
+            )
+
+            self.commitment_tracker.record_action(
+                self.hand.current_street,
+                skipped_seat,
+                current_price=self.hand.current_bet_bb,
+                last_aggressor=self.hand.last_aggressor_seat,
+                betting_open=self.has_open_bet,
+            )
+
+        self.commitment_tracker.sync_queue(
+            self.hand.current_street,
+            self.hand.players_to_act,
+        )
+
+        print(
+            "[ACTION_CURSOR_ADVANCE]",
+            f"street={self.hand.current_street}",
+            f"actor={seat}",
+            f"resolved={skipped_seats}",
+            f"remaining={self.hand.players_to_act}",
+            flush=True,
+        )
+
+        return inferred
+
+    def resolve_physically_completed_actor(
+        self,
+        seat: str,
+        *,
+        ts=None,
+    ):
+        """
+        Resolve direct physical evidence for exactly the actor currently
+        at the head of the canonical action queue.
+
+        This method can never skip another unresolved player. The normal
+        passive-action semantics remain authoritative:
+
+        - preflop -> FOLD
+        - postflop facing an open bet -> FOLD
+        - postflop with no open bet -> CHECK
+
+        Card disappearance is therefore chronology evidence, not an
+        independent permission to inject an action out of order.
+        """
+        queue = list(
+            self.hand.players_to_act
+            or []
+        )
+
+        if not queue:
+            return []
+
+        if queue[0] != seat:
+            print(
+                "[PHYSICAL_ACTOR_DEFER] "
+                f"street={self.hand.current_street} "
+                f"seat={seat} "
+                f"head={queue[0]}",
+                flush=True,
+            )
+            return []
+
+        inferred = self._infer_skipped_actions(
+            [seat],
+            ts=ts,
+        )
+
+        if not inferred:
+            return []
+
+        self.hand.players_to_act = queue[1:]
+
+        self.commitment_tracker.consume_pending_action(
+            self.hand.current_street,
+            seat,
+        )
+
+        self.commitment_tracker.record_action(
+            self.hand.current_street,
+            seat,
+            current_price=self.hand.current_bet_bb,
+            last_aggressor=self.hand.last_aggressor_seat,
+            betting_open=self.has_open_bet,
+        )
+
+        self.commitment_tracker.sync_queue(
+            self.hand.current_street,
+            self.hand.players_to_act,
+        )
+
+        print(
+            "[PHYSICAL_ACTOR_RESOLVE] "
+            f"street={self.hand.current_street} "
+            f"seat={seat} "
+            f"action={inferred[0].action} "
+            f"remaining={self.hand.players_to_act}",
+            flush=True,
+        )
+
+        return inferred
+
+
     def _infer_skipped_actions(
         self,
         skipped_seats: List[str],
@@ -667,15 +831,14 @@ class BettingRoundTracker:
             }:
                 amount_bb = delta_bb
 
-        # Never manufacture missing preflop action merely because a later
-        # voluntary actor was observed.
+        # Quantitative evidence for one actor does not independently prove
+        # the actions of earlier seats in the canonical traversal queue.
         #
-        # If seats still precede this actor in the canonical queue, their
-        # actions are unresolved. Publishing this actor now could establish
-        # the wrong live price/aggressor and corrupt every later action.
+        # If this actor is not currently at the head of the live queue,
+        # chronology is unresolved. Defer the episode without mutating the
+        # queue, fabricating passive actions, or marking the episode processed.
         #
-        # Preserve the queue and leave this episode diagnostics-only until
-        # earlier action context is available.
+        # Explicit chronology evidence owns skipped-seat resolution.
         forced_actions = {
             CANONICAL_POST_ANTE,
             CANONICAL_POST_SMALL_BLIND,
@@ -684,54 +847,13 @@ class BettingRoundTracker:
 
         if canonical_action not in forced_actions:
             queue = list(self.hand.players_to_act or [])
-            skipped_seats = []
 
             if seat in queue:
                 actor_index = queue.index(seat)
-                skipped_seats = queue[:actor_index]
 
-            if (
-                action_street == "PREFLOP"
-                and skipped_seats
-            ):
-                measurements = item.get("measurements") or {}
-                table_context = (
-                    measurements.get("table_context")
-                    or {}
-                )
+                if actor_index > 0:
+                    skipped_seats = queue[:actor_index]
 
-                prior_committed = set(
-                    table_context.get(
-                        "prior_voluntary_commitment_seats"
-                    )
-                    or []
-                )
-
-                # Raw bet-region occupancy is visual evidence only. It can be
-                # stale, bootstrap noise, or lingering chips and therefore
-                # must never establish an unresolved voluntary action.
-                #
-                # Only semantically confirmed voluntary commitments may block
-                # preflop skipped-seat resolution.
-                commitment_evidence = set(
-                    prior_committed
-                )
-
-                commitment_evidence.update(
-                    item.get(
-                        "unsettled_stack_evidence_seats",
-                        [],
-                    )
-                    or []
-                )
-
-                unresolved_skipped = [
-                    skipped_seat
-                    for skipped_seat in skipped_seats
-                    if skipped_seat in commitment_evidence
-                ]
-
-                if unresolved_skipped:
                     self._record_decision(
                         episode_id,
                         action_street,
@@ -740,46 +862,33 @@ class BettingRoundTracker:
                         None,
                         False,
                         (
-                            "unresolved earlier preflop actors with "
-                            "commitment evidence; action deferred "
-                            "without queue mutation"
+                            "earlier actors remain unresolved; "
+                            "quantitative action deferred without "
+                            "queue mutation"
                         ),
                     )
 
                     print(
-                        "[PREFLOP_UNRESOLVED_GAP]",
+                        "[QUANTITATIVE_ACTION_DEFERRED]",
+                        f"street={action_street}",
                         f"seat={seat}",
-                        f"skipped={skipped_seats}",
-                        f"commitment_evidence="
-                        f"{sorted(commitment_evidence)}",
-                        f"unresolved={unresolved_skipped}",
+                        f"earlier={skipped_seats}",
                         f"raw_action={action}",
                         f"canonical_candidate={canonical_action}",
                         flush=True,
                     )
 
-                    # DEFERRED is not PROCESSED.
+                    # Deferred is not processed. The state-machine replay
+                    # path may retry this episode after chronology advances.
                     self.processed_episode_ids.discard(
                         episode_id
                     )
 
                     return None
 
-                print(
-                    "[PREFLOP_GAP_RESOLVED]",
-                    f"seat={seat}",
-                    f"skipped={skipped_seats}",
-                    "resolution=FOLD",
-                    "reason=no_commitment_evidence",
-                    flush=True,
-                )
-
-            skipped_seats = self._consume_action_queue(seat)
-
-            self._infer_skipped_actions(
-                skipped_seats,
-                ts=item.get("ts"),
-            )
+            # The actor is now chronologically admissible. Consume exactly
+            # that actor and no unresolved predecessor.
+            self._consume_action_queue(seat)
 
         # Mandatory blinds are seeded during hand initialization.
         # Never duplicate them from later visual inference.

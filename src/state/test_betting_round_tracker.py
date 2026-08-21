@@ -123,6 +123,15 @@ def test_call_is_preserved():
             street="FLOP",
         )
     )
+
+    # This test verifies CALL semantic preservation, not skipped-actor
+    # inference. Resolve the intervening seat explicitly so Hero is
+    # chronologically admissible under the current queue invariant.
+    tracker.advance_to_observed_actor(
+        "hero",
+        ts=1.5,
+    )
+
     result = tracker.ingest(
         inferred(
             2,
@@ -213,6 +222,14 @@ def test_street_change_resets_aggression():
 
     hand.set_board(["Ah", "7c", "2d"])
 
+    # This test verifies that prior-street aggression does not leak into
+    # the new street. Make seat_upper_right chronologically admissible
+    # first rather than asking quantitative evidence to jump seat_top.
+    tracker.advance_to_observed_actor(
+        "seat_upper_right",
+        ts=2.0,
+    )
+
     result = tracker.ingest(
         inferred(
             2,
@@ -283,6 +300,31 @@ def test_later_actor_without_commitment_evidence_resolves_gap_as_fold():
     hand = make_hand()
     tracker = BettingRoundTracker(hand)
 
+    # Physical chronology establishes that seat_upper_right is now
+    # the acting seat. With no commitment evidence for seat_top,
+    # the skipped predecessor is safely resolved as a preflop fold.
+    resolved = tracker.advance_to_observed_actor(
+        "seat_upper_right",
+        ts=2.0,
+    )
+
+    assert [
+        (action.seat, action.action)
+        for action in resolved
+    ] == [
+        ("seat_top", "FOLD"),
+    ]
+
+    assert hand.players["seat_top"].folded is True
+    assert hand.players["seat_top"].active is False
+
+    assert hand.players_to_act == [
+        "seat_upper_right",
+        "hero",
+    ]
+
+    # Quantitative evidence may now consume exactly the observed
+    # actor because chronology has made that actor admissible.
     result = tracker.ingest(
         inferred(
             1,
@@ -302,10 +344,6 @@ def test_later_actor_without_commitment_evidence_resolves_gap_as_fold():
 
     assert result is not None
 
-    assert hand.players_to_act == [
-        "hero",
-    ]
-
     assert [
         (action.seat, action.action)
         for action in hand.actions
@@ -314,10 +352,12 @@ def test_later_actor_without_commitment_evidence_resolves_gap_as_fold():
         ("seat_upper_right", BET_OR_RAISE),
     ]
 
-    assert hand.players["seat_top"].folded is True
-    assert hand.players["seat_top"].active is False
+    assert hand.players_to_act == [
+        "hero",
+    ]
 
     assert tracker.decisions[-1].accepted is True
+
 
 
 def test_first_actor_consumes_only_itself():
@@ -362,6 +402,29 @@ def test_postflop_skipped_seat_is_not_inferred_as_fold():
     hand.set_board(["Ah", "7c", "2d"])
     tracker = BettingRoundTracker(hand)
 
+    # Physical chronology establishes that seat_upper_right is the
+    # next observed actor. With no open bet and no commitment evidence
+    # for seat_top, the skipped predecessor is a CHECK, never a FOLD.
+    resolved = tracker.advance_to_observed_actor(
+        "seat_upper_right",
+        ts=2.0,
+    )
+
+    assert [
+        (action.seat, action.action)
+        for action in resolved
+    ] == [
+        ("seat_top", "CHECK"),
+    ]
+
+    assert hand.players["seat_top"].folded is False
+    assert hand.players["seat_top"].active is True
+
+    assert hand.players_to_act == [
+        "seat_upper_right",
+        "hero",
+    ]
+
     result = tracker.ingest(
         inferred(
             1,
@@ -381,8 +444,10 @@ def test_postflop_skipped_seat_is_not_inferred_as_fold():
         ("seat_upper_right", BET_OR_RAISE),
     ]
 
-    assert hand.players["seat_top"].folded is False
-    assert hand.players["seat_top"].active is True
+    assert hand.players_to_act == [
+        "hero",
+    ]
+
 
 
 def test_later_preflop_gap_with_commitment_evidence_is_deferred():
@@ -440,7 +505,14 @@ def test_later_preflop_gap_with_commitment_evidence_is_deferred():
 
     assert tracker.decisions[-1].accepted is False
     assert tracker.decisions[-1].canonical_action is None
-    assert "commitment evidence" in tracker.decisions[-1].reason
+    assert (
+        "earlier actors remain unresolved"
+        in tracker.decisions[-1].reason
+    )
+    assert (
+        "without queue mutation"
+        in tracker.decisions[-1].reason
+    )
 
 
 def test_forced_blinds_do_not_consume_preflop_queue():

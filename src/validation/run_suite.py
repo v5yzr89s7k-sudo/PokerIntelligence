@@ -35,12 +35,28 @@ def main():
 
     passed = 0
     failed = 0
+    legacy = 0
 
     for hand in hands:
 
         print(f"{hand.name} ... ", end="", flush=True)
 
         try:
+            compatibility = (
+                hand.event_schema_compatibility()
+            )
+
+            if not compatibility["compatible"]:
+                print(
+                    "LEGACY — "
+                    + str(
+                        compatibility.get("reason")
+                        or "incompatible event schema"
+                    )
+                )
+                legacy += 1
+                continue
+
             generated = replay(
                 hand.events_path
             )
@@ -82,7 +98,10 @@ def main():
         f"Failed: {failed}"
     )
     print(
-        f"Total : {passed + failed}"
+        f"Legacy: {legacy}"
+    )
+    print(
+        f"Total : {passed + failed + legacy}"
     )
 
     return 0 if failed == 0 else 1

@@ -24,6 +24,10 @@ from src.api.position_engine import assign_positions
 from src.state.canonical_hand import CanonicalHand
 from src.state.canonical_hand_store import CanonicalHandStore
 from src.state.betting_round_tracker import BettingRoundTracker
+from src.state.preserved_action_reconciler import (
+    reconcile_preserved_actions,
+)
+
 from src.state.boundary_result_promoter import (
     promote_boundary_observation,
 )
@@ -180,6 +184,11 @@ def default_state():
         "canonical_snapshot_ready": False,
         "pending_board_events": [],
         "pending_inferred_actions": [],
+        # Physical actor observations that were chronologically valid but
+        # temporarily blocked by unresolved same-street commitment evidence.
+        # Preserve them until the blocking evidence settles.
+        "pending_actor_observations": [],
+        "pending_physical_actor_completions": [],
         "pending_stack_baseline_observations": [],
         "pending_stack_updates": [],
         "unresolved_stack_candidates": {},
@@ -187,6 +196,15 @@ def default_state():
         "pending_high_pot": None,
         "pending_terminal_events": [],
         "pending_boundary_results": [],
+        # Durable evidence for an ended street that is not yet semantically
+        # complete. Unlike pending_boundary_results, this survives the first
+        # eligible boundary replay so later deferred inferred actions can be
+        # reconciled against the same retrospective observations.
+        "preserved_boundary_evidence": {},
+        # Qualified inferred actions whose street has already ended. These
+        # are never sent through normal current-street ingestion again.
+        # They are consumed only by preserved-street reconciliation.
+        "preserved_inferred_actions": {},
         "winner_seat": None,
         "final_pot_bb": None,
         "timeline": [],
@@ -340,6 +358,14 @@ def seed_forced_blinds(state, canonical):
     # contributions, before the asynchronous observed-pot OCR returns.
     forced_pot_bb = float(canonical.expected_pot_bb or 0.0)
 
+    # Freeze the exact canonical forced-contribution baseline for the
+    # asynchronous initial table-pot observation. Later betting actions
+    # must not change the comparison baseline for that request.
+    state["forced_pot_baseline_bb"] = round(
+        forced_pot_bb,
+        6,
+    )
+
     preflop_summary = canonical.street_summaries.get("PREFLOP")
     if preflop_summary is not None:
         # This value is derived from the tournament level frozen for this hand:
@@ -372,9 +398,12 @@ def handle_table_snapshot(state, event):
     snapshot_dealt_in_seats = list(
         event.get("dealt_in_seats") or []
     )
+    # Structural hand topology is immutable once fast local table_context
+    # has established it. The asynchronous table snapshot is enrichment and
+    # validation only; it may never shrink or replace the starting roster.
     dealt_in_seats = (
-        snapshot_dealt_in_seats
-        or prior_dealt_in_seats
+        prior_dealt_in_seats
+        or snapshot_dealt_in_seats
     )
 
     event_hand_token = str(
@@ -441,22 +470,89 @@ def handle_table_snapshot(state, event):
             flush=True,
         )
 
-    dealer_button_seat = (
-        event.get("dealer_button_seat")
-        or state.get("dealer_button_seat")
-        or ""
+    # Preserve local structural truth when table_context already ran.
+    # Snapshot values remain the fallback for the legacy snapshot-first path.
+    prior_positions = dict(state.get("positions") or {})
+    prior_dealer = state.get("dealer_button_seat") or ""
+    prior_hero_position = state.get("hero_position") or ""
+
+    local_structure_ready = bool(
+        prior_dealt_in_seats
+        and prior_positions
     )
-    positions = dict(
-        event.get("positions")
-        or state.get("positions")
-        or {}
-    )
-    hero_position = (
-        event.get("hero_position")
-        or positions.get("hero")
-        or state.get("hero_position")
-        or "unknown"
-    )
+
+    if local_structure_ready:
+        dealer_button_seat = prior_dealer
+        positions = prior_positions
+        hero_position = (
+            prior_hero_position
+            or positions.get("hero")
+            or "unknown"
+        )
+    else:
+        dealer_button_seat = (
+            event.get("dealer_button_seat")
+            or prior_dealer
+            or ""
+        )
+        positions = dict(
+            event.get("positions")
+            or prior_positions
+            or {}
+        )
+        hero_position = (
+            event.get("hero_position")
+            or positions.get("hero")
+            or prior_hero_position
+            or "unknown"
+        )
+
+    # Merge snapshot enrichment by immutable physical seat. A missing
+    # snapshot seat must retain the local bootstrap player instead of
+    # disappearing from the hand.
+    prior_players_by_seat = {
+        item.get("seat"): dict(item)
+        for item in (state.get("players") or [])
+        if isinstance(item, dict) and item.get("seat")
+    }
+    snapshot_players_by_seat = {
+        item.get("seat"): dict(item)
+        for item in players
+        if isinstance(item, dict) and item.get("seat")
+    }
+
+    merged_players = []
+
+    for seat in dealt_in_seats:
+        prior_player = dict(
+            prior_players_by_seat.get(seat) or {}
+        )
+        snapshot_player = dict(
+            snapshot_players_by_seat.get(seat) or {}
+        )
+
+        merged = dict(prior_player)
+
+        for key, value in snapshot_player.items():
+            # Blank asynchronous fields are not enrichment.
+            if value is None or value == "":
+                continue
+            merged[key] = value
+
+        merged["seat"] = seat
+        merged.setdefault("is_hero", seat == "hero")
+        merged.setdefault("is_active", True)
+
+        # Never convert an unresolved physical seat into a player identity.
+        # Snapshot enrichment is keyed by immutable physical seat, so a blank
+        # name remains blank rather than borrowing or fabricating identity.
+        merged["name"] = str(
+            merged.get("name") or ""
+        ).strip()
+
+        merged_players.append(merged)
+
+    players = merged_players
 
     state["players"] = players
     state["dealt_in_seats"] = list(dealt_in_seats)
@@ -492,11 +588,15 @@ def handle_table_snapshot(state, event):
             dealt_in_seats=dealt_in_seats,
         )
 
-        # The canonical hand must still be PREFLOP here so mandatory
-        # contributions are never attached to FLOP/TURN/RIVER.
-        canonical.current_street = "PREFLOP"
-
-        seed_forced_blinds(state, canonical)
+        # If the asynchronous snapshot is the first usable structural
+        # context, retain the legacy initialization fallback. Normally the
+        # local table_context has already initialized canonical state.
+        #
+        # CRITICAL: never rewind an already-live FLOP/TURN/RIVER hand to
+        # PREFLOP merely because snapshot enrichment arrived late.
+        if not state.get("canonical_snapshot_ready"):
+            canonical.current_street = "PREFLOP"
+            seed_forced_blinds(state, canonical)
 
         state["canonical_snapshot_ready"] = True
         canonical_save(canonical)
@@ -663,26 +763,39 @@ def handle_table_snapshot(state, event):
 
 def handle_table_context(state, event):
     """
-    Temporary diagnostic event.
+    Fast local canonical bootstrap.
 
-    The initial table snapshot is now the authoritative source for:
-      - roster
-      - dealt-in seats
-      - dealer
-      - positions
-      - Hero position
-      - starting stacks
+    table_context is produced from local perception immediately after
+    Hero-card recognition. It supplies the frozen dealt-in roster, dealer,
+    positions, Hero position, and best available local stack observations.
 
-    table_context remains only to support participant validation during
-    the migration and will be removed after validation is complete.
+    This event MUST NOT wait for the asynchronous table snapshot. The
+    snapshot is enrichment/validation only. Once table_context has enough
+    structural poker information, CanonicalHand becomes live immediately so
+    qualified player actions can reach current_hand.txt without API latency.
     """
     dealt_in_seats = list(event.get("dealt_in_seats") or [])
     positions = dict(event.get("positions") or {})
     dealer_button_seat = event.get("dealer_button_seat") or ""
-    hero_position = event.get("hero_position") or positions.get("hero") or "unknown"
+    hero_position = (
+        event.get("hero_position")
+        or positions.get("hero")
+        or "unknown"
+    )
+    hand_token = str(event.get("hand_token") or "")
 
     if not dealt_in_seats:
-        print("[SKIP] table_context has no dealt-in seats", flush=True)
+        print(
+            "[TABLE_CONTEXT_DEFER] reason=no_dealt_in_seats",
+            flush=True,
+        )
+        return state
+
+    if state.get("phase") == "WAITING":
+        print(
+            "[TABLE_CONTEXT_DEFER] reason=canonical_hand_not_active",
+            flush=True,
+        )
         return state
 
     event_players = {
@@ -697,29 +810,277 @@ def handle_table_context(state, event):
     for seat in dealt_in_seats:
         local = event_players.get(seat) or {}
 
+        # Fast bootstrap publishes stack state immediately when local
+        # perception has already produced a trusted numeric observation.
+        #
+        # Ambiguous local OCR remains provisional and is preserved only as
+        # candidate evidence. It must still pass the existing independent
+        # pre-change baseline resolver before becoming canonical.
+        local_stack = local.get("stack_bb")
+
+        try:
+            local_confidence = float(
+                local.get("stack_confidence") or 0.0
+            )
+        except (TypeError, ValueError):
+            local_confidence = 0.0
+
+        trusted_local_stack = (
+            local_stack is not None
+            and local_confidence >= 0.95
+        )
+
+        stack_candidates = list(
+            local.get("stack_candidates") or []
+        )
+
+        if (
+            local_stack is not None
+            and local_stack not in stack_candidates
+        ):
+            stack_candidates.append(local_stack)
+
         players.append({
             "seat": seat,
-            "name": local.get("name") or seat,
-            "stack_bb": local.get("stack_bb"),
-            "stack_text": local.get("stack_text") or "",
+            # Physical geometry is not player identity. table_context owns
+            # topology and fast local stack evidence only. An unresolved name
+            # remains blank until same-seat snapshot identity enrichment
+            # arrives.
+            "name": str(local.get("name") or "").strip(),
+            "stack_bb": (
+                float(local_stack)
+                if trusted_local_stack
+                else None
+            ),
+            "stack_text": (
+                f"{float(local_stack):g} BB"
+                if trusted_local_stack
+                else ""
+            ),
+            "stack_candidates": stack_candidates,
             "stack_confidence": local.get("stack_confidence"),
-            "stack_read_mode": local.get("stack_read_mode") or "unknown",
+            "stack_read_mode": (
+                local.get("stack_read_mode") or "unknown"
+            ),
             "is_hero": seat == "hero",
             "is_active": True,
         })
 
-    # Snapshot is now the authoritative source for roster,
-    # positions, dealer, and dealt-in seats.
-    #
-    # table_context is retained temporarily for diagnostics and
-    # participant validation only.
+    state["players"] = players
+    state["dealt_in_seats"] = list(dealt_in_seats)
+    state["dealer_button_seat"] = dealer_button_seat
+    state["positions"] = positions
+    state["hero_position"] = hero_position
     state["participant_frame_count"] = int(
         event.get("participant_frame_count") or 0
     )
     state["participant_validation_recorded"] = False
 
+    if hand_token:
+        state["hand_token"] = hand_token
+
+    # table_snapshot may win the startup race and initialize CanonicalHand
+    # before the stronger local table_context arrives. In that ordering,
+    # canonical_snapshot_ready is already True, so the normal fast-bootstrap
+    # branch below will not run.
+    #
+    # Reconcile structural topology here. A larger local hand-start roster
+    # may promote the existing canonical table, but it may never shrink it.
+    if state.get("canonical_snapshot_ready"):
+        canonical = canonical_load()
+
+        canonical_seats = list(
+            canonical.dealt_in_seats
+            or canonical.players.keys()
+        )
+
+        canonical_seat_set = set(canonical_seats)
+        local_seat_set = set(dealt_in_seats)
+
+        structural_promotion = bool(
+            local_seat_set
+            and canonical_seat_set.issubset(local_seat_set)
+            and local_seat_set != canonical_seat_set
+        )
+
+        if structural_promotion:
+            existing_by_seat = {
+                seat: player
+                for seat, player in canonical.players.items()
+            }
+
+            promoted_players = []
+
+            for player_item in players:
+                seat = player_item.get("seat")
+
+                if not seat:
+                    continue
+
+                existing = existing_by_seat.get(seat)
+
+                item = dict(player_item)
+
+                # The asynchronous snapshot may already have better name/stack
+                # enrichment for seats it successfully recognized. Preserve
+                # that evidence while adopting the local seven-seat topology.
+                if existing is not None:
+                    item["name"] = str(
+                        existing.name
+                        or item.get("name")
+                        or ""
+                    ).strip()
+
+                    if existing.starting_stack_bb is not None:
+                        item["stack_bb"] = (
+                            existing.starting_stack_bb
+                        )
+
+                    existing_candidates = list(
+                        existing.starting_stack_candidates
+                        or []
+                    )
+
+                    if existing_candidates:
+                        item["stack_candidates"] = (
+                            existing_candidates
+                        )
+
+                    item["is_active"] = existing.active
+
+                promoted_players.append(item)
+
+            canonical.update_table_snapshot(
+                players=promoted_players,
+                hero_position=hero_position,
+                positions=positions,
+                dealt_in_seats=dealt_in_seats,
+            )
+
+            canonical_save(canonical)
+
+            # The persistent betting tracker may have been initialized against
+            # the smaller snapshot roster. Force it to rebuild from the
+            # promoted canonical topology before voluntary action begins.
+            reset_tracker()
+
+            print(
+                "[CANONICAL_STRUCTURE_PROMOTION] "
+                f"players={len(canonical_seats)}"
+                f"->{len(dealt_in_seats)} "
+                f"added={sorted(local_seat_set - canonical_seat_set)}",
+                flush=True,
+            )
+
+    if not state.get("canonical_snapshot_ready"):
+        canonical = CanonicalHand().start_hand(
+            hand_id=f"live-{int(state['hand_started_at'] * 1000)}",
+            players=players,
+            hero_cards=state.get("hero_cards", []),
+            hero_position=hero_position,
+            positions=positions,
+            started_ts=state["hand_started_at"],
+        )
+
+        canonical.dealt_in_seats = list(dealt_in_seats)
+
+        # Mandatory contributions are deterministic once local positions and
+        # the frozen dealt-in roster are known. Seed them now; do not wait for
+        # GPT name/stack enrichment.
+        canonical.current_street = "PREFLOP"
+        seed_forced_blinds(state, canonical)
+
+        state["canonical_snapshot_ready"] = True
+        canonical_save(canonical)
+
+        print(
+            "[CANONICAL_FAST_BOOTSTRAP] "
+            f"players={len(players)} "
+            f"dealer={dealer_button_seat or 'unknown'} "
+            f"hero_position={hero_position}",
+            flush=True,
+        )
+
+        # Events that raced ahead of the local bootstrap can now be consumed
+        # chronologically. This should normally be a very small queue.
+        pending_events = []
+
+        for pending_event in list(
+            state.get("pending_stack_baseline_observations") or []
+        ):
+            pending_events.append(
+                ("stack_baseline_observation", dict(pending_event))
+            )
+
+        for pending_event in list(
+            state.get("pending_stack_updates") or []
+        ):
+            pending_events.append(
+                ("stack_update", dict(pending_event))
+            )
+
+        for pending_event in list(
+            state.get("pending_pot_updates") or []
+        ):
+            pending_events.append(
+                ("pot_update", dict(pending_event))
+            )
+
+        for pending_event in list(
+            state.get("pending_board_events") or []
+        ):
+            pending_events.append(
+                ("board", dict(pending_event))
+            )
+
+        for pending_event in list(
+            state.get("pending_inferred_actions") or []
+        ):
+            pending_events.append(
+                ("inferred_action", dict(pending_event))
+            )
+
+        state["pending_stack_baseline_observations"] = []
+        state["pending_stack_updates"] = []
+        state["pending_pot_updates"] = []
+        state["pending_board_events"] = []
+        state["pending_inferred_actions"] = []
+
+        pending_events.sort(
+            key=lambda item: float(
+                item[1].get("ts") or 0.0
+            )
+        )
+
+        for event_type, pending_event in pending_events:
+            if event_type == "stack_baseline_observation":
+                state = handle_stack_baseline_observation(
+                    state,
+                    pending_event,
+                )
+            elif event_type == "stack_update":
+                state = handle_stack_update(
+                    state,
+                    pending_event,
+                )
+            elif event_type == "pot_update":
+                state = handle_pot_update(
+                    state,
+                    pending_event,
+                )
+            elif event_type == "board":
+                state = handle_board(
+                    state,
+                    pending_event,
+                )
+            elif event_type == "inferred_action":
+                state = handle_inferred_action(
+                    state,
+                    pending_event,
+                )
+
     print(
-        f"[STATE] table_context "
+        "[STATE] table_context "
         f"dealer={dealer_button_seat or 'unknown'} "
         f"hero_position={hero_position} "
         f"players={len(dealt_in_seats)}",
@@ -727,6 +1088,7 @@ def handle_table_context(state, event):
     )
 
     return state
+
 
 
 def handle_hero_cards(state, event):
@@ -1100,6 +1462,25 @@ def handle_pot_update(state, event):
         return state
 
     canonical = canonical_load()
+
+    if (
+        event.get("purpose") == "initial"
+        and event.get("forced_pot_baseline_bb") is not None
+    ):
+        adjustment = canonical.establish_starting_pot_adjustment(
+            observed,
+            float(event["forced_pot_baseline_bb"]),
+        )
+
+        print(
+            "[INITIAL_POT_BASELINE] "
+            f"observed={observed:.2f} "
+            f"forced_baseline="
+            f"{float(event['forced_pot_baseline_bb']):.2f} "
+            f"adjustment={float(adjustment):.2f}",
+            flush=True,
+        )
+
     expected = canonical.expected_pot_bb
 
     # A validated table-pot observation is authoritative. The reconstructed
@@ -1201,6 +1582,67 @@ def handle_pot_update(state, event):
 
     return state
 
+def release_pending_board_if_ready(state):
+    """
+    Promote the earliest confirmed board only after the current canonical
+    betting round is semantically complete.
+
+    Physical board visibility may race ahead of the final old-street action.
+    That visual evidence is preserved, but it must never advance canonical
+    street chronology while a player still owes action.
+    """
+    pending = list(
+        state.get("pending_board_events")
+        or []
+    )
+
+    if not pending:
+        return state
+
+    if not state.get("canonical_snapshot_ready"):
+        return state
+
+    canonical = canonical_load()
+    tracker = tracker_for_hand(canonical)
+
+    status = tracker.commitment_tracker.round_status(
+        canonical.current_street
+    )
+
+    if not status.get("complete"):
+        print(
+            "[BOARD_WAIT] "
+            f"street={canonical.current_street} "
+            f"owing={status.get('players_owing_action')} "
+            f"pending={len(pending)}",
+            flush=True,
+        )
+        return state
+
+    pending.sort(
+        key=lambda item: (
+            len(item.get("board") or []),
+            float(item.get("ts") or 0.0),
+        )
+    )
+
+    event = pending.pop(0)
+    state["pending_board_events"] = pending
+
+    print(
+        "[BOARD_RELEASE] "
+        f"street={canonical.current_street} "
+        f"board={event.get('board') or []} "
+        f"remaining={len(pending)}",
+        flush=True,
+    )
+
+    return handle_board(
+        state,
+        event,
+    )
+
+
 def handle_board(state, event):
     board = normalize_cards(event.get("board") or [])
     n = len(board)
@@ -1218,7 +1660,10 @@ def handle_board(state, event):
         return state
 
     if not state.get("canonical_snapshot_ready"):
-        pending = list(state.get("pending_board_events") or [])
+        pending = list(
+            state.get("pending_board_events")
+            or []
+        )
 
         pending.append({
             "board": board,
@@ -1236,29 +1681,85 @@ def handle_board(state, event):
 
         print(
             f"[STATE] buffered board len={n} "
-            f"waiting_for_snapshot",
+            "waiting_for_snapshot",
+            flush=True,
+        )
+
+        return state
+
+    canonical = canonical_load()
+    tracker = tracker_for_hand(canonical)
+
+    round_status = (
+        tracker.commitment_tracker.round_status(
+            canonical.current_street
+        )
+    )
+
+    if not round_status.get("complete"):
+        pending = list(
+            state.get("pending_board_events")
+            or []
+        )
+
+        candidate = {
+            "board": board,
+            "ts": event.get("ts") or time.time(),
+        }
+
+        # Board workers may repeat the same confirmed board while an old
+        # betting round is still resolving. Preserve one copy only.
+        if not any(
+            list(item.get("board") or []) == board
+            for item in pending
+        ):
+            pending.append(candidate)
+
+        pending.sort(
+            key=lambda item: (
+                len(item.get("board") or []),
+                float(item.get("ts") or 0.0),
+            )
+        )
+
+        state["pending_board_events"] = pending
+
+        print(
+            "[BOARD_WAIT] "
+            f"street={canonical.current_street} "
+            f"next={transition_for_board_len(n)} "
+            f"owing={round_status.get('players_owing_action')} "
+            f"board={board}",
             flush=True,
         )
 
         return state
 
     next_phase = transition_for_board_len(n)
+
     state["phase"] = next_phase
     state["board"] = board
     state["pending_high_pot"] = None
 
-    canonical = canonical_load()
     canonical.set_board(
         board,
         ts=event.get("ts") or time.time(),
     )
     canonical_save(canonical)
 
-    state = record_timeline(state, f"board {next_phase} {' '.join(board)}")
-    print(f"[STATE] board -> {next_phase}", board)
+    state = record_timeline(
+        state,
+        f"board {next_phase} {' '.join(board)}",
+    )
+
+    print(
+        f"[STATE] board -> {next_phase}",
+        board,
+    )
 
     pending_boundary = list(
-        state.get("pending_boundary_results") or []
+        state.get("pending_boundary_results")
+        or []
     )
 
     if pending_boundary:
@@ -1274,7 +1775,8 @@ def handle_board(state, event):
 
         for pending_result in pending_boundary:
             old = str(
-                pending_result.get("street") or ""
+                pending_result.get("street")
+                or ""
             ).upper()
 
             expected = {
@@ -1388,6 +1890,171 @@ def handle_hero_fold(state, event):
     return state
 
 
+def unresolved_stack_candidate_seats(
+    state,
+    street,
+):
+    street = str(street or "").upper()
+
+    return {
+        str(item.get("seat") or "")
+        for item in (
+            state.get("unresolved_stack_candidates")
+            or {}
+        ).values()
+        if (
+            str(item.get("street") or "").upper()
+            == street
+            and item.get("seat")
+        )
+    }
+
+
+def physical_completion_stack_blocked(
+    state,
+    street,
+    seat,
+):
+    """
+    Return True only when an unresolved stack candidate contains
+    independent commitment evidence strong enough to veto direct
+    physical actor-completion evidence.
+
+    stack_motion alone is a visual-change hypothesis. It must not
+    indefinitely block calibrated opponent-card disappearance for
+    the current chronological actor.
+
+    Bet-region evidence remains a blocker because it independently
+    supports chip commitment by this seat.
+    """
+    street = str(street or "").upper()
+    seat = str(seat or "")
+
+    candidate = (
+        state.get("unresolved_stack_candidates")
+        or {}
+    ).get(
+        f"{street}:{seat}"
+    )
+
+    if not candidate:
+        return False
+
+    sources = {
+        str(source)
+        for source in (
+            candidate.get("sources")
+            or []
+        )
+        if source
+    }
+
+    commitment_sources = {
+        "bet_region_appeared",
+        "bet_region_occupied",
+    }
+
+    blocked = bool(
+        sources & commitment_sources
+    )
+
+    print(
+        "[PHYSICAL_STACK_ARBITRATION] "
+        f"street={street} "
+        f"seat={seat} "
+        f"sources={sorted(sources)} "
+        f"blocked={blocked}",
+        flush=True,
+    )
+
+    return blocked
+
+
+def preserve_pending_actor_observation(
+    state,
+    event,
+):
+    pending = list(
+        state.get("pending_actor_observations")
+        or []
+    )
+
+    candidate = dict(event)
+
+    # Same physical observation may be encountered more than once during
+    # replay/reconciliation. Keep it idempotent.
+    key = (
+        str(candidate.get("hand_token") or ""),
+        str(candidate.get("street") or "").upper(),
+        str(candidate.get("seat") or ""),
+        float(candidate.get("ts") or 0.0),
+    )
+
+    existing_keys = {
+        (
+            str(item.get("hand_token") or ""),
+            str(item.get("street") or "").upper(),
+            str(item.get("seat") or ""),
+            float(item.get("ts") or 0.0),
+        )
+        for item in pending
+    }
+
+    if key not in existing_keys:
+        pending.append(candidate)
+
+    pending.sort(
+        key=lambda item: float(
+            item.get("ts") or 0.0
+        )
+    )
+
+    state["pending_actor_observations"] = pending
+
+    print(
+        "[ACTOR_OBSERVED_DEFER] "
+        f"street={candidate.get('street')} "
+        f"seat={candidate.get('seat')} "
+        f"pending={len(pending)}",
+        flush=True,
+    )
+
+    return state
+
+
+def replay_pending_actor_observations(state):
+    pending = list(
+        state.get("pending_actor_observations")
+        or []
+    )
+
+    if not pending:
+        return state
+
+    pending.sort(
+        key=lambda item: float(
+            item.get("ts") or 0.0
+        )
+    )
+
+    state["pending_actor_observations"] = []
+
+    print(
+        "[ACTOR_OBSERVED_REPLAY] "
+        f"count={len(pending)}",
+        flush=True,
+    )
+
+    for pending_event in pending:
+        state = handle_actor_observed(
+            state,
+            pending_event,
+            preserve_if_blocked=True,
+        )
+
+    return state
+
+
 def handle_stack_candidate_opened(state, event):
     seat = str(event.get("seat") or "")
     street = str(event.get("street") or "").upper()
@@ -1447,9 +2114,56 @@ def handle_stack_candidate_closed(state, event):
         or {}
     )
 
-    if seat and street:
+    reason = str(
+        event.get("reason")
+        or "candidate_removed"
+    )
+
+    candidate_key = (
+        f"{street}:{seat}"
+        if seat and street
+        else ""
+    )
+
+    if (
+        candidate_key
+        and reason == "validated_stack_transition"
+    ):
+        # Validation proves a quantitative action exists, but the matching
+        # inferred_action is produced asynchronously by ActionEpisodeManager.
+        #
+        # Do NOT release preserved later actors in the gap between these two
+        # events. Otherwise chronology can fabricate a passive action for this
+        # seat immediately before its real quantitative action arrives.
+        candidate = dict(
+            candidates.get(candidate_key)
+            or {}
+        )
+
+        candidate.update({
+            "seat": seat,
+            "street": street,
+            "awaiting_action": True,
+            "resolved_reason": reason,
+            "resolved_ts": event.get("ts"),
+        })
+
+        candidates[candidate_key] = candidate
+        state["unresolved_stack_candidates"] = candidates
+
+        print(
+            "[STACK_CANDIDATE_STATE] "
+            f"resolved_waiting_action seat={seat} "
+            f"street={street} "
+            f"reason={reason}",
+            flush=True,
+        )
+
+        return state
+
+    if candidate_key:
         candidates.pop(
-            f"{street}:{seat}",
+            candidate_key,
             None,
         )
 
@@ -1458,9 +2172,545 @@ def handle_stack_candidate_closed(state, event):
     print(
         "[STACK_CANDIDATE_STATE] "
         f"closed seat={seat} street={street} "
-        f"reason={event.get('reason') or 'candidate_removed'}",
+        f"reason={reason}",
         flush=True,
     )
+
+    # Ordinary candidate closure means no unresolved quantitative action
+    # remains for this seat. Preserved later actors may now be reconsidered.
+    state = replay_pending_actor_observations(
+        state
+    )
+
+    return state
+
+
+def handle_actor_observed(
+    state,
+    event,
+    *,
+    preserve_if_blocked=True,
+):
+    """
+    Advance canonical action chronology to a physically observed actor.
+
+    This event carries chronology evidence only. It does NOT classify the
+    observed actor's action or assign sizing. Earlier seats may be resolved
+    passively only when no unresolved same-street commitment evidence blocks
+    the gap.
+    """
+    if state.get("phase") == "WAITING":
+        print("[SKIP] actor_observed while waiting", event)
+        return state
+
+    if not state.get("canonical_snapshot_ready"):
+        print(
+            "[SKIP] actor_observed before canonical bootstrap "
+            f"seat={event.get('seat')}",
+            flush=True,
+        )
+        return state
+
+    seat = str(event.get("seat") or "")
+    event_street = str(
+        event.get("street") or state.get("phase") or ""
+    ).upper()
+    current_street = str(state.get("phase") or "").upper()
+
+    if not seat:
+        return state
+
+    if event_street != current_street:
+        print(
+            "[ACTOR_OBSERVED_SKIP] "
+            f"seat={seat} "
+            f"event_street={event_street} "
+            f"current_street={current_street} "
+            "reason=street_mismatch",
+            flush=True,
+        )
+        return state
+
+    event_token = str(event.get("hand_token") or "")
+    current_token = str(state.get("hand_token") or "")
+
+    if (
+        event_token
+        and current_token
+        and event_token != current_token
+    ):
+        print(
+            "[ACTOR_OBSERVED_SKIP] "
+            f"seat={seat} reason=hand_token_mismatch",
+            flush=True,
+        )
+        return state
+
+    canonical = canonical_load()
+
+    if str(canonical.current_street or "").upper() != event_street:
+        print(
+            "[ACTOR_OBSERVED_SKIP] "
+            f"seat={seat} "
+            f"canonical_street={canonical.current_street} "
+            f"event_street={event_street} "
+            "reason=canonical_street_mismatch",
+            flush=True,
+        )
+        return state
+
+    if seat not in canonical.players:
+        print(
+            "[ACTOR_OBSERVED_SKIP] "
+            f"seat={seat} reason=unknown_seat",
+            flush=True,
+        )
+        return state
+
+    blocked_seats = unresolved_stack_candidate_seats(
+        state,
+        event_street,
+    )
+
+    # The coordinator may observe stack motion and a later actor in the same
+    # local frame. api_events.jsonl has not necessarily delivered the
+    # stack_candidate_opened event yet, so preserve those same-frame seats as
+    # conservative chronology blockers directly on actor_observed.
+    blocked_seats.update(
+        str(seat)
+        for seat in (event.get("blocked_seats") or [])
+        if seat
+    )
+
+    tracker = tracker_for_hand(canonical)
+
+    queue_before = list(
+        canonical.players_to_act or []
+    )
+
+    actor_index = (
+        queue_before.index(seat)
+        if seat in queue_before
+        else -1
+    )
+
+    skipped_before = (
+        queue_before[:actor_index]
+        if actor_index > 0
+        else []
+    )
+
+    blocking_gap = [
+        skipped_seat
+        for skipped_seat in skipped_before
+        if skipped_seat in blocked_seats
+    ]
+
+    added = tracker.advance_to_observed_actor(
+        seat,
+        ts=event.get("ts") or time.time(),
+        blocked_seats=blocked_seats,
+    )
+
+    if (
+        not added
+        and blocking_gap
+        and preserve_if_blocked
+    ):
+        state = preserve_pending_actor_observation(
+            state,
+            event,
+        )
+
+        print(
+            "[ACTOR_OBSERVED_BLOCKED_PRESERVED] "
+            f"street={event_street} "
+            f"actor={seat} "
+            f"blocked={blocking_gap}",
+            flush=True,
+        )
+
+        return state
+
+    if added:
+        canonical_save(canonical)
+
+        for action in added:
+            print(
+                "[CANONICAL_ACTION_ORDER] "
+                f"{action.street} "
+                f"{action.seat} "
+                f"{action.action} "
+                f"trigger_actor={seat}",
+                flush=True,
+            )
+
+            state = record_timeline(
+                state,
+                "action_order "
+                f"{action.street} "
+                f"{action.seat} "
+                f"{action.action}",
+            )
+
+        write_betting_round_status(
+            tracker,
+            canonical,
+            state,
+        )
+
+        state = replay_pending_physical_actor_completions(
+            state
+        )
+
+        # Chronology advancement may make an already-qualified quantitative
+        # action admissible. Retry the normal inference queue immediately.
+        pending = list(
+            state.get("pending_inferred_actions")
+            or []
+        )
+
+        if pending:
+            state["pending_inferred_actions"] = []
+
+            pending.sort(
+                key=lambda item: float(
+                    item.get("ts") or 0.0
+                )
+            )
+
+            print(
+                "[REPLAY] actor_observed retrying "
+                f"{len(pending)} deferred inferred actions",
+                flush=True,
+            )
+
+            for pending_event in pending:
+                state = handle_inferred_action(
+                    state,
+                    pending_event,
+                )
+
+    return state
+
+
+def preserve_physical_actor_completion(
+    state,
+    event,
+):
+    pending = list(
+        state.get(
+            "pending_physical_actor_completions"
+        )
+        or []
+    )
+
+    key = (
+        str(event.get("hand_token") or ""),
+        str(event.get("street") or "").upper(),
+        str(event.get("seat") or ""),
+    )
+
+    existing = {
+        (
+            str(item.get("hand_token") or ""),
+            str(item.get("street") or "").upper(),
+            str(item.get("seat") or ""),
+        )
+        for item in pending
+    }
+
+    if key not in existing:
+        pending.append(dict(event))
+
+    pending.sort(
+        key=lambda item: float(
+            item.get("ts") or 0.0
+        )
+    )
+
+    state[
+        "pending_physical_actor_completions"
+    ] = pending
+
+    return state
+
+
+def replay_pending_physical_actor_completions(
+    state,
+):
+    pending = list(
+        state.get(
+            "pending_physical_actor_completions"
+        )
+        or []
+    )
+
+    if not pending:
+        return state
+
+    state[
+        "pending_physical_actor_completions"
+    ] = []
+
+    pending.sort(
+        key=lambda item: float(
+            item.get("ts") or 0.0
+        )
+    )
+
+    for pending_event in pending:
+        state = handle_physical_actor_completed(
+            state,
+            pending_event,
+            preserve_if_blocked=True,
+        )
+
+    return state
+
+
+def handle_physical_actor_completed(
+    state,
+    event,
+    *,
+    preserve_if_blocked=True,
+):
+    """
+    Consume neutral physical completion evidence only when that seat
+    is the current head of canonical players_to_act.
+
+    Evidence for a later seat is preserved. It can never jump an
+    unresolved earlier actor.
+    """
+    if state.get("phase") == "WAITING":
+        return state
+
+    if not state.get("canonical_snapshot_ready"):
+        if preserve_if_blocked:
+            return preserve_physical_actor_completion(
+                state,
+                event,
+            )
+        return state
+
+    seat = str(
+        event.get("seat")
+        or ""
+    )
+
+    event_street = str(
+        event.get("street")
+        or state.get("phase")
+        or ""
+    ).upper()
+
+    current_street = str(
+        state.get("phase")
+        or ""
+    ).upper()
+
+    if not seat:
+        return state
+
+    if event_street != current_street:
+        print(
+            "[PHYSICAL_ACTOR_SKIP] "
+            f"seat={seat} "
+            f"event_street={event_street} "
+            f"current_street={current_street} "
+            "reason=street_mismatch",
+            flush=True,
+        )
+        return state
+
+    event_token = str(
+        event.get("hand_token")
+        or ""
+    )
+
+    current_token = str(
+        state.get("hand_token")
+        or ""
+    )
+
+    if (
+        event_token
+        and current_token
+        and event_token != current_token
+    ):
+        return state
+
+    canonical = canonical_load()
+
+    if (
+        str(
+            canonical.current_street
+            or ""
+        ).upper()
+        != event_street
+    ):
+        return state
+
+    if seat not in canonical.players:
+        return state
+
+    queue = list(
+        canonical.players_to_act
+        or []
+    )
+
+    if not queue:
+        return state
+
+    if queue[0] != seat:
+        # A later physical completion is also chronology evidence that all
+        # earlier seats have already completed their actions. Reuse the
+        # existing actor_observed path, which may resolve only safe passive
+        # predecessors and is blocked by unresolved commitment evidence.
+        state = handle_actor_observed(
+            state,
+            {
+                "type": "actor_observed",
+                "hand_token": event_token,
+                "seat": seat,
+                "street": event_street,
+                "source": (
+                    event.get("source")
+                    or "physical_actor_completed"
+                ),
+                "blocked_seats": list(
+                    event.get("blocked_seats")
+                    or []
+                ),
+                "ts": event.get("ts") or time.time(),
+            },
+            preserve_if_blocked=preserve_if_blocked,
+        )
+
+        # actor_observed may have advanced the queue through missed passive
+        # predecessors. Reload the canonical hand before applying the direct
+        # head-only physical completion.
+        canonical = canonical_load()
+        queue = list(
+            canonical.players_to_act
+            or []
+        )
+
+        if not queue or queue[0] != seat:
+            if preserve_if_blocked:
+                state = preserve_physical_actor_completion(
+                    state,
+                    event,
+                )
+
+            print(
+                "[PHYSICAL_ACTOR_PENDING] "
+                f"street={event_street} "
+                f"seat={seat} "
+                f"head={queue[0] if queue else None}",
+                flush=True,
+            )
+
+            return state
+
+    # Do not resolve through unresolved quantitative commitment evidence.
+    if physical_completion_stack_blocked(
+        state,
+        event_street,
+        seat,
+    ):
+        if preserve_if_blocked:
+            state = preserve_physical_actor_completion(
+                state,
+                event,
+            )
+
+        print(
+            "[PHYSICAL_ACTOR_PENDING] "
+            f"street={event_street} "
+            f"seat={seat} "
+            "reason=unresolved_stack_candidate",
+            flush=True,
+        )
+
+        return state
+
+    tracker = tracker_for_hand(
+        canonical
+    )
+
+    added = (
+        tracker.resolve_physically_completed_actor(
+            seat,
+            ts=event.get("ts") or time.time(),
+        )
+    )
+
+    if not added:
+        if preserve_if_blocked:
+            state = preserve_physical_actor_completion(
+                state,
+                event,
+            )
+        return state
+
+    canonical_save(
+        canonical
+    )
+
+    for action in added:
+        print(
+            "[CANONICAL_PHYSICAL_ACTION] "
+            f"{action.street} "
+            f"{action.seat} "
+            f"{action.action}",
+            flush=True,
+        )
+
+        state = record_timeline(
+            state,
+            "physical_action "
+            f"{action.street} "
+            f"{action.seat} "
+            f"{action.action}",
+        )
+
+    write_betting_round_status(
+        tracker,
+        canonical,
+        state,
+    )
+
+    # Head advancement may make another preserved physical
+    # completion immediately admissible.
+    state = (
+        replay_pending_physical_actor_completions(
+            state
+        )
+    )
+
+    # It may also unblock normal deferred quantitative actions.
+    pending = list(
+        state.get("pending_inferred_actions")
+        or []
+    )
+
+    if pending:
+        state[
+            "pending_inferred_actions"
+        ] = []
+
+        pending.sort(
+            key=lambda item: float(
+                item.get("ts") or 0.0
+            )
+        )
+
+        for pending_event in pending:
+            state = handle_inferred_action(
+                state,
+                pending_event,
+            )
 
     return state
 
@@ -1535,6 +2785,59 @@ def handle_inferred_action(state, event):
         "unsettled_stack_evidence_seats"
     ] = unsettled_stack_evidence_seats
 
+    canonical_street = str(
+        canonical.current_street or ""
+    ).upper()
+
+    if (
+        action_street
+        and action_street != canonical_street
+    ):
+        evidence_key = (
+            f"{str(state.get('hand_token') or '')}:"
+            f"{action_street}"
+        )
+
+        preserved_boundary = (
+            state.get("preserved_boundary_evidence")
+            or {}
+        )
+
+        if evidence_key in preserved_boundary:
+            state = preserve_old_street_inferred_action(
+                state,
+                tracker_event,
+            )
+
+            state, reconciled = (
+                reconcile_preserved_inferred_actions(
+                    state,
+                    hand_token=state.get("hand_token"),
+                    street=action_street,
+                )
+            )
+
+            if reconciled:
+                state = record_timeline(
+                    state,
+                    "preserved_action_reconciled "
+                    f"{action_street}",
+                )
+
+                return state
+
+            print(
+                "[CANONICAL_DEFER_OLD_STREET] "
+                f"street={action_street} "
+                f"current={canonical_street} "
+                f"seat={seat} "
+                f"action={event.get('action')} "
+                "reason=preserved_boundary_context",
+                flush=True,
+            )
+
+            return state
+
     added = tracker.ingest(tracker_event)
 
     status = write_betting_round_status(
@@ -1595,6 +2898,56 @@ def handle_inferred_action(state, event):
         f"{added.seat} {added.action}",
     )
 
+    # A validated stack candidate remains a chronology blocker until the
+    # corresponding quantitative inferred_action is actually canonical.
+    #
+    # Release it only after tracker.ingest() succeeds. Deferred/rejected
+    # actions return above and therefore keep their blocker intact.
+    candidates = dict(
+        state.get("unresolved_stack_candidates")
+        or {}
+    )
+
+    candidate_key = (
+        f"{str(added.street or '').upper()}:"
+        f"{str(added.seat or '')}"
+    )
+
+    candidate = candidates.get(
+        candidate_key
+    )
+
+    if (
+        isinstance(candidate, dict)
+        and candidate.get("awaiting_action")
+    ):
+        candidates.pop(
+            candidate_key,
+            None,
+        )
+
+        state["unresolved_stack_candidates"] = (
+            candidates
+        )
+
+        print(
+            "[STACK_CANDIDATE_STATE] "
+            f"action_consumed seat={added.seat} "
+            f"street={added.street}",
+            flush=True,
+        )
+
+        # The real quantitative action is canonical now. Only now is it safe
+        # to reconsider physical observations of later actors that were
+        # preserved behind this commitment.
+        state = replay_pending_actor_observations(
+            state
+        )
+
+    state = replay_pending_physical_actor_completions(
+        state
+    )
+
     pending = list(
         state.get("pending_inferred_actions") or []
     )
@@ -1618,6 +2971,13 @@ def handle_inferred_action(state, event):
                 state,
                 pending_event,
             )
+
+    # A physical next-street board may already be waiting. The action just
+    # accepted above can be the final obligation on the old street, so promote
+    # that board immediately rather than waiting for another unrelated event.
+    state = release_pending_board_if_ready(
+        state
+    )
 
     return state
 
@@ -1851,6 +3211,729 @@ def handle_hand_complete(state, event):
     return default_state()
 
 
+def preserve_boundary_evidence(state, result):
+    """
+    Retain objective old-street boundary evidence until that preserved
+    betting round is semantically complete.
+
+    This is evidence storage only. It assigns no poker action.
+    """
+    hand_token = str(
+        result.get("hand_token") or ""
+    )
+
+    street = str(
+        result.get("street") or ""
+    ).upper()
+
+    if (
+        not hand_token
+        or street not in (
+            "PREFLOP",
+            "FLOP",
+            "TURN",
+        )
+    ):
+        return state
+
+    store = dict(
+        state.get("preserved_boundary_evidence")
+        or {}
+    )
+
+    key = f"{hand_token}:{street}"
+
+    existing = dict(
+        store.get(key) or {}
+    )
+
+    observations_by_seat = dict(
+        existing.get("observations_by_seat")
+        or {}
+    )
+
+    for item in list(
+        result.get("observations") or []
+    ):
+        if not isinstance(item, dict):
+            continue
+
+        seat = str(
+            item.get("seat") or ""
+        )
+
+        observation = item.get("observation")
+
+        if (
+            not seat
+            or not isinstance(observation, dict)
+        ):
+            continue
+
+        observations_by_seat[seat] = {
+            "seat": seat,
+            "observation": dict(observation),
+        }
+
+    existing.update({
+        "hand_token": hand_token,
+        "street": street,
+        "request_id": str(
+            result.get("request_id") or ""
+        ),
+        "observations_by_seat": (
+            observations_by_seat
+        ),
+        "last_result_ts": (
+            result.get("ts")
+            or time.time()
+        ),
+    })
+
+    store[key] = existing
+    state["preserved_boundary_evidence"] = store
+
+    print(
+        "[BOUNDARY_EVIDENCE_PRESERVED] "
+        f"street={street} "
+        f"seats={list(observations_by_seat)} "
+        f"request={existing['request_id'][:8]}",
+        flush=True,
+    )
+
+    return state
+
+
+def preserve_old_street_inferred_action(
+    state,
+    event,
+):
+    """
+    Retain one already-qualified inferred action for historical reconciliation.
+
+    This does not assign canonical semantics and is not a stale-action bypass.
+    """
+    hand_token = str(
+        state.get("hand_token") or ""
+    )
+
+    street = str(
+        event.get("street") or ""
+    ).upper()
+
+    seat = str(
+        event.get("seat") or ""
+    )
+
+    if (
+        not hand_token
+        or street not in (
+            "PREFLOP",
+            "FLOP",
+            "TURN",
+        )
+        or not seat
+    ):
+        return state
+
+    store = dict(
+        state.get("preserved_inferred_actions")
+        or {}
+    )
+
+    key = f"{hand_token}:{street}"
+
+    bucket = dict(
+        store.get(key) or {}
+    )
+
+    by_seat = dict(
+        bucket.get("actions_by_seat")
+        or {}
+    )
+
+    existing = by_seat.get(seat)
+
+    # Keep the strongest/latest qualified evidence for one seat while
+    # remaining deterministic under duplicate event delivery.
+    if existing is None:
+        by_seat[seat] = dict(event)
+    else:
+        existing_confidence = float(
+            existing.get("confidence") or 0.0
+        )
+        new_confidence = float(
+            event.get("confidence") or 0.0
+        )
+
+        existing_ts = float(
+            existing.get("ts") or 0.0
+        )
+        new_ts = float(
+            event.get("ts") or 0.0
+        )
+
+        if (
+            new_confidence > existing_confidence
+            or (
+                new_confidence == existing_confidence
+                and new_ts >= existing_ts
+            )
+        ):
+            by_seat[seat] = dict(event)
+
+    bucket.update({
+        "hand_token": hand_token,
+        "street": street,
+        "actions_by_seat": by_seat,
+    })
+
+    store[key] = bucket
+    state["preserved_inferred_actions"] = store
+
+    print(
+        "[OLD_STREET_ACTION_PRESERVED] "
+        f"street={street} "
+        f"seat={seat} "
+        f"action={event.get('action')} "
+        f"delta={event.get('delta_bb')}",
+        flush=True,
+    )
+
+    return state
+
+
+def reconcile_preserved_inferred_actions(
+    state,
+    *,
+    hand_token,
+    street,
+):
+    """
+    Promote a complete qualified historical PREFLOP sequence immediately.
+
+    This repairs event arrival order only. It does not weaken the normal
+    BettingRoundTracker stale-street contract and it does not manufacture
+    semantics for a committed player whose own qualified event is absent.
+    """
+    hand_token = str(hand_token or "")
+    street = str(street or "").upper()
+
+    if not hand_token or not street:
+        return state, False
+
+    key = f"{hand_token}:{street}"
+
+    store = (
+        state.get("preserved_inferred_actions")
+        or {}
+    )
+
+    bucket = store.get(key)
+
+    if not isinstance(bucket, dict):
+        return state, False
+
+    qualified = dict(
+        bucket.get("actions_by_seat")
+        or {}
+    )
+
+    if not qualified:
+        return state, False
+
+    canonical = canonical_load()
+    tracker = tracker_for_hand(canonical)
+
+    reconciliation = reconcile_preserved_actions(
+        hand=canonical,
+        commitment_tracker=tracker.commitment_tracker,
+        street=street,
+        qualified_actions=qualified,
+    )
+
+    if not reconciliation.resolved:
+        print(
+            "[PRESERVED_ACTION_RECONCILE_WAIT] "
+            f"street={street} "
+            f"reason={reconciliation.reason}",
+            flush=True,
+        )
+        return state, False
+
+    # Historical actions already present are never duplicated.
+    existing = {
+        (
+            str(action.street or "").upper(),
+            action.seat,
+            action.action,
+        )
+        for action in canonical.actions
+    }
+
+    added = []
+
+    for item in reconciliation.actions:
+        identity = (
+            street,
+            item["seat"],
+            item["action"],
+        )
+
+        if identity in existing:
+            continue
+
+        action = canonical.add_boundary_action(
+            street=street,
+            seat=item["seat"],
+            action=item["action"],
+            amount_bb=item.get("amount_bb"),
+            raise_to_bb=item.get("raise_to_bb"),
+            confidence=item.get("confidence"),
+            source=item.get("source"),
+            evidence=item.get("evidence"),
+            ts=item.get("ts"),
+        )
+
+        existing.add(identity)
+
+        added.append(
+            (
+                action.seat,
+                action.action,
+            )
+        )
+
+    if not added:
+        return state, False
+
+    # The reconstructed sequence is complete through its latest qualified
+    # actor. Rebuild only the preserved OLD-STREET obligation state.
+    #
+    # This does not touch CanonicalHand.current_street, players_to_act,
+    # current_bet_bb, or last_aggressor_seat for the live street.
+    old_state = tracker.commitment_tracker._state(
+        street
+    )
+
+    old_order = list(
+        old_state.street_order
+        or []
+    )
+
+    tracker.commitment_tracker.reset_street(
+        street
+    )
+
+    tracker.commitment_tracker.initialize_street_order(
+        street,
+        old_order,
+    )
+
+    tracker.commitment_tracker.sync_queue(
+        street,
+        old_order,
+    )
+
+    for item in reconciliation.actions:
+        seat = item["seat"]
+        action = item["action"]
+
+        if action == "FOLD":
+            tracker.commitment_tracker.consume_pending_action(
+                street,
+                seat,
+            )
+
+            tracker.commitment_tracker.record_action(
+                street,
+                seat,
+            )
+
+            continue
+
+        tracker.commitment_tracker.record_commitment(
+            street,
+            seat,
+        )
+
+        if action == "RAISE":
+            tracker.commitment_tracker.consume_pending_action(
+                street,
+                seat,
+            )
+
+            eligible = [
+                candidate
+                for candidate in old_order
+                if candidate != seat
+                and canonical.players.get(candidate)
+                and canonical.players[candidate].active
+                and not canonical.players[candidate].folded
+                and not canonical.players[candidate].all_in
+            ]
+
+            tracker.commitment_tracker.open_response_queue(
+                street,
+                seat,
+                eligible,
+            )
+
+            tracker.commitment_tracker.record_action(
+                street,
+                seat,
+                current_price=float(
+                    item.get("raise_to_bb")
+                    or 0.0
+                ),
+                last_aggressor=seat,
+                betting_open=True,
+            )
+
+            continue
+
+        # CALL
+        status = (
+            tracker.commitment_tracker
+            .round_status(street)
+        )
+
+        if status.get("betting_open"):
+            tracker.commitment_tracker.record_response(
+                street,
+                seat,
+            )
+        else:
+            tracker.commitment_tracker.consume_pending_action(
+                street,
+                seat,
+            )
+
+        tracker.commitment_tracker.record_action(
+            street,
+            seat,
+        )
+
+    canonical_save(canonical)
+
+    print(
+        "[PRESERVED_ACTION_RECONCILED] "
+        f"street={street} "
+        f"actions={added}",
+        flush=True,
+    )
+
+    # A validated quantitative stack candidate remains a chronology blocker
+    # until its corresponding inferred_action is actually canonical.
+    #
+    # Historical reconciliation is another canonicalization path, so it must
+    # complete the same transaction as the ordinary tracker.ingest() path.
+    # Only consume candidates for seats that supplied qualified quantitative
+    # evidence to this successful reconciliation. Passive reconstructed seats
+    # must never consume unrelated stack candidates.
+    candidates = dict(
+        state.get("unresolved_stack_candidates")
+        or {}
+    )
+
+    consumed_candidate = False
+
+    for qualified_seat in qualified:
+        candidate_key = (
+            f"{street}:{qualified_seat}"
+        )
+
+        candidate = candidates.get(
+            candidate_key
+        )
+
+        if (
+            isinstance(candidate, dict)
+            and candidate.get("awaiting_action")
+        ):
+            candidates.pop(
+                candidate_key,
+                None,
+            )
+
+            consumed_candidate = True
+
+            print(
+                "[STACK_CANDIDATE_STATE] "
+                f"action_consumed seat={qualified_seat} "
+                f"street={street} "
+                "path=preserved_reconciliation",
+                flush=True,
+            )
+
+    if consumed_candidate:
+        state["unresolved_stack_candidates"] = (
+            candidates
+        )
+
+        # Match the ordinary canonical-action transaction: once the real
+        # quantitative action owns this commitment, chronology that was held
+        # behind its blocker may safely be reconsidered.
+        state = replay_pending_actor_observations(
+            state
+        )
+
+    state = clear_preserved_inferred_actions(
+        state,
+        hand_token=hand_token,
+        street=street,
+    )
+
+    state = clear_preserved_boundary_evidence(
+        state,
+        hand_token=hand_token,
+        street=street,
+    )
+
+    write_betting_round_status(
+        tracker,
+        canonical,
+        state,
+    )
+
+    return state, True
+
+
+def clear_preserved_inferred_actions(
+    state,
+    *,
+    hand_token,
+    street,
+):
+    store = dict(
+        state.get("preserved_inferred_actions")
+        or {}
+    )
+
+    key = (
+        f"{str(hand_token or '')}:"
+        f"{str(street or '').upper()}"
+    )
+
+    if key in store:
+        store.pop(key, None)
+        state["preserved_inferred_actions"] = store
+
+        print(
+            "[OLD_STREET_ACTIONS_CLEARED] "
+            f"street={str(street or '').upper()}",
+            flush=True,
+        )
+
+    return state
+
+
+def clear_preserved_boundary_evidence(
+    state,
+    *,
+    hand_token,
+    street,
+):
+    store = dict(
+        state.get("preserved_boundary_evidence")
+        or {}
+    )
+
+    key = (
+        f"{str(hand_token or '')}:"
+        f"{str(street or '').upper()}"
+    )
+
+    if key in store:
+        store.pop(key, None)
+        state["preserved_boundary_evidence"] = store
+
+        print(
+            "[BOUNDARY_EVIDENCE_CLEARED] "
+            f"street={str(street or '').upper()}",
+            flush=True,
+        )
+
+    return state
+
+
+def resolve_silent_boundary_obligations(
+    state,
+    *,
+    canonical,
+    tracker,
+    street,
+    observed_seats=None,
+):
+    """
+    Conservatively complete silent old-street obligations at a physically
+    confirmed next-street boundary.
+
+    This is a recovery path, not the normal live action path.
+
+    Safety:
+    - process owing seats strictly in poker response order;
+    - never cross a seat with explicit boundary evidence that failed to
+      resolve;
+    - never cross unresolved stack evidence;
+    - never cross preserved qualified action evidence;
+    - facing open aggression, a silent seat with no contrary evidence folds;
+    - on an unopened postflop street, a silent seat checks;
+    - unopened PREFLOP remains unresolved because blind semantics differ.
+    """
+    street = str(street or "").upper()
+    observed_seats = set(observed_seats or [])
+
+    unresolved_candidates = {
+        str(item.get("seat") or "")
+        for item in (
+            state.get("unresolved_stack_candidates")
+            or {}
+        ).values()
+        if (
+            str(item.get("street") or "").upper()
+            == street
+            and item.get("seat")
+        )
+    }
+
+    preserved_key = (
+        f"{str(state.get('hand_token') or '')}:"
+        f"{street}"
+    )
+
+    preserved_actions = (
+        state.get("preserved_inferred_actions")
+        or {}
+    ).get(preserved_key) or {}
+
+    resolved = []
+
+    while True:
+        status = (
+            tracker.commitment_tracker
+            .round_status(street)
+        )
+
+        owing = list(
+            status.get("players_owing_action")
+            or []
+        )
+
+        if not owing:
+            break
+
+        seat = owing[0]
+
+        # An explicit boundary observation existed for this seat but did not
+        # resolve it. Never replace ambiguous quantitative evidence with a
+        # passive guess.
+        if seat in observed_seats:
+            print(
+                "[BOUNDARY_PASSIVE_BLOCK] "
+                f"street={street} "
+                f"seat={seat} "
+                "reason=explicit_boundary_observation_unresolved",
+                flush=True,
+            )
+            break
+
+        if seat in unresolved_candidates:
+            print(
+                "[BOUNDARY_PASSIVE_BLOCK] "
+                f"street={street} "
+                f"seat={seat} "
+                "reason=unresolved_stack_candidate",
+                flush=True,
+            )
+            break
+
+        if seat in preserved_actions:
+            print(
+                "[BOUNDARY_PASSIVE_BLOCK] "
+                f"street={street} "
+                f"seat={seat} "
+                "reason=preserved_qualified_action",
+                flush=True,
+            )
+            break
+
+        betting_open = bool(
+            status.get("betting_open")
+        )
+
+        if betting_open:
+            action = "FOLD"
+        elif street != "PREFLOP":
+            action = "CHECK"
+        else:
+            print(
+                "[BOUNDARY_PASSIVE_BLOCK] "
+                f"street={street} "
+                f"seat={seat} "
+                "reason=unopened_preflop_not_uniquely_resolved",
+                flush=True,
+            )
+            break
+
+        added = canonical.add_boundary_action(
+            street=street,
+            seat=seat,
+            action=action,
+            amount_bb=None,
+            raise_to_bb=None,
+            confidence=0.90,
+            source="board_boundary_action_order",
+            evidence=[
+                "confirmed_next_street",
+                "still_owed_action_at_boundary",
+                "no_conflicting_commitment_evidence",
+            ],
+            ts=None,
+        )
+
+        if betting_open:
+            tracker.commitment_tracker.record_response(
+                street,
+                seat,
+            )
+        else:
+            tracker.commitment_tracker.consume_pending_action(
+                street,
+                seat,
+            )
+
+        tracker.commitment_tracker.record_action(
+            street,
+            seat,
+        )
+
+        resolved.append(
+            {
+                "seat": seat,
+                "action": action,
+                "sequence": added.sequence,
+            }
+        )
+
+        state = record_timeline(
+            state,
+            "boundary_passive_action "
+            f"{street} {seat} {action}",
+        )
+
+        print(
+            "[BOUNDARY_PASSIVE_ACTION] "
+            f"street={street} "
+            f"seat={seat} "
+            f"action={action} "
+            f"sequence={added.sequence}",
+            flush=True,
+        )
+
+    return state, resolved
+
+
 def handle_boundary_stack_result(state, result):
     """
     Consume one asynchronous retrospective stack result.
@@ -1911,51 +3994,83 @@ def handle_boundary_stack_result(state, result):
 
     if expected_current != current_street:
         if old_street == current_street:
-            pending = list(
-                state.get("pending_boundary_results") or []
+            # A confirmed next-street board may already be buffered behind
+            # unresolved old-street betting obligations. In that state the
+            # retrospective boundary result belongs to the street that is
+            # still canonical and must be allowed to resolve those obligations
+            # BEFORE the board advances.
+            pending_boards = list(
+                state.get("pending_board_events") or []
             )
 
-            request_id = str(
-                result.get("request_id") or ""
+            matching_pending_board = any(
+                transition_for_board_len(
+                    len(item.get("board") or [])
+                )
+                == expected_current
+                for item in pending_boards
+                if isinstance(item, dict)
             )
 
-            already_pending = any(
-                str(item.get("request_id") or "")
-                == request_id
-                for item in pending
-            )
-
-            if not already_pending:
-                pending.append(dict(result))
-                pending.sort(
-                    key=lambda item: float(
-                        item.get("ts") or 0.0
-                    )
+            if matching_pending_board:
+                print(
+                    "[BOUNDARY_RESULT_CURRENT_STREET] "
+                    f"old={old_street} "
+                    f"pending_next={expected_current} "
+                    f"request={str(result.get('request_id') or '')[:8]}",
+                    flush=True,
+                )
+            else:
+                pending = list(
+                    state.get("pending_boundary_results") or []
                 )
 
-            state["pending_boundary_results"] = pending
+                request_id = str(
+                    result.get("request_id") or ""
+                )
 
+                already_pending = any(
+                    str(item.get("request_id") or "")
+                    == request_id
+                    for item in pending
+                )
+
+                if not already_pending:
+                    pending.append(dict(result))
+                    pending.sort(
+                        key=lambda item: float(
+                            item.get("ts") or 0.0
+                        )
+                    )
+
+                state["pending_boundary_results"] = pending
+
+                print(
+                    "[BOUNDARY_RESULT_DEFER] "
+                    f"old={old_street} "
+                    f"current={current_street} "
+                    f"request={request_id[:8]}",
+                    flush=True,
+                )
+
+                return state
+        else:
             print(
-                "[BOUNDARY_RESULT_DEFER] "
+                "[BOUNDARY_RESULT_SKIP] "
+                "reason=street_relationship_mismatch "
                 f"old={old_street} "
-                f"current={current_street} "
-                f"request={request_id[:8]}",
+                f"current={current_street}",
                 flush=True,
             )
-
             return state
-
-        print(
-            "[BOUNDARY_RESULT_SKIP] "
-            "reason=street_relationship_mismatch "
-            f"old={old_street} "
-            f"current={current_street}",
-            flush=True,
-        )
-        return state
 
     canonical = canonical_load()
     tracker = tracker_for_hand(canonical)
+
+    state = preserve_boundary_evidence(
+        state,
+        result,
+    )
 
     observations = list(
         result.get("observations") or []
@@ -1987,6 +4102,7 @@ def handle_boundary_stack_result(state, result):
     )
 
     promoted = []
+    unresolved_observation_seats = set()
 
     for seat in ordered_seats:
         item = observation_by_seat.get(seat)
@@ -1997,6 +4113,35 @@ def handle_boundary_stack_result(state, result):
         observation = item.get("observation")
 
         if not isinstance(observation, dict):
+            continue
+
+        candidate_key = (
+            f"{old_street}:{seat}"
+        )
+
+        unresolved_candidate = (
+            state.get("unresolved_stack_candidates")
+            or {}
+        ).get(candidate_key)
+
+        if unresolved_candidate is not None:
+            # Boundary evidence is retrospective confirmation. It may not
+            # canonicalize a seat while that same seat still owns unresolved
+            # quantitative commitment evidence.
+            #
+            # Mark this explicit observation unresolved as well so the passive
+            # boundary recovery path cannot cross it and manufacture a second
+            # action.
+            unresolved_observation_seats.add(seat)
+
+            print(
+                "[BOUNDARY_ACTION_DEFER] "
+                f"street={old_street} "
+                f"seat={seat} "
+                "reason=unresolved_stack_candidate",
+                flush=True,
+            )
+
             continue
 
         promotion = promote_boundary_observation(
@@ -2031,6 +4176,8 @@ def handle_boundary_stack_result(state, result):
                 flush=True,
             )
         else:
+            unresolved_observation_seats.add(seat)
+
             print(
                 "[BOUNDARY_UNRESOLVED] "
                 f"street={old_street} "
@@ -2038,6 +4185,23 @@ def handle_boundary_stack_result(state, result):
                 f"reason={promotion.reason}",
                 flush=True,
             )
+
+    # A confirmed next-street board is a hard physical boundary. After every
+    # available quantitative observation has been consumed, close only those
+    # remaining obligations whose passive action is uniquely established by
+    # poker order and the absence of conflicting commitment evidence.
+    state, passive_resolved = (
+        resolve_silent_boundary_obligations(
+            state,
+            canonical=canonical,
+            tracker=tracker,
+            street=old_street,
+            observed_seats=unresolved_observation_seats,
+        )
+    )
+
+    if passive_resolved:
+        promoted.extend(passive_resolved)
 
     if promoted:
         current_street = str(
@@ -2097,11 +4261,25 @@ def handle_boundary_stack_result(state, result):
         flush=True,
     )
 
+    if old_status.get("complete"):
+        state = clear_preserved_boundary_evidence(
+            state,
+            hand_token=state.get("hand_token"),
+            street=old_street,
+        )
+
     # Keep the public status artifact current-street scoped.
     write_betting_round_status(
         tracker,
         canonical,
         state,
+    )
+
+    # Boundary evidence may have consumed the final old-street obligation
+    # while a confirmed next-street board was waiting. Release immediately
+    # when that made the round complete.
+    state = release_pending_board_if_ready(
+        state
     )
 
     return state
@@ -2166,6 +4344,15 @@ def handle_event(state, event):
 
     if t == "hero_fold":
         return handle_hero_fold(state, event)
+
+    if t == "actor_observed":
+        return handle_actor_observed(state, event)
+
+    if t == "physical_actor_completed":
+        return handle_physical_actor_completed(
+            state,
+            event,
+        )
 
     if t == "inferred_action":
         return handle_inferred_action(state, event)

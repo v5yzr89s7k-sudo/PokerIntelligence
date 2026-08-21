@@ -17,7 +17,11 @@ from src.events.detectors.pot_detector import pot_changed
 from src.events.detectors.stack_detector import stack_changed, stack_change_details
 from src.events.detectors.action_buttons_detector import action_buttons_changed, action_buttons_visible
 from src.events.detectors.dealer_detector import dealer_changed
-from src.events.detectors.card_presence import count_board_cards, hero_cards_visible
+from src.events.detectors.card_presence import (
+    count_board_cards,
+    hero_cards_visible,
+    opponent_cards_visible,
+)
 from src.events.detectors.hero_turn_detector import hero_nameplate_blinking
 from src.events.detectors.bet_region_detector import bet_region_occupancy
 from src.events.detectors.bet_region_state_tracker import BetRegionStateTracker
@@ -63,6 +67,12 @@ class ChangeSet:
     hero_cards_transition: dict = field(default_factory=dict)
     hero_cards_appeared: bool = False
     hero_cards_cleared: bool = False
+    opponent_hole_card_changed_seats: list = field(
+        default_factory=list
+    )
+    opponent_hole_cards_disappeared_seats: list = field(
+        default_factory=list
+    )
 
     def has_changes(self):
         return any([
@@ -78,6 +88,12 @@ class ChangeSet:
             bool(self.bet_region_cleared),
             self.hero_cards_appeared,
             self.hero_cards_cleared,
+            bool(
+                self.opponent_hole_card_changed_seats
+            ),
+            bool(
+                self.opponent_hole_cards_disappeared_seats
+            ),
         ])
 
     def to_dict(self):
@@ -101,6 +117,12 @@ class ChangeSet:
             "hero_cards_transition": self.hero_cards_transition,
             "hero_cards_appeared": self.hero_cards_appeared,
             "hero_cards_cleared": self.hero_cards_cleared,
+            "opponent_hole_card_changed_seats": list(
+                self.opponent_hole_card_changed_seats
+            ),
+            "opponent_hole_cards_disappeared_seats": list(
+                self.opponent_hole_cards_disappeared_seats
+            ),
             "has_changes": self.has_changes(),
         }
 
@@ -122,6 +144,18 @@ class ChangeSet:
             parts.append("hero_nameplate_blinking")
         if self.stack_changed_seats:
             parts.append("stack_changed=" + ",".join(self.stack_changed_seats))
+
+        if getattr(
+            self,
+            "opponent_hole_card_changed_seats",
+            [],
+        ):
+            parts.append(
+                "opponent_cards_changed="
+                + ",".join(
+                    self.opponent_hole_card_changed_seats
+                )
+            )
         if self.occupied_bet_regions:
             parts.append("bet_regions=" + ",".join(self.occupied_bet_regions))
         if self.bet_region_appeared:
@@ -133,6 +167,142 @@ class ChangeSet:
         if self.hero_cards_cleared:
             parts.append("hero_cards_cleared")
         return " ".join(parts) if parts else "no_change"
+
+
+
+def opponent_hole_cards_disappeared_seats(
+    previous_frame,
+    current_frame,
+    geometry,
+):
+    """
+    Detect a directional physical transition:
+
+        calibrated opponent cards visible
+                    ->
+        calibrated opponent cards absent
+
+    This reports pixels only. Poker chronology determines whether
+    the observation can be admitted as a fold.
+    """
+    disappeared = []
+
+    hole_cards = (
+        geometry.get("hole_cards")
+        or {}
+    )
+
+    for seat, regions in hole_cards.items():
+        if seat == "hero":
+            continue
+
+        if not isinstance(regions, dict):
+            continue
+
+        before_visible = opponent_cards_visible(
+            previous_frame,
+            regions,
+        )
+
+        after_visible = opponent_cards_visible(
+            current_frame,
+            regions,
+        )
+
+        if before_visible and not after_visible:
+            disappeared.append(seat)
+
+    return disappeared
+
+
+def opponent_hole_card_changed_seats(
+    previous_frame,
+    current_frame,
+    geometry,
+):
+    """
+    Cheap local transition signal only.
+
+    This does NOT infer a fold. It reports opponent seats whose
+    hole-card regions changed substantially between consecutive
+    raw samples so the semantic frame cannot be discarded.
+    """
+
+    changed = []
+
+    hole_cards = geometry.get("hole_cards", {})
+
+    for seat, cards in hole_cards.items():
+
+        if seat == "hero":
+            continue
+
+        if not isinstance(cards, dict):
+            continue
+
+        fractions = []
+
+        for card_name in ("card_1", "card_2"):
+
+            rect = cards.get(card_name)
+
+            if not rect:
+                continue
+
+            x = int(rect["x"])
+            y = int(rect["y"])
+            w = int(rect["width"])
+            h = int(rect["height"])
+
+            before = previous_frame[
+                y:y+h,
+                x:x+w,
+            ]
+
+            after = current_frame[
+                y:y+h,
+                x:x+w,
+            ]
+
+            if (
+                before.size == 0
+                or after.size == 0
+                or before.shape != after.shape
+            ):
+                continue
+
+            diff = cv2.absdiff(
+                before,
+                after,
+            )
+
+            changed_fraction = float(
+                np.mean(
+                    np.max(diff, axis=2) >= 18
+                )
+            )
+
+            fractions.append(
+                changed_fraction
+            )
+
+        if not fractions:
+            continue
+
+        both_material = bool(
+            len(fractions) >= 2
+            and fractions[0] >= 0.20
+            and fractions[1] >= 0.20
+        )
+
+        one_extreme = bool(
+            max(fractions) >= 0.60
+        )
+
+        if both_material or one_extreme:
+            changed.append(seat)
+
+    return changed
 
 
 class LocalEventDetector:
@@ -178,6 +348,22 @@ class LocalEventDetector:
             seat for seat, info in changes.stack_change_details.items()
             if info.get("changed")
         ]
+
+        changes.opponent_hole_card_changed_seats = (
+            opponent_hole_card_changed_seats(
+                self.previous_frame,
+                frame,
+                GEOM,
+            )
+        )
+
+        changes.opponent_hole_cards_disappeared_seats = (
+            opponent_hole_cards_disappeared_seats(
+                self.previous_frame,
+                frame,
+                GEOM,
+            )
+        )
         changes.bet_region_occupancy = bet_region_occupancy(
             frame,
             GEOM,

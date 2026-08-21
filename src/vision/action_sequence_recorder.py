@@ -44,7 +44,7 @@ class ActionSequenceRecorder:
         self.frame_index = 0
         return self.session_dir
 
-    def record(self, frame, changes, state, source_frame=None):
+    def record(self, frame, changes, state, source_frame=None, tournament_level=None):
         if self.session_dir is None:
             self.start_session()
 
@@ -121,6 +121,9 @@ class ActionSequenceRecorder:
             ),
             "confirmed_board_len": state.get(
                 "confirmed_board_len"
+            ),
+            "tournament_level": dict(
+                tournament_level or {}
             ),
             "files": {
                 "full": full_path.name,

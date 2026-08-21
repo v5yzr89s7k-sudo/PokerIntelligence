@@ -524,12 +524,79 @@ class ActionEpisodeManager:
                             flush=True,
                         )
 
+                        # This STACK_CHANGED observation has already passed
+                        # settlement, OCR continuity, transition validation,
+                        # positive-delta validation, and confidence gating.
+                        #
+                        # It is therefore decisive quantitative action
+                        # evidence. Do not add the unrelated idle_timeout
+                        # latency before making it available to inference.
+                        self._close_episode(
+                            seat,
+                            "validated_stack_transition",
+                        )
+
                         continue
 
                     self._cache_pending_stack(obs)
                     continue
 
+                # STACK_CHANGED attached to an already-active visual episode
+                # is decisive quantitative action evidence once it has passed
+                # the production stack settlement/validation gate.
+                #
+                # Do not retain the visual idle/settlement latency after the
+                # action is already quantitatively established. Later
+                # bet-region clear/pot/bet-amount evidence may enrich canonical
+                # state independently; it must not gate action publication.
                 ep.add(obs)
+
+                payload = obs.payload or {}
+
+                try:
+                    confidence = float(
+                        payload.get("stack_read_confidence")
+                        or getattr(
+                            obs,
+                            "confidence",
+                            0.0,
+                        )
+                        or 0.0
+                    )
+                except (TypeError, ValueError):
+                    confidence = 0.0
+
+                try:
+                    delta_bb = float(
+                        payload.get("delta_bb")
+                        or 0.0
+                    )
+                except (TypeError, ValueError):
+                    delta_bb = 0.0
+
+                trusted_transition = bool(
+                    payload.get("previous_stack_bb") is not None
+                    and payload.get("current_stack_bb") is not None
+                    and delta_bb > 0.0
+                    and confidence >= 0.75
+                    and str(
+                        payload.get("stack_read_mode")
+                        or ""
+                    ).lower()
+                    not in {
+                        "",
+                        "unknown",
+                        "unresolved",
+                        "empty",
+                    }
+                )
+
+                if trusted_transition:
+                    self._close_episode(
+                        seat,
+                        "validated_stack_transition",
+                    )
+
                 continue
 
             # A visible bet/chip region is the primary seat-level episode opener.

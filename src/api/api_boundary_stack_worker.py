@@ -131,28 +131,77 @@ def process_request(request):
 
     observations = []
 
-    # Newest frame first. Stop at the first trusted read per seat.
+    # Boundary evidence must belong to the street that is ENDING.
+    #
+    # The request intentionally contains both the trailing old-street frames
+    # and the first frame that proves the next street exists. Reading newest
+    # first without filtering allowed the first FLOP frame to masquerade as
+    # PREFLOP terminal evidence.
+    #
+    # Prefer the newest trusted OLD-STREET frame. Only if no trusted old-street
+    # read exists do we fall back to the transition/new-street frames.
+    expected_old_board_count = {
+        "PREFLOP": 0,
+        "FLOP": 3,
+        "TURN": 4,
+    }.get(street)
+
+    old_street_frames = [
+        item
+        for item in frames
+        if (
+            expected_old_board_count is not None
+            and item.get("local_board_count")
+            == expected_old_board_count
+        )
+    ]
+
+    transition_frames = [
+        item
+        for item in frames
+        if item not in old_street_frames
+    ]
+
+    search_groups = (
+        ("old_street", old_street_frames),
+        ("transition_fallback", transition_frames),
+    )
+
     for seat in seats:
         observation = None
 
-        for frame_item in reversed(frames):
-            frame_path = frame_item.get("frame_path")
+        for evidence_scope, candidates in search_groups:
+            for frame_item in reversed(candidates):
+                frame_path = frame_item.get("frame_path")
 
-            if not frame_path:
-                continue
+                if not frame_path:
+                    continue
 
-            candidate = trusted_read(frame_path, seat)
+                candidate = trusted_read(
+                    frame_path,
+                    seat,
+                )
 
-            if candidate is None:
-                continue
+                if candidate is None:
+                    continue
 
-            candidate["frame_ts"] = frame_item.get("ts")
-            candidate["local_board_count"] = frame_item.get(
-                "local_board_count"
-            )
+                candidate["frame_ts"] = (
+                    frame_item.get("ts")
+                )
+                candidate["local_board_count"] = (
+                    frame_item.get(
+                        "local_board_count"
+                    )
+                )
+                candidate["boundary_evidence_scope"] = (
+                    evidence_scope
+                )
 
-            observation = candidate
-            break
+                observation = candidate
+                break
+
+            if observation is not None:
+                break
 
         observations.append({
             "seat": seat,

@@ -1,4 +1,7 @@
-from src.api.api_board_worker import board_is_valid
+from src.api.api_board_worker import (
+    board_is_valid,
+    normalize_board,
+)
 
 
 def assert_valid(board, expected_len):
@@ -16,6 +19,39 @@ def assert_invalid(board, expected_len, expected_reason):
 assert_valid(["Qd", "Jd", "7d"], 3)
 assert_valid(["Qd", "Jd", "7d", "5c"], 4)
 assert_valid(["Qd", "Jd", "7d", "5c", "As"], 5)
+
+assert normalize_board(
+    ["Jd", "9s", "10c", "9h"]
+) == [
+    "Jd",
+    "9s",
+    "Tc",
+    "9h",
+]
+
+assert normalize_board(
+    ["Jd", "9s", "10c", "9h", "7h"]
+) == [
+    "Jd",
+    "9s",
+    "Tc",
+    "9h",
+    "7h",
+]
+
+assert_valid(
+    normalize_board(
+        ["Jd", "9s", "10c", "9h"]
+    ),
+    4,
+)
+
+assert_valid(
+    normalize_board(
+        ["Jd", "9s", "10c", "9h", "7h"]
+    ),
+    5,
+)
 
 assert_invalid(["4h", "4h", "4h"], 3, "duplicate_cards")
 assert_invalid(["Qd", "Jd"], 3, "wrong_length")

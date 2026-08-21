@@ -84,6 +84,31 @@ import re
 
 CARD_RE = re.compile(r"^(?:[2-9TJQKA][cdhs])$")
 
+def normalize_card(card):
+    """
+    Normalize API card notation to Poker Intelligence canonical notation.
+
+    In particular, API responses may spell a ten as "10c" while the
+    canonical representation is "Tc".
+    """
+    card = str(card or "").strip()
+
+    if (
+        len(card) == 3
+        and card[:2] == "10"
+    ):
+        return "T" + card[2]
+
+    return card
+
+
+def normalize_board(board):
+    return [
+        normalize_card(card)
+        for card in list(board or [])
+    ]
+
+
 def board_is_valid(board, expected_len):
     if len(board) != expected_len:
         return False, "wrong_length"
@@ -196,7 +221,9 @@ def process_request(request):
 
         return
 
-    board = data.get("board") or []
+    board = normalize_board(
+        data.get("board") or []
+    )
 
     if len(board) < expected_len:
         write_result({

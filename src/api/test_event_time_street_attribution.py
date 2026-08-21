@@ -159,10 +159,81 @@ def main():
         == "FLOP"
     )
 
+    # --------------------------------------------------------
+    # Old-street obligation boundary:
+    #
+    # A locally visible next street must not steal commitment
+    # evidence from a seat that still owes action on the
+    # confirmed old street.
+    # --------------------------------------------------------
+
+    turn_state = {
+        "phase": "TURN",
+        "pending_stack_reads": {},
+    }
+
+    river_event_street = (
+        coordinator.event_street_for_frame(
+            turn_state,
+            5,
+        )
+    )
+
+    assert river_event_street == "RIVER"
+
+    with (
+        patch.object(
+            coordinator,
+            "_canonical_stack_values",
+            return_value={},
+        ),
+        patch.object(
+            coordinator.time,
+            "time",
+            return_value=3.0,
+        ),
+    ):
+        coordinator.enrich_stack_change_measurements(
+            changes(
+                board_count=5,
+                appeared=[
+                    "seat_lower_left",
+                    "seat_mid_left",
+                ],
+            ),
+            frame,
+            turn_state,
+            prior_occupied_bet_regions=set(),
+            prior_commitment_seats=set(),
+            event_street=river_event_street,
+            old_street_owing_seats={
+                "seat_lower_left",
+            },
+        )
+
+    turn_pending = turn_state[
+        "pending_stack_reads"
+    ]
+
+    assert (
+        turn_pending["seat_lower_left"][
+            "origin_street"
+        ]
+        == "TURN"
+    )
+
+    assert (
+        turn_pending["seat_mid_left"][
+            "origin_street"
+        ]
+        == "RIVER"
+    )
+
     print(
         "PASS event-time street attribution: "
         "late Hero settlement remains PREFLOP; "
-        "new BB commitment on local board=3 starts FLOP"
+        "new BB commitment on local board=3 starts FLOP; "
+        "old-street owing seat remains on confirmed street"
     )
 
 

@@ -108,6 +108,16 @@ class CanonicalHand:
         self.current_bet_bb = 0.0
         self.pot_bb: Optional[float] = None
         self.expected_pot_bb: Optional[float] = None
+
+        # Extra money independently proven to have existed in the
+        # authoritative initial table pot beyond the canonical forced
+        # contributions known when that observation was requested.
+        #
+        # This is evidence-derived and intentionally agnostic about its
+        # semantic source (ante, dead money, other forced contribution).
+        self.starting_pot_adjustment_bb: float = 0.0
+        self.starting_pot_adjustment_established: bool = False
+
         self.last_aggressor_seat: Optional[str] = None
         self.players_to_act: List[str] = []
 
@@ -177,7 +187,7 @@ class CanonicalHand:
             self.players[seat] = CanonicalPlayer(
                 seat=seat,
                 position=positions.get(seat, "unknown"),
-                name=item.get("name") or seat,
+                name=str(item.get("name") or "").strip(),
                 starting_stack_bb=float(stack_bb) if stack_bb is not None else None,
                 current_stack_bb=float(stack_bb) if stack_bb is not None else None,
                 last_confirmed_stack_bb=float(stack_bb) if stack_bb is not None else None,
@@ -698,10 +708,35 @@ class CanonicalHand:
                 f"invalid_boundary_street: {target_street}"
             )
 
-        if normalized_action not in ("FOLD", "CALL", "CHECK"):
+        if normalized_action not in (
+            "FOLD",
+            "CALL",
+            "CHECK",
+            "RAISE",
+        ):
             raise ValueError(
                 f"unsupported_boundary_action: {normalized_action}"
             )
+
+        if normalized_action == "RAISE":
+            if raise_to_bb is None:
+                raise ValueError(
+                    "boundary_raise_requires_explicit_raise_to_bb"
+                )
+
+            try:
+                raise_to_value = float(raise_to_bb)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "boundary_raise_requires_explicit_raise_to_bb"
+                )
+
+            if raise_to_value <= 0:
+                raise ValueError(
+                    "boundary_raise_requires_positive_raise_to_bb"
+                )
+
+            raise_to_bb = raise_to_value
 
         player = self.players.get(seat)
 
@@ -800,33 +835,102 @@ class CanonicalHand:
 
         self.expected_pot_bb = round(total, 2)
 
-        # Canonical commitment arithmetic drives the live pot continuously.
-        # Pot OCR is corroborating evidence and must not freeze the displayed
-        # pot at an earlier value after new actions are recorded.
-        summary = self.street_summaries.get(self.current_street)
+        # Canonical chip commitments establish a hard lower bound on
+        # the pot. An observed table pot may legitimately be ahead of
+        # incomplete semantic reconstruction, so observed evidence is
+        # preserved. It may not remain below chips that later canonical
+        # actions prove have been committed.
+        #
+        # Effective pot is therefore the maximum of:
+        #   - reconstructed canonical commitments,
+        #   - accepted observed table pot,
+        #   - pot inherited when the current street began.
+        #
+        # This invariant is independent of player count, positions,
+        # action sequence, bet sizing, blinds, antes, and street.
+        summary = self.street_summaries.get(
+            self.current_street
+        )
 
-        # A directly observed table pot is authoritative for this street.
-        # Continue maintaining expected_pot_bb for diagnostics and fallback,
-        # but do not overwrite an observed street pot with inferred arithmetic.
+        expected = float(
+            self.expected_pot_bb or 0.0
+        )
+
+        reconstructed = round(
+            expected
+            + float(
+                self.starting_pot_adjustment_bb
+                or 0.0
+            ),
+            2,
+        )
+
+        observed = (
+            float(self.pot_bb)
+            if self.pot_bb is not None
+            else 0.0
+        )
+
+        inherited = 0.0
+
         if (
             summary is not None
-            and not summary.pot_observed
+            and summary.starting_pot_bb is not None
         ):
-            # Reconstructed commitments may be incomplete. A new street
-            # inherits the real pot carried from the previous street, so
-            # incomplete action accounting must never reduce that amount.
-            inherited_pot = summary.starting_pot_bb
+            inherited = float(
+                summary.starting_pot_bb
+            )
 
-            if inherited_pot is None:
-                summary.ending_pot_bb = self.expected_pot_bb
-            else:
-                summary.ending_pot_bb = round(
-                    max(
-                        float(inherited_pot),
-                        float(self.expected_pot_bb or 0.0),
-                    ),
-                    2,
-                )
+        effective = round(
+            max(
+                reconstructed,
+                observed,
+                inherited,
+            ),
+            2,
+        )
+
+        self.pot_bb = effective
+
+        if summary is not None:
+            summary.ending_pot_bb = effective
+
+
+    def establish_starting_pot_adjustment(
+        self,
+        observed_pot_bb: float,
+        forced_pot_baseline_bb: float,
+    ) -> float:
+        """
+        Preserve money independently proven by the authoritative
+        initial table-pot observation but absent from the canonical
+        forced-contribution ledger frozen for that request.
+
+        The supplied baseline is historical request-time state.
+        Current expected_pot_bb is deliberately NOT consulted because
+        asynchronous OCR may return after later betting actions.
+        """
+        observed = round(float(observed_pot_bb), 6)
+        baseline = round(float(forced_pot_baseline_bb), 6)
+
+        if observed < 0.0 or baseline < 0.0:
+            raise ValueError(
+                "Starting pot inputs cannot be negative"
+            )
+
+        adjustment = round(
+            max(
+                0.0,
+                observed - baseline,
+            ),
+            6,
+        )
+
+        if not self.starting_pot_adjustment_established:
+            self.starting_pot_adjustment_bb = adjustment
+            self.starting_pot_adjustment_established = True
+
+        return self.starting_pot_adjustment_bb
 
 
     def set_observed_pot(self, pot_bb: float) -> float:
@@ -922,7 +1026,7 @@ class CanonicalHand:
             hand.players[seat] = CanonicalPlayer(
                 seat=item.get("seat") or seat,
                 position=item.get("position") or "unknown",
-                name=item.get("name") or seat,
+                name=str(item.get("name") or "").strip(),
                 starting_stack_bb=item.get("starting_stack_bb"),
                 current_stack_bb=item.get(
                     "current_stack_bb",
@@ -978,6 +1082,16 @@ class CanonicalHand:
         hand.current_bet_bb = float(data.get("current_bet_bb") or 0.0)
         hand.pot_bb = data.get("pot_bb")
         hand.expected_pot_bb = data.get("expected_pot_bb")
+        hand.starting_pot_adjustment_bb = float(
+            data.get("starting_pot_adjustment_bb")
+            or 0.0
+        )
+        hand.starting_pot_adjustment_established = bool(
+            data.get(
+                "starting_pot_adjustment_established",
+                False,
+            )
+        )
         hand.last_aggressor_seat = data.get("last_aggressor_seat")
         hand.players_to_act = list(data.get("players_to_act") or [])
 
@@ -1035,6 +1149,12 @@ class CanonicalHand:
             "current_bet_bb": self.current_bet_bb,
             "pot_bb": self.pot_bb,
             "expected_pot_bb": self.expected_pot_bb,
+            "starting_pot_adjustment_bb": (
+                self.starting_pot_adjustment_bb
+            ),
+            "starting_pot_adjustment_established": (
+                self.starting_pot_adjustment_established
+            ),
             "last_aggressor_seat": self.last_aggressor_seat,
             "players_to_act": list(self.players_to_act),
             "street_summaries": {

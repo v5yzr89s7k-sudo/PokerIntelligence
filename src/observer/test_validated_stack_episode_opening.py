@@ -50,17 +50,23 @@ def test_validated_stack_opens_quantitative_episode():
     ):
         manager.ingest([obs])
 
-    assert "seat_mid_left" in manager.active_by_seat
+    # A trusted settled quantitative transition is already decisive
+    # seat-level commitment evidence. It must not remain active merely to
+    # wait for idle_timeout.
+    assert "seat_mid_left" not in manager.active_by_seat
+    assert len(manager.closed) == 1
 
-    episode = manager.active_by_seat[
-        "seat_mid_left"
-    ]
+    episode = manager.closed[0]
 
     assert episode.street == "FLOP"
     assert episode.confidence == 0.40
     assert episode.evidence_mature is True
     assert episode.maturity_reason == (
         "quantitative_stack_commitment"
+    )
+    assert (
+        episode.close_reason
+        == "validated_stack_transition"
     )
 
     assert [
@@ -75,7 +81,8 @@ def test_validated_stack_opens_quantitative_episode():
     print(
         "PASS validated stack opening: "
         "trusted 90.85 -> 87.71 FLOP transition "
-        "originates a quantitative episode"
+        "originates and immediately closes a mature "
+        "quantitative episode"
     )
 
 

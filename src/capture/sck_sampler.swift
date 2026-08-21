@@ -383,8 +383,33 @@ struct Main {
         let config =
             SCStreamConfiguration()
 
-        // Produce the exact canonical image expected
-        // by all existing Poker Intelligence geometry.
+        // The filter is display-scoped because direct
+        // desktopIndependentWindow capture is unstable in this
+        // command-line process. Therefore explicitly crop the
+        // display coordinate space to the ACR window rectangle.
+        //
+        // This is critical: output pixel (0,0) must correspond
+        // to poker-table pixel (0,0), otherwise every existing
+        // 934x696 geometry ROI is displaced/scaled.
+        let displayFrame = targetDisplay.frame
+        let windowFrame = targetWindow.frame
+
+        let sourceRect = CGRect(
+            x: windowFrame.minX - displayFrame.minX,
+            y: windowFrame.minY - displayFrame.minY,
+            width: windowFrame.width,
+            height: windowFrame.height
+        )
+
+        config.sourceRect = sourceRect
+
+        print(
+            "[SCK] SOURCE RECT:",
+            sourceRect
+        )
+
+        // Produce the exact canonical image expected by the
+        // existing Poker Intelligence geometry.
         config.width = 934
         config.height = 696
 

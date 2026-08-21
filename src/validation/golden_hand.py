@@ -92,6 +92,102 @@ class GoldenHand:
 
         return data
 
+    def event_schema_compatibility(self) -> Dict[str, Any]:
+        """
+        Classify whether this fixture's recorded evidence schema can
+        exercise the current chronology-aware state machine literally.
+
+        Event replay remains evidence-preserving: incompatible legacy
+        fixtures are classified here rather than rewritten or augmented.
+        """
+        metadata = self.metadata()
+
+        try:
+            format_version = int(
+                metadata.get("format_version", 0)
+                or 0
+            )
+        except (TypeError, ValueError):
+            format_version = 0
+
+        event_types = []
+
+        try:
+            lines = self.events_path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+        except OSError as exc:
+            raise GoldenHandError(
+                f"{self.name}: could not read api_events.jsonl: {exc}"
+            ) from exc
+
+        for line in lines:
+            if not line.strip():
+                continue
+
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise GoldenHandError(
+                    f"{self.name}: invalid api event JSON: {exc}"
+                ) from exc
+
+            if not isinstance(event, dict):
+                raise GoldenHandError(
+                    f"{self.name}: api event must be a JSON object"
+                )
+
+            event_types.append(
+                event.get("type")
+            )
+
+        has_inferred_action = (
+            "inferred_action"
+            in event_types
+        )
+
+        has_chronology_transport = any(
+            event_type in {
+                "actor_observed",
+                "physical_actor_completed",
+            }
+            for event_type in event_types
+        )
+
+        # Version 1 predates explicit chronology transport.
+        #
+        # A v1 fixture that never relies on inferred_action remains
+        # replay-compatible: there is no missing quantitative-action
+        # chronology to reconstruct.
+        #
+        # A v1 fixture that DOES contain inferred_action but lacks all
+        # chronology transport cannot prove the action ordering required
+        # by the current state machine. Do not synthesize that evidence.
+        legacy_quantitative_only = (
+            format_version == 1
+            and has_inferred_action
+            and not has_chronology_transport
+        )
+
+        if legacy_quantitative_only:
+            return {
+                "compatible": False,
+                "classification": "legacy",
+                "reason": (
+                    "format v1 quantitative actions lack "
+                    "chronology transport"
+                ),
+                "format_version": format_version,
+            }
+
+        return {
+            "compatible": True,
+            "classification": "current",
+            "reason": None,
+            "format_version": format_version,
+        }
+
+
     def frames(self) -> List[Path]:
         """
         Return optional recorded perception frames.
