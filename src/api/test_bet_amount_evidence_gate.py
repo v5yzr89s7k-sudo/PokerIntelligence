@@ -70,9 +70,34 @@ def main():
             )
 
             assert consumed is True
-            assert read_events(
+
+            events = read_events(
                 coord.EVENT_LOG
-            ) == []
+            )
+
+            assert len(events) == 1
+            assert (
+                events[0]["type"]
+                == "provisional_bet_opened"
+            )
+            assert (
+                events[0]["seat"]
+                == "seat_lower_left"
+            )
+            assert (
+                events[0]["street"]
+                == "RIVER"
+            )
+            assert (
+                events[0]["source_request_id"]
+                == request_id
+            )
+
+            assert not any(
+                event.get("type")
+                == "bet_amount_observation"
+                for event in events
+            )
 
             assert (
                 request_id
@@ -97,9 +122,22 @@ def main():
                 )
             )
 
-            assert read_events(
+            events = read_events(
                 coord.EVENT_LOG
-            ) == []
+            )
+
+            assert [
+                event.get("type")
+                for event in events
+            ] == [
+                "provisional_bet_opened",
+            ]
+
+            assert not any(
+                event.get("type")
+                == "bet_amount_observation"
+                for event in events
+            )
 
             # ========================================================
             # Same-seat/same-street positive stack delta releases it.
@@ -128,15 +166,37 @@ def main():
                 coord.EVENT_LOG
             )
 
-            assert len(events) == 1
+            assert [
+                event.get("type")
+                for event in events
+            ] == [
+                "provisional_bet_opened",
+                "bet_amount_observation",
+                "provisional_bet_closed",
+            ]
+
+            bet_event = events[1]
+            close_event = events[2]
+
+            assert bet_event["bet_bb"] == 6.75
             assert (
-                events[0]["type"]
-                == "bet_amount_observation"
-            )
-            assert events[0]["bet_bb"] == 6.75
-            assert (
-                events[0]["source"]
+                bet_event["source"]
                 == "transition"
+            )
+
+            assert (
+                bet_event["source_request_id"]
+                == request_id
+            )
+
+            assert (
+                close_event["reason"]
+                == "corroborated"
+            )
+
+            assert (
+                close_event["source_request_id"]
+                == request_id
             )
 
             assert (
@@ -247,8 +307,11 @@ def main():
 
             print(
                 "PASS bet amount evidence gate: "
-                "transition reads require positive stack "
-                "corroboration; initial inventory is immediate; "
+                "transition reads open provisional ownership "
+                "without publishing quantitative action; "
+                "positive stack corroboration publishes BET "
+                "before closing provisional ownership; "
+                "initial inventory is immediate; "
                 "inactive-hand results are rejected"
             )
 

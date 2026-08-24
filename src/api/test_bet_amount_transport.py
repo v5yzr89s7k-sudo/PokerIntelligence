@@ -125,7 +125,28 @@ def main():
                 if line.strip()
             ]
 
-            assert event_lines == []
+            assert [
+                event.get("type")
+                for event in event_lines
+            ] == [
+                "provisional_bet_opened",
+            ]
+
+            assert (
+                event_lines[0]["seat"]
+                == "hero"
+            )
+
+            assert (
+                event_lines[0]["source_request_id"]
+                == second["request_id"]
+            )
+
+            assert not any(
+                event.get("type")
+                == "bet_amount_observation"
+                for event in event_lines
+            )
 
             deferred = dict(
                 state.get(
@@ -186,7 +207,37 @@ def main():
                 if line.strip()
             ]
 
-            assert event_lines == []
+            assert [
+                event.get("type")
+                for event in event_lines
+            ] == [
+                "provisional_bet_opened",
+                "provisional_bet_opened",
+            ]
+
+            assert [
+                event.get("seat")
+                for event in event_lines
+            ] == [
+                "hero",
+                "seat_lower_right",
+            ]
+
+            assert {
+                event.get(
+                    "source_request_id"
+                )
+                for event in event_lines
+            } == {
+                first["request_id"],
+                second["request_id"],
+            }
+
+            assert not any(
+                event.get("type")
+                == "bet_amount_observation"
+                for event in event_lines
+            )
 
             deferred = dict(
                 state.get(
@@ -216,6 +267,16 @@ def main():
 
             # A stale hand result must be consumed from pending
             # transport but may not emit evidence into the new hand.
+            event_lines_before_stale = [
+                line
+                for line in (
+                    coord.EVENT_LOG
+                    .read_text()
+                    .splitlines()
+                )
+                if line.strip()
+            ]
+
             state = coord.queue_bet_amount_request(
                 state,
                 frame,
@@ -267,12 +328,36 @@ def main():
                 if line.strip()
             ]
 
-            assert event_lines_after == []
+            assert (
+                event_lines_after
+                == event_lines_before_stale
+            )
+
+            parsed_events = [
+                json.loads(line)
+                for line in event_lines_after
+            ]
+
+            assert not any(
+                event.get("type")
+                == "bet_amount_observation"
+                for event in parsed_events
+            )
+
+            assert [
+                event.get("type")
+                for event in parsed_events
+            ] == [
+                "provisional_bet_opened",
+                "provisional_bet_opened",
+            ]
 
             print(
                 "PASS bet amount transport: "
                 "multiple concurrent seat requests, "
-                "out-of-order completion, deferred transition evidence, "
+                "out-of-order completion, provisional lifecycle "
+                "without premature quantitative publication, "
+                "deferred transition evidence, "
                 "and stale-hand rejection"
             )
 

@@ -192,6 +192,7 @@ def default_state():
         "pending_stack_baseline_observations": [],
         "pending_stack_updates": [],
         "unresolved_stack_candidates": {},
+        "unresolved_provisional_bets": {},
         "pending_pot_updates": [],
         "pending_high_pot": None,
         "pending_terminal_events": [],
@@ -2176,8 +2177,134 @@ def handle_stack_candidate_closed(state, event):
         flush=True,
     )
 
-    # Ordinary candidate closure means no unresolved quantitative action
-    # remains for this seat. Preserved later actors may now be reconsidered.
+    # Stack ownership is only one commitment-evidence lifecycle.
+    # A separate provisional absolute-bet observation may still make
+    # passive chronology unsafe for this same seat/street.
+    provisional = (
+        state.get("unresolved_provisional_bets")
+        or {}
+    )
+
+    provisional_key = (
+        f"{street}:{seat}"
+        if seat and street
+        else ""
+    )
+
+    if (
+        provisional_key
+        and provisional_key in provisional
+    ):
+        print(
+            "[STACK_CANDIDATE_STATE] "
+            f"closed seat={seat} street={street} "
+            "chronology_release=deferred "
+            "reason=provisional_bet_unresolved",
+            flush=True,
+        )
+
+        return state
+
+    # No commitment-evidence owner remains for this candidate.
+    # Preserved later actors may now be reconsidered.
+    state = replay_pending_actor_observations(
+        state
+    )
+
+    return state
+
+
+def handle_provisional_bet_opened(state, event):
+    seat = str(event.get("seat") or "")
+    street = str(event.get("street") or "").upper()
+    event_token = str(event.get("hand_token") or "")
+    current_token = str(state.get("hand_token") or "")
+
+    if not seat or not street:
+        return state
+
+    if (
+        event_token
+        and current_token
+        and event_token != current_token
+    ):
+        return state
+
+    blockers = dict(
+        state.get("unresolved_provisional_bets")
+        or {}
+    )
+
+    blockers[f"{street}:{seat}"] = {
+        "seat": seat,
+        "street": street,
+        "source": event.get(
+            "source",
+            "transition",
+        ),
+        "source_request_id": event.get(
+            "source_request_id"
+        ),
+        "bet_bb": event.get("bet_bb"),
+        "ts": event.get("ts"),
+    }
+
+    state[
+        "unresolved_provisional_bets"
+    ] = blockers
+
+    print(
+        "[PROVISIONAL_BET_STATE] "
+        f"opened seat={seat} "
+        f"street={street}",
+        flush=True,
+    )
+
+    return state
+
+
+def handle_provisional_bet_closed(state, event):
+    seat = str(event.get("seat") or "")
+    street = str(event.get("street") or "").upper()
+    event_token = str(event.get("hand_token") or "")
+    current_token = str(state.get("hand_token") or "")
+
+    if (
+        event_token
+        and current_token
+        and event_token != current_token
+    ):
+        return state
+
+    key = (
+        f"{street}:{seat}"
+        if seat and street
+        else ""
+    )
+
+    blockers = dict(
+        state.get("unresolved_provisional_bets")
+        or {}
+    )
+
+    if key:
+        blockers.pop(
+            key,
+            None,
+        )
+
+    state[
+        "unresolved_provisional_bets"
+    ] = blockers
+
+    print(
+        "[PROVISIONAL_BET_STATE] "
+        f"closed seat={seat} "
+        f"street={street} "
+        f"reason={event.get('reason') or 'resolved'}",
+        flush=True,
+    )
+
     state = replay_pending_actor_observations(
         state
     )
@@ -4311,6 +4438,18 @@ def handle_event(state, event):
 
     if t == "stack_candidate_closed":
         return handle_stack_candidate_closed(
+            state,
+            event,
+        )
+
+    if t == "provisional_bet_opened":
+        return handle_provisional_bet_opened(
+            state,
+            event,
+        )
+
+    if t == "provisional_bet_closed":
+        return handle_provisional_bet_closed(
             state,
             event,
         )

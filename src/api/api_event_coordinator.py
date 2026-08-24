@@ -788,6 +788,79 @@ def emit_fast_actor_observations(
         or []
     ))
 
+    # Transition-sourced absolute bet evidence remains provisional
+    # until the independent stack pipeline confirms commitment.
+    #
+    # Provisional does not mean passive. While same-hand/same-street
+    # bet evidence is awaiting corroboration, chronology must not skip
+    # through that seat and manufacture CHECK merely because no
+    # canonical open bet has been established yet.
+    deferred_bet_blockers = []
+
+    current_token = str(
+        state.get("hand_token")
+        or ""
+    )
+
+    for item in (
+        state.get(
+            "deferred_bet_amount_results"
+        )
+        or {}
+    ).values():
+        request = (
+            item.get("request")
+            or {}
+        )
+
+        result = (
+            item.get("result")
+            or {}
+        )
+
+        item_token = str(
+            result.get("hand_token")
+            or request.get("hand_token")
+            or ""
+        )
+
+        item_street = str(
+            result.get("street")
+            or request.get("street")
+            or item.get("street")
+            or ""
+        ).upper()
+
+        item_seat = str(
+            result.get("seat")
+            or request.get("seat")
+            or item.get("seat")
+            or ""
+        )
+
+        source = str(
+            request.get("source")
+            or "transition"
+        )
+
+        if (
+            item_seat
+            and source == "transition"
+            and current_token
+            and item_token == current_token
+            and item_street == current_street
+        ):
+            deferred_bet_blockers.append(
+                item_seat
+            )
+
+    chronology_blockers = list(
+        dict.fromkeys(
+            same_frame_blockers
+            + deferred_bet_blockers
+        )
+    )
+
     for seat in actor_seats:
         if not seat:
             continue
@@ -798,7 +871,7 @@ def emit_fast_actor_observations(
             "seat": seat,
             "street": current_street,
             "source": "bet_region_appeared",
-            "blocked_seats": same_frame_blockers,
+            "blocked_seats": chronology_blockers,
             "ts": time.time(),
         })
 
@@ -806,7 +879,7 @@ def emit_fast_actor_observations(
             "[ACTOR_OBSERVED_EMIT] "
             f"street={current_street} "
             f"seat={seat} "
-            f"blocked={same_frame_blockers}",
+            f"blocked={chronology_blockers}",
             flush=True,
         )
 
@@ -1393,6 +1466,8 @@ def enrich_stack_change_measurements(
                 None,
             )
 
+            entry["unchanged_stack_reads"] = 0
+
             print(
                 "[STACK_CANDIDATE_REARM] "
                 f"seat={seat} "
@@ -1448,10 +1523,48 @@ def enrich_stack_change_measurements(
             and seat in stack_worker_results
         )
 
-        if (
+        candidate_settled = bool(
             now - float(entry["last_change_ts"])
-            < settle_seconds
+            >= settle_seconds
+        )
+
+        # Live and ordinary replay require the full semantic quiet
+        # interval before quantitative stack sampling.
+        #
+        # Deterministic replay EOF is a finite-recording boundary:
+        # recorded time can no longer advance. If a physically
+        # evidenced candidate remains unresolved and owns no
+        # outstanding worker, permit exactly the normal downstream
+        # queue path to take one terminal sample. The queue path
+        # below selects the newest recorded frame at EOF.
+        eof_terminal_sample = bool(
+            replay_eof
+            and not candidate_settled
             and not eof_completed_result
+            and not entry.get(
+                "stack_worker_request_id"
+            )
+            and not entry.get(
+                "eof_terminal_sample_consumed"
+            )
+            and bool(
+                {
+                    "stack_motion",
+                    "bet_region_appeared",
+                }
+                & set(
+                    entry.get(
+                        "trigger_sources"
+                    )
+                    or []
+                )
+            )
+        )
+
+        if (
+            not candidate_settled
+            and not eof_completed_result
+            and not eof_terminal_sample
         ):
             continue
 
@@ -1564,11 +1677,41 @@ def enrich_stack_change_measurements(
                 if (
                     retry_not_before_ts is not None
                     and now < float(retry_not_before_ts)
+                    and not eof_terminal_sample
                 ):
                     continue
 
                 request_frame_path = frame_path
                 request_frame_ts = now
+
+                # EOF terminal sampling must use the newest recorded
+                # evidence. A previously selected retry frame may
+                # predate the candidate's final detected movement.
+                if (
+                    eof_terminal_sample
+                    and replay_records
+                ):
+                    terminal_record = replay_records[-1]
+
+                    request_frame_path = str(
+                        terminal_record[
+                            "frame_path"
+                        ]
+                    )
+
+                    request_frame_ts = float(
+                        terminal_record["ts"]
+                    )
+
+                    # Deterministic replay EOF owns exactly one
+                    # terminal quantitative sample per physical
+                    # stack candidate. Mark that finite opportunity
+                    # before queueing so a completed unresolved
+                    # result cannot level-trigger the same final
+                    # recorded frame forever.
+                    entry[
+                        "eof_terminal_sample_consumed"
+                    ] = True
 
                 retry_frame_path = entry.get(
                     "retry_frame_path"
@@ -1578,7 +1721,8 @@ def enrich_stack_change_measurements(
                 )
 
                 if (
-                    replay_records
+                    not eof_terminal_sample
+                    and replay_records
                     and retry_frame_path
                     and retry_frame_ts is not None
                 ):
@@ -1904,6 +2048,12 @@ def enrich_stack_change_measurements(
                 )
                 reading["votes"] = 1
                 reading["mode"] = "continuity_unresolved"
+                reading["numeric_evidence_present"] = bool(
+                    resolution.numeric_evidence_present
+                )
+                reading["continuity_resolution_reason"] = (
+                    resolution.reason
+                )
 
                 print(
                     f"[STACK_CONTINUITY_REJECT] seat={seat} "
@@ -1933,6 +2083,43 @@ def enrich_stack_change_measurements(
             or confidence < minimum_confidence
             or votes < minimum_votes
         ):
+            unresolved_numeric_evidence = bool(
+                reading.get("numeric_evidence_present")
+                and reading.get(
+                    "mode"
+                )
+                == "continuity_unresolved"
+            )
+
+            if unresolved_numeric_evidence:
+                # Continuity rejected a real numeric family.
+                # Keep it unresolved rather than consuming the
+                # generic OCR-failure retry budget.
+                #
+                # This does not promote or accept the value.
+                entry["last_numeric_evidence_ts"] = now
+                entry[
+                    "last_numeric_evidence_reason"
+                ] = reading.get(
+                    "continuity_resolution_reason"
+                )
+
+                reason = entry.get(
+                    "last_numeric_evidence_reason"
+                )
+
+                print(
+                    "[STACK_CONTINUITY_PENDING]",
+                    "seat=" + str(seat),
+                    "numeric=yes",
+                    "resolved=no",
+                    "ocr_budget_consumed=no",
+                    "reason=" + str(reason),
+                    flush=True,
+                )
+
+                continue
+
             attempts = int(entry.get("ocr_attempts") or 0) + 1
             entry["ocr_attempts"] = attempts
 
@@ -2091,7 +2278,20 @@ def enrich_stack_change_measurements(
                 or 0
             )
 
-            if not unchanged_physical_candidate:
+            unchanged_stack_reads = int(
+                entry.get(
+                    "unchanged_stack_reads"
+                )
+                or 0
+            )
+
+            if unchanged_physical_candidate:
+                unchanged_stack_reads += 1
+
+                entry[
+                    "unchanged_stack_reads"
+                ] = unchanged_stack_reads
+            else:
                 attempts += 1
                 entry["validation_attempts"] = attempts
 
@@ -2138,8 +2338,16 @@ def enrich_stack_change_measurements(
                     or physical_candidate_pending
                 )
                 and (
-                    unchanged_physical_candidate
-                    or attempts < maximum_ocr_attempts
+                    (
+                        unchanged_physical_candidate
+                        and unchanged_stack_reads
+                        < maximum_ocr_attempts
+                    )
+                    or (
+                        not unchanged_physical_candidate
+                        and attempts
+                        < maximum_ocr_attempts
+                    )
                 )
                 and within_lifetime
             )
@@ -3783,6 +3991,7 @@ def queue_bet_amount_request(
     )
 
     pending[request_id] = {
+        "hand_token": request["hand_token"],
         "seat": request["seat"],
         "street": request["street"],
         "frame": request["frame"],
@@ -3913,6 +4122,62 @@ def release_corroborated_bet_amount_results(
     if not deferred:
         return state
 
+    current_token = state.get("hand_token")
+
+    # Hand ownership is independent of stack corroboration.
+    # Retire stale provisional evidence even on a frame with
+    # no confirmed quantitative stack transition.
+    for request_id, item in list(deferred.items()):
+        request = item.get("request") or {}
+        result = item.get("result") or {}
+
+        item_token = (
+            request.get("hand_token")
+            or result.get("hand_token")
+        )
+
+        if (
+            item_token
+            and item_token != current_token
+        ):
+            seat = (
+                item.get("seat")
+                or result.get("seat")
+                or request.get("seat")
+            )
+
+            street = str(
+                item.get("street")
+                or result.get("street")
+                or request.get("street")
+                or ""
+            ).upper()
+
+            emit({
+                "type": "provisional_bet_closed",
+                "hand_token": item_token,
+                "seat": seat,
+                "street": street,
+                "reason": "hand_changed",
+                "source_request_id": request_id,
+                "ts": time.time(),
+            })
+
+            deferred.pop(
+                request_id,
+                None,
+            )
+
+            print(
+                "[BET_AMOUNT] retired deferred result "
+                "reason=hand_changed "
+                f"request={request_id[:8]}",
+                flush=True,
+            )
+
+    if not deferred:
+        return state
+
     details = dict(
         getattr(
             changes,
@@ -3971,21 +4236,77 @@ def release_corroborated_bet_amount_results(
             and stack_street
             and result_street != stack_street
         ):
-            continue
+            # Candidate origin_street remains historical: an unresolved
+            # old-street physical candidate must not be relabeled merely
+            # because newer board-local evidence appeared.
+            #
+            # However, independently confirmed quantitative stack evidence
+            # may validate a newer-street deferred absolute bet when both
+            # independent sensors agree on the exact chip commitment.
+            #
+            # Keep this bridge deliberately narrow. Weak continuity OCR or
+            # merely approximate amounts may not cross a street boundary.
+            try:
+                deferred_bet_bb = float(
+                    item.get("bet_bb")
+                )
+            except (TypeError, ValueError):
+                deferred_bet_bb = None
 
-        if (
-            request.get("hand_token")
-            != state.get("hand_token")
-        ):
-            deferred.pop(request_id, None)
+            try:
+                stack_confidence = float(
+                    detail.get(
+                        "stack_read_confidence"
+                    )
+                    or 0.0
+                )
+            except (TypeError, ValueError):
+                stack_confidence = 0.0
+
+            stack_mode = str(
+                detail.get(
+                    "stack_read_mode"
+                )
+                or ""
+            ).lower()
+
+            independent_modes = {
+                "independent_confirmed",
+                "independent_segmentation",
+                "agreement_verified",
+            }
+
+            exact_quantitative_match = bool(
+                deferred_bet_bb is not None
+                and abs(
+                    deferred_bet_bb
+                    - delta_bb
+                ) <= 0.011
+            )
+
+            strong_independent_stack = bool(
+                stack_confidence >= 0.95
+                and stack_mode
+                in independent_modes
+            )
+
+            if not (
+                exact_quantitative_match
+                and strong_independent_stack
+            ):
+                continue
 
             print(
-                "[BET_AMOUNT] retired deferred result "
-                "reason=hand_changed "
-                f"request={request_id[:8]}",
+                "[BET_AMOUNT] cross-boundary corroboration "
+                f"seat={seat} "
+                f"stack_street={stack_street} "
+                f"bet_street={result_street} "
+                f"delta={delta_bb:.2f} "
+                f"bet={deferred_bet_bb:.2f} "
+                f"confidence={stack_confidence:.2f} "
+                f"mode={stack_mode}",
                 flush=True,
             )
-            continue
 
         emit_bet_amount_observation(
             state,
@@ -3996,6 +4317,16 @@ def release_corroborated_bet_amount_results(
         )
 
         deferred.pop(request_id, None)
+
+        emit({
+            "type": "provisional_bet_closed",
+            "hand_token": state.get("hand_token"),
+            "seat": seat,
+            "street": result_street,
+            "reason": "corroborated",
+            "source_request_id": request_id,
+            "ts": time.time(),
+        })
 
         print(
             "[BET_AMOUNT] corroborated",
@@ -4106,6 +4437,18 @@ def apply_bet_amount_result(
         "seat": result.get("seat"),
         "street": result.get("street"),
     }
+
+    emit({
+        "type": "provisional_bet_opened",
+        "hand_token": current_token,
+        "seat": result.get("seat"),
+        "street": result.get("street"),
+        "source": source,
+        "source_request_id": request_id,
+        "bet_bb": round(bet_bb, 2),
+        "ts": result.get("ts")
+        or time.time(),
+    })
 
     print(
         "[BET_AMOUNT] deferred",
@@ -4857,12 +5200,49 @@ def replay_pending_stack_candidates(state):
     prerecorded quantitative work at replay EOF.
 
     Tokenless/post-hand candidates are not semantic replay obligations.
-    Existing settled-stack ownership remains authoritative at EOF.
+
+    pending_stack_worker_requests is the durable transport ledger.
+    A candidate-local stack_worker_request_id is only a correlation key.
+    If that request no longer exists in durable transport, reconcile the
+    stale local key before deciding whether the candidate owns EOF work.
     """
     hand_token = state.get("hand_token")
 
     if not hand_token:
         return {}
+
+    transport = (
+        state.get("pending_stack_worker_requests")
+        or {}
+    )
+
+    for seat, pending in (
+        state.get("pending_stack_reads")
+        or {}
+    ).items():
+        if not isinstance(pending, dict):
+            continue
+
+        request_id = pending.get(
+            "stack_worker_request_id"
+        )
+
+        if (
+            request_id
+            and request_id not in transport
+        ):
+            pending.pop(
+                "stack_worker_request_id",
+                None,
+            )
+
+            print(
+                "[REPLAY_EOF_STACK_RECONCILE] "
+                f"seat={seat} "
+                f"request={str(request_id)[:8]} "
+                "reason=local_request_absent_from_transport",
+                flush=True,
+            )
 
     return {
         seat: dict(pending)
@@ -4877,6 +5257,14 @@ def replay_pending_stack_candidates(state):
                     None,
                     hand_token,
                 }
+            )
+            and not (
+                pending.get(
+                    "eof_terminal_sample_consumed"
+                )
+                and not pending.get(
+                    "stack_worker_request_id"
+                )
             )
         )
     }
@@ -5170,6 +5558,110 @@ def drain_replay_stack_candidates_once(
     if not replay_pending_stack_candidates(state):
         return state, False, ChangeSet()
 
+    # Deterministic replay owns only finite prerecorded evidence.
+    #
+    # A settled candidate may already have sampled the newest recorded
+    # frame and then schedule an unchanged-stack retry after the recording
+    # ends. Recorded semantic time can never reach that deadline.
+    #
+    # In that exact state there is no additional quantitative evidence
+    # available to drain. Preserve the unresolved candidate itself, but
+    # mark its one terminal opportunity consumed so it no longer blocks
+    # replay completion.
+    eof_candidates = (
+        state.get("pending_stack_reads")
+        or {}
+    )
+
+    for seat, entry in eof_candidates.items():
+        if not isinstance(entry, dict):
+            continue
+
+        if entry.get("stack_worker_request_id"):
+            continue
+
+        if entry.get(
+            "eof_terminal_sample_consumed"
+        ):
+            continue
+
+        retry_not_before_ts = entry.get(
+            "retry_not_before_ts"
+        )
+
+        last_stack_sample_ts = entry.get(
+            "last_stack_sample_ts"
+        )
+
+        if (
+            retry_not_before_ts is None
+            or last_stack_sample_ts is None
+        ):
+            continue
+
+        final_ts = float(final_frame_ts)
+        retry_ts = float(retry_not_before_ts)
+        sample_ts = float(last_stack_sample_ts)
+
+        last_change_ts = entry.get(
+            "last_change_ts"
+        )
+
+        # retry_ts - sample_ts is the ordinary semantic
+        # settlement interval already carried by this
+        # candidate's retry schedule.
+        settle_interval = max(
+            0.0,
+            retry_ts - sample_ts,
+        )
+
+        candidate_settled_at_eof = bool(
+            last_change_ts is not None
+            and (
+                final_ts
+                - float(last_change_ts)
+            )
+            >= settle_interval - 1e-9
+        )
+
+        # Two finite-recording cases are terminal:
+        #
+        # 1. The candidate already sampled the final recorded
+        #    frame and its next retry lies beyond EOF.
+        #
+        # 2. The physical candidate is already semantically
+        #    settled at EOF, has consumed quantitative evidence,
+        #    and its next eligible retry lies beyond EOF.
+        #
+        # An UNSETTLED physical candidate is deliberately not
+        # exhausted here. It retains the existing right to one
+        # newest-frame EOF terminal sample.
+        if (
+            retry_ts > final_ts
+            and (
+                sample_ts
+                >= final_ts - 1e-9
+                or candidate_settled_at_eof
+            )
+        ):
+            entry[
+                "eof_terminal_sample_consumed"
+            ] = True
+
+            print(
+                "[REPLAY_EOF_STACK_EXHAUSTED] "
+                f"seat={seat} "
+                f"last_sample_ts={sample_ts:.6f} "
+                f"final_frame_ts={final_ts:.6f} "
+                f"retry_not_before_ts={retry_ts:.6f} "
+                "reason=no_later_recorded_frame",
+                flush=True,
+            )
+
+    if not replay_pending_stack_candidates(state):
+        save_state(state)
+        return state, True, ChangeSet()
+
     ready = collect_ready_stack_worker_results(
         state,
         replay_frame_ts=float(
@@ -5416,6 +5908,14 @@ def main():
                         "stack_changed_seats",
                         None,
                     ):
+                        # EOF-produced settled stack evidence must pass
+                        # through the same deferred-bet corroboration
+                        # contract as ordinary frame-produced evidence.
+                        state = release_corroborated_bet_amount_results(
+                            state,
+                            eof_stack_changes,
+                        )
+
                         ingest_eof_stack_semantics(
                             eof_stack_changes,
                             state,

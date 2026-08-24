@@ -8,6 +8,7 @@ class StackCandidateResolution:
     resolved: bool
     reason: str
     distance: Optional[float] = None
+    numeric_evidence_present: bool = False
 
 
 def resolve_stack_candidates(
@@ -62,6 +63,7 @@ def resolve_stack_candidates(
                 resolved=True,
                 reason="single_candidate_without_baseline",
                 distance=None,
+                numeric_evidence_present=True,
             )
 
         return StackCandidateResolution(
@@ -69,6 +71,7 @@ def resolve_stack_candidates(
             resolved=False,
             reason="candidate_disagreement_without_baseline",
             distance=None,
+            numeric_evidence_present=True,
         )
 
     previous = float(previous_stack_bb)
@@ -85,6 +88,7 @@ def resolve_stack_candidates(
             resolved=False,
             reason="all_candidates_increase_stack",
             distance=None,
+            numeric_evidence_present=True,
         )
 
     selected = min(
@@ -103,6 +107,7 @@ def resolve_stack_candidates(
             resolved=False,
             reason="nearest_candidate_exceeds_drop_bound",
             distance=distance,
+            numeric_evidence_present=True,
         )
 
     return StackCandidateResolution(
@@ -110,4 +115,5 @@ def resolve_stack_candidates(
         resolved=True,
         reason="nearest_nonincreasing_candidate",
         distance=distance,
+        numeric_evidence_present=True,
     )
