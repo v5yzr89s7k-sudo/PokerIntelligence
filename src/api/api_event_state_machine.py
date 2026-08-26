@@ -85,7 +85,13 @@ def reset_tracker():
     print("[TRACKER] reset", flush=True)
 
 
-def write_betting_round_status(tracker, canonical, state=None):
+def write_betting_round_status(
+    tracker,
+    canonical,
+    state=None,
+    *,
+    processed_event_cursor=None,
+):
     """
     Publish authoritative betting-round state for read-only downstream
     consumers.
@@ -93,6 +99,13 @@ def write_betting_round_status(tracker, canonical, state=None):
     hand_id identifies CanonicalHand persistence. hand_token identifies the
     live perception hand. Both are published so asynchronous consumers can
     reject stale status from another live hand.
+
+    processed_event_cursor is the next-unprocessed api_events.jsonl index.
+    A published value N guarantees that every event at index < N completed
+    its full state-machine transaction before this status was published.
+
+    Handler-internal writes do not advance that acknowledgement. They preserve
+    the last proven cursor until the main event loop explicitly advances it.
     """
     status = tracker.commitment_tracker.round_status(
         canonical.current_street
@@ -107,6 +120,35 @@ def write_betting_round_status(tracker, canonical, state=None):
     status["processed_episode_count"] = len(
         tracker.processed_episode_ids
     )
+
+    if processed_event_cursor is None:
+        previous_cursor = None
+
+        if BETTING_ROUND_STATUS_PATH.exists():
+            try:
+                previous_status = json.loads(
+                    BETTING_ROUND_STATUS_PATH.read_text()
+                )
+
+                previous_cursor = (
+                    previous_status.get(
+                        "processed_event_cursor"
+                    )
+                    if isinstance(previous_status, dict)
+                    else None
+                )
+            except Exception:
+                previous_cursor = None
+
+        if previous_cursor is not None:
+            status["processed_event_cursor"] = int(
+                previous_cursor
+            )
+
+    else:
+        status["processed_event_cursor"] = int(
+            processed_event_cursor
+        )
 
     BETTING_ROUND_STATUS_PATH.parent.mkdir(
         parents=True,
@@ -1583,6 +1625,97 @@ def handle_pot_update(state, event):
 
     return state
 
+def unresolved_board_ownership(state, street):
+    """
+    Return finite same-street quantitative ownership that must settle before
+    canonical board promotion.
+
+    A validated stack transition awaiting its inferred action is canonical
+    action ownership.
+
+    A provisional bet is independent quantitative commitment ownership.
+
+    Raw stack-motion hypotheses are deliberately excluded. They are perception
+    candidates, not by themselves proof that canonical action publication is
+    still pending.
+    """
+    street = str(street or "").upper()
+
+    awaiting_action = sorted({
+        str(item.get("seat") or "")
+        for item in (
+            state.get("unresolved_stack_candidates")
+            or {}
+        ).values()
+        if (
+            str(item.get("street") or "").upper()
+            == street
+            and item.get("seat")
+            and item.get("awaiting_action")
+        )
+    })
+
+    provisional_bets = sorted({
+        str(item.get("seat") or "")
+        for item in (
+            state.get("unresolved_provisional_bets")
+            or {}
+        ).values()
+        if (
+            str(item.get("street") or "").upper()
+            == street
+            and item.get("seat")
+        )
+    })
+
+    # A raw stack-motion candidate remains only a perception hypothesis and
+    # must not freeze street advancement by itself.
+    #
+    # Once the same candidate carries independent bet-region evidence,
+    # however, a physical chip commitment is already underway. Canonical
+    # board promotion must not outrun that finite quantitative lifecycle
+    # merely because OCR/action classification has not completed yet.
+    commitment_sources = {
+        "bet_region_appeared",
+        "bet_region_occupied",
+    }
+
+    commitment_candidates = sorted({
+        str(item.get("seat") or "")
+        for item in (
+            state.get("unresolved_stack_candidates")
+            or {}
+        ).values()
+        if (
+            str(item.get("street") or "").upper()
+            == street
+            and item.get("seat")
+            and (
+                {
+                    str(source)
+                    for source in (
+                        item.get("sources")
+                        or []
+                    )
+                    if source
+                }
+                & commitment_sources
+            )
+        )
+    })
+
+    return {
+        "awaiting_action": awaiting_action,
+        "provisional_bets": provisional_bets,
+        "commitment_candidates": commitment_candidates,
+        "blocked": bool(
+            awaiting_action
+            or provisional_bets
+            or commitment_candidates
+        ),
+    }
+
+
 def release_pending_board_if_ready(state):
     """
     Promote the earliest confirmed board only after the current canonical
@@ -1610,11 +1743,23 @@ def release_pending_board_if_ready(state):
         canonical.current_street
     )
 
-    if not status.get("complete"):
+    ownership = unresolved_board_ownership(
+        state,
+        canonical.current_street,
+    )
+
+    if (
+        not status.get("complete")
+        or ownership["blocked"]
+    ):
         print(
             "[BOARD_WAIT] "
             f"street={canonical.current_street} "
             f"owing={status.get('players_owing_action')} "
+            f"awaiting_action={ownership['awaiting_action']} "
+            f"provisional_bets={ownership['provisional_bets']} "
+            f"commitment_candidates="
+            f"{ownership['commitment_candidates']} "
             f"pending={len(pending)}",
             flush=True,
         )
@@ -1697,7 +1842,15 @@ def handle_board(state, event):
         )
     )
 
-    if not round_status.get("complete"):
+    ownership = unresolved_board_ownership(
+        state,
+        canonical.current_street,
+    )
+
+    if (
+        not round_status.get("complete")
+        or ownership["blocked"]
+    ):
         pending = list(
             state.get("pending_board_events")
             or []
@@ -1730,6 +1883,10 @@ def handle_board(state, event):
             f"street={canonical.current_street} "
             f"next={transition_for_board_len(n)} "
             f"owing={round_status.get('players_owing_action')} "
+            f"awaiting_action={ownership['awaiting_action']} "
+            f"provisional_bets={ownership['provisional_bets']} "
+            f"commitment_candidates="
+            f"{ownership['commitment_candidates']} "
             f"board={board}",
             flush=True,
         )
@@ -1857,9 +2014,38 @@ def handle_hero_fold(state, event):
 
     canonical = canonical_load()
 
+    event_street = str(
+        event.get("street") or state.get("phase") or ""
+    ).upper()
+
+    current_street = str(
+        state.get("phase") or ""
+    ).upper()
+
+    canonical_street = str(
+        canonical.current_street or ""
+    ).upper()
+
+    # Terminal perception may run ahead of canonical betting-round
+    # reconciliation. Never reinterpret an explicitly owned future-street
+    # fold as an action on whichever street canonical currently owns.
+    if (
+        event_street != current_street
+        or event_street != canonical_street
+    ):
+        print(
+            "[HERO_FOLD_DEFER] "
+            f"event_street={event_street} "
+            f"current_street={current_street} "
+            f"canonical_street={canonical_street} "
+            "reason=street_mismatch",
+            flush=True,
+        )
+        return state
+
     already_recorded = any(
         action.seat == canonical.hero_seat
-        and action.street == canonical.current_street
+        and str(action.street or "").upper() == event_street
         and action.action == "FOLD"
         for action in canonical.actions
     )
@@ -1883,6 +2069,14 @@ def handle_hero_fold(state, event):
             f"{added.seat} FOLD confidence=1.0"
         )
 
+    # The fold has survived state/canonical street ownership checks above.
+    # Record that causal fact so a subsequent fold-derived hand_complete
+    # cannot bypass canonical action acceptance.
+    state["accepted_hero_fold_street"] = event_street
+    state["accepted_hero_fold_ts"] = float(
+        event.get("ts") or time.time()
+    )
+
     state["hero_to_act"] = False
     state = record_timeline(
         state,
@@ -1901,6 +2095,34 @@ def unresolved_stack_candidate_seats(
         str(item.get("seat") or "")
         for item in (
             state.get("unresolved_stack_candidates")
+            or {}
+        ).values()
+        if (
+            str(item.get("street") or "").upper()
+            == street
+            and item.get("seat")
+        )
+    }
+
+
+def unresolved_provisional_bet_seats(
+    state,
+    street,
+):
+    """
+    Return seats whose same-street provisional bet still owns unresolved
+    action chronology.
+
+    Stack-candidate ownership and provisional-bet ownership are independent
+    commitment-evidence lifecycles. Either one makes passive actor skipping
+    unsafe until that evidence is resolved.
+    """
+    street = str(street or "").upper()
+
+    return {
+        str(item.get("seat") or "")
+        for item in (
+            state.get("unresolved_provisional_bets")
             or {}
         ).values()
         if (
@@ -2309,6 +2531,10 @@ def handle_provisional_bet_closed(state, event):
         state
     )
 
+    state = replay_pending_inferred_actions(
+        state
+    )
+
     return state
 
 
@@ -2399,6 +2625,17 @@ def handle_actor_observed(
         event_street,
     )
 
+    blocked_seats.update(
+        unresolved_provisional_bet_seats(
+            state,
+            event_street,
+        )
+    )
+
+    # Stack candidates and provisional bets are independent commitment
+    # evidence lifecycles. Either one prevents a later observed actor from
+    # fabricating a passive action through the unresolved seat.
+    #
     # The coordinator may observe stack motion and a later actor in the same
     # local frame. api_events.jsonl has not necessarily delivered the
     # stack_candidate_opened event yet, so preserve those same-frame seats as
@@ -2842,6 +3079,91 @@ def handle_physical_actor_completed(
     return state
 
 
+def preserve_pending_inferred_action(
+    state,
+    event,
+):
+    pending = list(
+        state.get("pending_inferred_actions")
+        or []
+    )
+
+    key = (
+        str(event.get("hand_token") or ""),
+        str(event.get("street") or "").upper(),
+        str(event.get("seat") or ""),
+        str(event.get("action") or ""),
+        float(event.get("ts") or 0.0),
+    )
+
+    existing = {
+        (
+            str(item.get("hand_token") or ""),
+            str(item.get("street") or "").upper(),
+            str(item.get("seat") or ""),
+            str(item.get("action") or ""),
+            float(item.get("ts") or 0.0),
+        )
+        for item in pending
+    }
+
+    if key not in existing:
+        pending.append(
+            dict(event)
+        )
+
+    pending.sort(
+        key=lambda item: float(
+            item.get("ts")
+            or 0.0
+        )
+    )
+
+    state[
+        "pending_inferred_actions"
+    ] = pending
+
+    return state
+
+
+def replay_pending_inferred_actions(
+    state,
+):
+    pending = list(
+        state.get("pending_inferred_actions")
+        or []
+    )
+
+    if not pending:
+        return state
+
+    state[
+        "pending_inferred_actions"
+    ] = []
+
+    pending.sort(
+        key=lambda item: float(
+            item.get("ts")
+            or 0.0
+        )
+    )
+
+    print(
+        "[REPLAY] retrying "
+        f"{len(pending)} "
+        "deferred inferred actions",
+        flush=True,
+    )
+
+    for pending_event in pending:
+        state = handle_inferred_action(
+            state,
+            pending_event,
+        )
+
+    return state
+
+
 def handle_inferred_action(state, event):
     if state.get("phase") == "WAITING":
         print("[SKIP] inferred_action while waiting", event)
@@ -2965,6 +3287,99 @@ def handle_inferred_action(state, event):
 
             return state
 
+    provisional_blockers = {
+        str(item.get("seat") or "")
+        for item in (
+            state.get(
+                "unresolved_provisional_bets"
+            )
+            or {}
+        ).values()
+        if (
+            str(
+                item.get("street")
+                or ""
+            ).upper()
+            == action_street
+            and item.get("seat")
+        )
+    }
+
+    queue = list(
+        canonical.players_to_act
+        or []
+    )
+
+    actor_index = (
+        queue.index(seat)
+        if seat in queue
+        else -1
+    )
+
+    earlier_seats = (
+        queue[:actor_index]
+        if actor_index > 0
+        else []
+    )
+
+    provisional_gap = [
+        earlier_seat
+        for earlier_seat in earlier_seats
+        if earlier_seat
+        in provisional_blockers
+    ]
+
+    # A player may already have acted earlier on this street and therefore
+    # no longer appear in players_to_act. Unresolved aggression by another
+    # seat can legitimately reopen action for that player.
+    #
+    # Until that provisional aggression resolves, a later quantitative
+    # stack decrease from the previously acted player cannot be classified
+    # as fresh aggression merely because the player is absent from the
+    # current action queue.
+    #
+    # Exclude the incoming seat itself: its quantitative action must remain
+    # eligible to resolve its own provisional commitment.
+    provisional_reentry_gap = (
+        sorted(
+            provisional_blockers
+            - {str(seat or "")}
+        )
+        if actor_index < 0
+        else []
+    )
+
+    provisional_blocking_seats = (
+        provisional_gap
+        if provisional_gap
+        else provisional_reentry_gap
+    )
+
+    if provisional_blocking_seats:
+        state = (
+            preserve_pending_inferred_action(
+                state,
+                event,
+            )
+        )
+
+        mode = (
+            "queue_gap"
+            if provisional_gap
+            else "reentry"
+        )
+
+        print(
+            "[QUANTITATIVE_PROVISIONAL_DEFER] "
+            f"street={action_street} "
+            f"seat={seat} "
+            f"blocked={provisional_blocking_seats} "
+            f"mode={mode}",
+            flush=True,
+        )
+
+        return state
+
     added = tracker.ingest(tracker_event)
 
     status = write_betting_round_status(
@@ -2992,16 +3407,10 @@ def handle_inferred_action(state, event):
 
             # Deferred actions remain pending for replay.
             if "deferred" in decision.reason.lower():
-                pending = list(
-                    state.get("pending_inferred_actions") or []
+                state = preserve_pending_inferred_action(
+                    state,
+                    event,
                 )
-
-                pending.append(dict(event))
-                pending.sort(
-                    key=lambda item: float(item.get("ts") or 0.0)
-                )
-
-                state["pending_inferred_actions"] = pending
 
                 print(
                     "[BUFFER] deferred inferred_action "
@@ -3075,29 +3484,9 @@ def handle_inferred_action(state, event):
         state
     )
 
-    pending = list(
-        state.get("pending_inferred_actions") or []
+    state = replay_pending_inferred_actions(
+        state
     )
-
-    if pending:
-        state["pending_inferred_actions"] = []
-
-        pending.sort(
-            key=lambda item: float(
-                item.get("ts") or 0.0
-            )
-        )
-
-        print(
-            f"[REPLAY] retrying {len(pending)} deferred inferred actions",
-            flush=True,
-        )
-
-        for pending_event in pending:
-            state = handle_inferred_action(
-                state,
-                pending_event,
-            )
 
     # A physical next-street board may already be waiting. The action just
     # accepted above can be the final obligation on the old street, so promote
@@ -3277,6 +3666,44 @@ def handle_hand_complete(state, event):
         return state
 
     result = event.get("result") or "Hand complete"
+
+    normalized_result = str(result).strip().lower()
+    fold_prefix = "hero folded on "
+
+    if normalized_result.startswith(fold_prefix):
+        claimed_street = (
+            normalized_result[len(fold_prefix):]
+            .strip()
+            .upper()
+        )
+
+        accepted_street = str(
+            state.get("accepted_hero_fold_street")
+            or ""
+        ).upper()
+
+        if (
+            not accepted_street
+            or accepted_street != claimed_street
+        ):
+            print(
+                "[HAND_COMPLETE_REJECT] "
+                f"result={result!r} "
+                f"claimed_street={claimed_street or 'unknown'} "
+                f"accepted_hero_fold_street="
+                f"{accepted_street or 'none'} "
+                "reason=missing_accepted_fold_cause",
+                flush=True,
+            )
+
+            state = record_timeline(
+                state,
+                "hand_complete_rejected "
+                "missing_accepted_fold_cause",
+            )
+
+            return state
+
     state["phase"] = "COMPLETE"
     state["snapshot_cached"] = False
     state["hand_complete"] = True
@@ -4508,7 +4935,7 @@ def main():
 
     while True:
         if not EVENT_LOG.exists():
-            time.sleep(0.5)
+            time.sleep(0.02)
             continue
 
         lines = EVENT_LOG.read_text().splitlines()
@@ -4524,6 +4951,36 @@ def main():
             event = json.loads(line)
             state = handle_event(state, event)
             save_state(state)
+
+            # Publish the event-log acknowledgement only after the entire
+            # event transaction has completed. This is intentionally owned
+            # by the main loop rather than individual handlers.
+            if _ACTIVE_TRACKER is not None:
+                try:
+                    canonical = canonical_load()
+
+                    if (
+                        canonical is not None
+                        and (
+                            canonical.hand_id
+                            or "__unknown__"
+                        )
+                        == _ACTIVE_HAND_ID
+                    ):
+                        write_betting_round_status(
+                            _ACTIVE_TRACKER,
+                            canonical,
+                            state,
+                            processed_event_cursor=i + 1,
+                        )
+                except Exception as exc:
+                    print(
+                        "[BETTING_STATUS_ACK_SKIP] "
+                        f"cursor={i + 1} "
+                        f"reason={type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+
             save_cursor(i + 1)
 
         # Boundary OCR is intentionally outside api_events.jsonl.
@@ -4570,7 +5027,7 @@ def main():
                 save_state(state)
                 save_boundary_stack_cursor(i + 1)
 
-        time.sleep(0.5)
+        time.sleep(0.02)
 
 
 if __name__ == "__main__":

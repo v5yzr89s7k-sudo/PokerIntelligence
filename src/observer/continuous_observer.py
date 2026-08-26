@@ -41,19 +41,29 @@ def observations_from_changes(changes, street="unknown") -> List[Observation]:
     transitions = getattr(changes, "bet_region_transitions", {}) or {}
 
     for seat in getattr(changes, "bet_region_appeared", []) or []:
+        payload = transitions.get(seat) or {}
+
         observations.append(Observation(
             type=BET_REGION_OCCUPIED,
-            street=street,
+            street=payload.get(
+                "origin_street",
+                street,
+            ),
             seat=seat,
-            payload=transitions.get(seat) or {},
+            payload=payload,
         ))
 
     for seat in getattr(changes, "bet_region_cleared", []) or []:
+        payload = transitions.get(seat) or {}
+
         observations.append(Observation(
             type=BET_REGION_CLEARED,
-            street=street,
+            street=payload.get(
+                "origin_street",
+                street,
+            ),
             seat=seat,
-            payload=transitions.get(seat) or {},
+            payload=payload,
         ))
 
     if getattr(changes, "hero_cards_appeared", False):

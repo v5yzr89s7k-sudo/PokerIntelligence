@@ -159,6 +159,97 @@ def main():
                 "unacknowledged result remains durably owned"
             )
 
+
+            # ------------------------------------------------------------
+            # Missing semantic request ownership
+            # ------------------------------------------------------------
+            #
+            # Transport still owns a completed settled-stack request, but
+            # the semantic candidate currently owns NO request id.
+            #
+            # Exact ownership requires request_id equality. Absence of a
+            # semantic request id is not permission to retire transport.
+            state = c.fresh_state()
+            state["hand_token"] = "hand-1"
+            state["phase"] = "PREFLOP"
+
+            state[
+                "pending_stack_worker_requests"
+            ] = {
+                "request-orphan": {
+                    "seat": SEAT,
+                    "street": "PREFLOP",
+                    "frame": "/tmp/0054_full.png",
+                    "purpose": "settled",
+                    "hand_token": "hand-1",
+                    "queued_ts": 3.0,
+                }
+            }
+
+            state["pending_stack_reads"] = {
+                SEAT: {
+                    "first_change_ts": 3.0,
+                    "last_change_ts": 3.0,
+                    "origin_street": "PREFLOP",
+                    "trigger_sources": [
+                        "stack_motion",
+                    ],
+                    # Intentionally NO stack_worker_request_id.
+                    "last_stack_sample_ts": 3.0,
+                    "ocr_attempts": 1,
+                    "hand_token": "hand-1",
+                }
+            }
+
+            results_path.write_text(
+                """
+{"type":"stack_result","request_id":"request-orphan","hand_token":"hand-1","seat":"seat_lower_left","street":"PREFLOP","frame":"/tmp/0054_full.png","purpose":"settled","ok":true,"reading":{"raw":[{"variant":"green","raw":"47.57 BB","stack_bb":47.57},{"variant":"plain","raw":"47.57 BB","stack_bb":47.57}],"stack_bb":47.57,"stack_text":"47.57 BB","confidence":0.98,"votes":2,"mode":"agreement_verified"},"independent":{"stack_bb":47.57,"stack_text":"47.57 BB","confidence":0.98,"votes":4,"mode":"independent_segmentation","raw":[]},"error":null,"elapsed_ms":582.1,"ts":4.0}
+""".strip()
+                + "\n"
+            )
+
+            ready = (
+                c.collect_ready_stack_worker_results(
+                    state
+                )
+            )
+
+            transport_still_owns_orphan = (
+                "request-orphan"
+                in state[
+                    "pending_stack_worker_requests"
+                ]
+            )
+
+            print()
+            print(
+                "missing-owner ready:",
+                {
+                    seat: item.get("request_id")
+                    for seat, item in ready.items()
+                },
+            )
+            print(
+                "missing-owner transport retained:",
+                transport_still_owns_orphan,
+            )
+
+            assert ready == {}, (
+                "RED: collector exposed completed settled-stack "
+                "result even though semantic candidate owns no "
+                "request id"
+            )
+
+            assert transport_still_owns_orphan, (
+                "RED: collector retired settled-stack transport "
+                "without exact semantic request ownership"
+            )
+
+            print(
+                "PASS missing semantic request ownership: "
+                "transport remains durable"
+            )
+
         finally:
             c.STACK_RESULTS = old_results
             c.CANONICAL_HAND_JSON = old_canonical

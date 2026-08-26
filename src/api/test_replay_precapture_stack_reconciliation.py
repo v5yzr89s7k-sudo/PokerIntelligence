@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import tempfile
+
 from src.api import api_event_coordinator as c
 from src.events.local_event_detector import ChangeSet
 
@@ -98,39 +100,84 @@ def make_state():
 def main():
     state = make_state()
 
+    # Unrelated candidate deliberately has no worker request.
+    #
+    # Pre-capture reconciliation for seat_lower_left must NOT give this
+    # candidate an extra scheduling cycle. Doing so would create a synthetic
+    # pseudo-frame and move unrelated request ownership earlier in replay.
+    unrelated_seat = "seat_mid_right"
+
+    state["pending_stack_reads"][
+        unrelated_seat
+    ] = {
+        "first_change_ts": FRAME_TS[50] - 1.0,
+        "last_change_ts": FRAME_TS[50] - 1.0,
+        "origin_street": "PREFLOP",
+        "trigger_sources": [
+            "stack_motion",
+        ],
+        "hand_token": "hand-1",
+    }
+
     old_finder = c.find_stack_worker_result
+    old_canonical = c.CANONICAL_HAND_JSON
 
-    try:
-        c.find_stack_worker_result = (
-            lambda request_id: (
-                unchanged_result(request_id)
-                if request_id == "request-1"
-                else None
-            )
+    with tempfile.TemporaryDirectory() as tmp:
+        canonical_path = (
+            Path(tmp) / "canonical_hand.json"
         )
 
-        # This helper does not exist yet.
-        #
-        # Required behavior:
-        #
-        # - current semantic frame is 51
-        # - next replay frame 52 reaches/crosses the release boundary
-        # - request-1 physically exists
-        # - consume and reconcile request-1 BEFORE capture(52)
-        # - unchanged validation preserves the candidate
-        # - deterministic retry ownership is established
-        # - therefore frame 52 is NOT yet eligible for perception
-        result = (
-            c.reconcile_replay_stack_before_capture(
-                state,
-                current_frame_ts=FRAME_TS[51],
-                next_frame_ts=FRAME_TS[52],
-                replay_records=REPLAY_RECORDS,
-            )
+        canonical_path.write_text(
+            """
+{
+  "players": {
+    "seat_lower_left": {
+      "starting_stack_bb": 48.57,
+      "current_stack_bb": 48.57,
+      "last_confirmed_stack_bb": 48.57
+    },
+    "seat_mid_right": {
+      "starting_stack_bb": 100.00,
+      "current_stack_bb": 100.00,
+      "last_confirmed_stack_bb": 100.00
+    }
+  }
+}
+""".strip()
+            + "\n"
         )
 
-    finally:
-        c.find_stack_worker_result = old_finder
+        c.CANONICAL_HAND_JSON = canonical_path
+
+        try:
+            c.find_stack_worker_result = (
+                lambda request_id: (
+                    unchanged_result(request_id)
+                    if request_id == "request-1"
+                    else None
+                )
+            )
+
+            # Required replay pre-capture contract:
+            #
+            # - current semantic frame is 51
+            # - next replay frame 52 reaches/crosses release boundary
+            # - request-1 physically exists
+            # - reconcile request-1 BEFORE capture(52)
+            # - unchanged validation preserves candidate
+            # - deterministic retry ownership is established
+            result = (
+                c.reconcile_replay_stack_before_capture(
+                    state,
+                    current_frame_ts=FRAME_TS[51],
+                    next_frame_ts=FRAME_TS[52],
+                    replay_records=REPLAY_RECORDS,
+                )
+            )
+
+        finally:
+            c.find_stack_worker_result = old_finder
+            c.CANONICAL_HAND_JSON = old_canonical
 
     print("result:", result)
 
@@ -168,6 +215,26 @@ def main():
         in state[
             "pending_stack_worker_requests"
         ]
+    )
+
+    unrelated_requests = [
+        request
+        for request in (
+            state[
+                "pending_stack_worker_requests"
+            ].values()
+        )
+        if request.get("seat") == unrelated_seat
+    ]
+
+    print(
+        "unrelated pre-capture requests:",
+        unrelated_requests,
+    )
+
+    assert unrelated_requests == [], (
+        "RED: pre-capture reconciliation gave an "
+        "unrelated stack candidate a synthetic scheduling cycle"
     )
 
     assert (

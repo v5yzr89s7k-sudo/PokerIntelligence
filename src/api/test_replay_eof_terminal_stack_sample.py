@@ -77,16 +77,28 @@ def main():
 
             final = records[-1]
 
-            _, progressed, _ = (
-                c.drain_replay_stack_candidates_once(
-                    state,
-                    final_frame_path=(
-                        final["frame_path"]
-                    ),
-                    final_frame_ts=final["ts"],
-                    replay_records=records,
+            # A settled quantitative sample requires an
+            # authoritative previous canonical stack. This fixture
+            # tests EOF timing, not baseline acquisition.
+            from unittest.mock import patch
+
+            with patch.object(
+                c,
+                "_canonical_stack_values",
+                return_value={
+                    SEAT: 10.28,
+                },
+            ):
+                _, progressed, _ = (
+                    c.drain_replay_stack_candidates_once(
+                        state,
+                        final_frame_path=(
+                            final["frame_path"]
+                        ),
+                        final_frame_ts=final["ts"],
+                        replay_records=records,
+                    )
                 )
-            )
 
             entry = state[
                 "pending_stack_reads"
