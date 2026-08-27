@@ -179,6 +179,9 @@ def fresh_state():
         "board_request_id": None,
         "board_request_expected_len": None,
         "board_request_ts": None,
+        # Replay-only semantic ownership timestamp. Live requests leave this
+        # unset and retain the existing asynchronous timeout behavior.
+        "board_request_replay_frame_ts": None,
         "hero_request_id": None,
         "hero_request_token": None,
         "hero_request_ts": None,
@@ -849,11 +852,108 @@ def close_pending_stack_candidate(
     return entry
 
 
+def current_commitment_old_street_owing_seats(
+    state,
+    *,
+    previous_street,
+    next_street,
+    fallback=None,
+):
+    """
+    Return current old-street ownership for commitment attribution.
+
+    Frame-local ownership is useful, but same-frame reconciliation may have
+    refreshed the durable unresolved-boundary owner after that local snapshot
+    was captured. Merge both sources so commitment attribution always sees
+    the newest durable ownership without discarding valid frame-local context.
+    """
+    owing = set(
+        fallback
+        or []
+    )
+
+    owing.update(
+        pending_boundary_old_street_owing_seats(
+            state,
+            previous_street=previous_street,
+            next_street=next_street,
+        )
+    )
+
+    return owing
+
+
+def stack_candidate_must_remain_open_for_authoritative_owing(
+    state,
+    seat,
+    entry,
+    *,
+    fallback_old_street_owing_seats=None,
+    event_street=None,
+):
+    """
+    Return True when an unresolved physical stack candidate still owns action
+    on an authoritative unresolved old-street boundary.
+
+    Retry budgets remain authoritative for ordinary/noise candidates. They may
+    not, however, retire a real physical candidate while canonical chronology
+    still says this actor owes action on the candidate's own street.
+    """
+    if not isinstance(entry, dict):
+        return False
+
+    candidate_street = str(
+        entry.get("origin_street")
+        or ""
+    ).upper()
+
+    if (
+        not candidate_street
+        or candidate_street == "WAITING"
+    ):
+        return False
+
+    sources = set(
+        entry.get("trigger_sources")
+        or []
+    )
+
+    if not (
+        {
+            "stack_motion",
+            "bet_region_appeared",
+        }
+        & sources
+    ):
+        return False
+
+    next_street = str(
+        event_street
+        or state.get("phase")
+        or candidate_street
+    ).upper()
+
+    owing = (
+        current_commitment_old_street_owing_seats(
+            state,
+            previous_street=candidate_street,
+            next_street=next_street,
+            fallback=(
+                fallback_old_street_owing_seats
+            ),
+        )
+    )
+
+    return str(seat) in owing
+
+
 def commitment_evidence_street(
     state,
     changes,
     seat,
     fallback_street,
+    *,
+    old_street_owing_seats=None,
 ):
     """
     Return the immutable semantic street for seat-local commitment evidence.
@@ -862,10 +962,13 @@ def commitment_evidence_street(
       1. validated stack detail from this frame;
       2. still-open physical stack candidate;
       3. active bet-region lifecycle owner;
-      4. frame-local street fallback.
+      4. authoritative open canonical street when this actor still owes action;
+      5. frame-local street fallback.
 
     Later board visibility and asynchronous worker completion must not
-    relabel an already-started physical commitment.
+    relabel an already-started physical commitment. For genuinely new
+    commitment evidence, provisional next-street visibility must not steal
+    action ownership from an unfinished authoritative betting round.
     """
     fallback = str(
         fallback_street
@@ -920,6 +1023,29 @@ def commitment_evidence_street(
     if owner_street:
         return owner_street
 
+    old_street_owing_seats = (
+        current_commitment_old_street_owing_seats(
+            state,
+            previous_street=(
+                state.get("phase")
+                or "WAITING"
+            ),
+            next_street=fallback,
+            fallback=old_street_owing_seats,
+        )
+    )
+
+    canonical = str(
+        state.get("phase")
+        or "WAITING"
+    ).upper()
+
+    if (
+        seat in old_street_owing_seats
+        and canonical != "WAITING"
+    ):
+        return canonical
+
     return fallback
 
 
@@ -927,6 +1053,8 @@ def stamp_bet_region_street_ownership(
     state,
     changes,
     fallback_street,
+    *,
+    old_street_owing_seats=None,
 ):
     """
     Attach immutable per-seat street ownership to physical bet-region
@@ -970,6 +1098,9 @@ def stamp_bet_region_street_ownership(
             changes,
             seat,
             fallback_street,
+            old_street_owing_seats=(
+                old_street_owing_seats
+            ),
         )
 
         owners[seat] = street
@@ -988,6 +1119,9 @@ def stamp_bet_region_street_ownership(
             changes,
             seat,
             fallback_street,
+            old_street_owing_seats=(
+                old_street_owing_seats
+            ),
         )
 
         payload = dict(
@@ -1504,9 +1638,53 @@ def reconcile_replay_stack_before_capture(
     }
 
     if not settled:
+        # Collection and semantic reconciliation form one replay boundary.
+        #
+        # A settled result can physically arrive after the collector looked
+        # but before replay_stack_semantic_barrier_allows_advance() performs
+        # its own worker-result lookup. In that race, physical availability
+        # must NOT authorize the next recorded perception frame: the result
+        # has not yet passed through semantic reconciliation.
+        #
+        # Hold whenever an owned settled request is already due at this next
+        # recorded frame. The next coordinator cycle remains on the same
+        # replay boundary, allowing the collector to consume the now-ready
+        # result before capture can advance.
+        due_owned_settled = False
+
+        pending_transport = (
+            state.get("pending_stack_worker_requests")
+            or {}
+        )
+
+        for request_id, request in pending_transport.items():
+            if request.get("purpose") != "settled":
+                continue
+
+            release_ts = _replay_stack_request_release_ts(
+                state,
+                request_id,
+                request,
+                replay_records,
+            )
+
+            if release_ts is None:
+                continue
+
+            if (
+                float(next_frame_ts) + 1e-9
+                < float(release_ts)
+            ):
+                continue
+
+            due_owned_settled = True
+            break
+
         return {
             "advance": (
-                replay_stack_semantic_barrier_allows_advance(
+                False
+                if due_owned_settled
+                else replay_stack_semantic_barrier_allows_advance(
                     state,
                     next_frame_ts=float(next_frame_ts),
                     replay_records=replay_records,
@@ -1705,6 +1883,11 @@ def reconcile_replay_stack_before_capture(
             )
         ),
         "reconciled": True,
+        # Pre-capture reconciliation may validate a real quantitative stack
+        # transition before the next recorded perception frame. Preserve that
+        # semantic evidence for the ordinary replay observer/action pipeline
+        # instead of allowing this temporary ChangeSet to disappear here.
+        "semantic_changes": changes,
     }
 
 
@@ -2069,6 +2252,72 @@ def enrich_stack_change_measurements(
     # Candidates may originate from raw stack motion or independent
     # bet-region evidence.
     for seat in candidate_seats:
+        # One seat may perform successive physical commitments on adjacent
+        # streets while an older weak stack-motion hypothesis is still
+        # unresolved.
+        #
+        # Candidate persistence does not grant the old candidate ownership of
+        # all future same-seat evidence. Once at least one trusted unchanged
+        # stack read has failed to establish an old-street commitment, a fresh
+        # bet-region onset on a genuinely newer physical street starts a new
+        # commitment epoch.
+        #
+        # Do NOT split a candidate that has already established independent
+        # commitment ownership. That candidate must retain its immutable onset
+        # street even if asynchronous OCR settles after the board advances.
+        existing_entry = pending.get(seat) or {}
+
+        existing_street = str(
+            existing_entry.get("origin_street")
+            or ""
+        ).upper()
+
+        physical_street = str(
+            event_street
+            or state.get("phase")
+            or "WAITING"
+        ).upper()
+
+        existing_sources = set(
+            existing_entry.get("trigger_sources")
+            or []
+        )
+
+        cross_street_new_commitment = bool(
+            existing_entry
+            and seat in bet_evidence_seats
+            and "bet_region_appeared" not in existing_sources
+            and existing_street
+            and physical_street
+            and existing_street != physical_street
+            and not existing_entry.get(
+                "semantic_commitment_confirmed"
+            )
+            and int(
+                existing_entry.get(
+                    "unchanged_stack_reads"
+                )
+                or 0
+            ) > 0
+        )
+
+        if cross_street_new_commitment:
+            close_pending_stack_candidate(
+                state,
+                pending,
+                seat,
+                reason="superseded_by_new_street_commitment",
+            )
+
+            print(
+                "[STACK_CANDIDATE_EPOCH_SPLIT] "
+                f"seat={seat} "
+                f"old_street={existing_street} "
+                f"new_street={physical_street} "
+                "reason=fresh_cross_street_commitment",
+                flush=True,
+            )
+
         is_new_candidate = seat not in pending
 
         # A raw stack-motion transition gives us access to the immediately
@@ -2129,14 +2378,22 @@ def enrich_stack_change_measurements(
                 # confirmed old street must remain attached to that old street
                 # across the visual boundary.
                 "origin_street": (
-                    str(
-                        state.get("phase")
-                        or "WAITING"
-                    ).upper()
-                    if seat in old_street_owing_seats
-                    else (
-                        event_street
-                        or state.get("phase", "WAITING")
+                    physical_street
+                    if cross_street_new_commitment
+                    else commitment_evidence_street(
+                        state,
+                        changes,
+                        seat,
+                        (
+                            event_street
+                            or state.get(
+                                "phase",
+                                "WAITING",
+                            )
+                        ),
+                        old_street_owing_seats=(
+                            old_street_owing_seats
+                        ),
                     )
                 ),
                 "trigger_sources": [],
@@ -3159,13 +3416,27 @@ def enrich_stack_change_measurements(
                 or pending_age < maximum_pending_seconds
             )
 
+            authoritative_owing_lifetime = bool(
+                unchanged_physical_candidate
+                and stack_candidate_must_remain_open_for_authoritative_owing(
+                    state,
+                    seat,
+                    entry,
+                    fallback_old_street_owing_seats=(
+                        old_street_owing_seats
+                    ),
+                    event_street=event_street,
+                )
+            )
+
             retrying = bool(
                 (
                     validation.decision != STACK_REJECT
                     or physical_candidate_pending
                 )
                 and (
-                    (
+                    authoritative_owing_lifetime
+                    or (
                         unchanged_physical_candidate
                         and unchanged_stack_reads
                         < maximum_ocr_attempts
@@ -3179,8 +3450,21 @@ def enrich_stack_change_measurements(
                 and within_lifetime
             )
 
+            if authoritative_owing_lifetime:
+                print(
+                    "[STACK_CANDIDATE_RETAIN] "
+                    f"seat={seat} "
+                    f"street={entry.get('origin_street')} "
+                    "reason=authoritative_owing",
+                    flush=True,
+                )
+
             if not retrying:
-                close_pending_stack_candidate(state, pending, seat)
+                close_pending_stack_candidate(
+                    state,
+                    pending,
+                    seat,
+                )
 
             print(
                 "[STACK_PIPELINE]",
@@ -4315,6 +4599,218 @@ def event_log_next_cursor():
         return 0
 
 
+def pending_boundary_old_street_owing_seats(
+    state,
+    *,
+    previous_street,
+    next_street,
+):
+    """
+    Return authoritative old-street owing ownership retained by the
+    currently unresolved physical street boundary.
+
+    This is fallback ownership only. A newer valid betting-round status may
+    refresh the set on any later frame of the same boundary.
+    """
+    pending = (
+        state.get("pending_boundary_route")
+        if isinstance(state, dict)
+        else None
+    )
+
+    if not isinstance(pending, dict):
+        return set()
+
+    hand_token = str(
+        state.get("hand_token")
+        or ""
+    )
+
+    if (
+        not hand_token
+        or str(
+            pending.get("hand_token")
+            or ""
+        ) != hand_token
+    ):
+        return set()
+
+    if (
+        str(
+            pending.get("previous_street")
+            or ""
+        ).upper()
+        != str(previous_street or "").upper()
+    ):
+        return set()
+
+    if (
+        str(
+            pending.get("next_street")
+            or ""
+        ).upper()
+        != str(next_street or "").upper()
+    ):
+        return set()
+
+    return {
+        str(seat)
+        for seat in (
+            pending.get(
+                "old_street_owing_seats"
+            )
+            or []
+        )
+        if seat
+    }
+
+
+def refresh_boundary_old_street_owing_seats(
+    state,
+    *,
+    previous_street,
+    next_street,
+    status,
+):
+    """
+    Return the causally authoritative old-street owing set for a physical
+    board boundary.
+
+    Previously acknowledged boundary ownership is durable. A matching
+    betting-round status may replace it only when its processed event cursor
+    is at least as fresh as the boundary's causal ownership watermark.
+
+    Authoritative owing is defined consistently as the union of
+    players_owing_action and canonical_players_to_act.
+    """
+    retained = pending_boundary_old_street_owing_seats(
+        state,
+        previous_street=previous_street,
+        next_street=next_street,
+    )
+
+    status = (
+        status
+        if isinstance(status, dict)
+        else {}
+    )
+
+    current_token = str(
+        state.get("hand_token")
+        or ""
+    )
+
+    status_token = str(
+        status.get("hand_token")
+        or ""
+    )
+
+    status_street = str(
+        status.get("street")
+        or ""
+    ).upper()
+
+    expected_street = str(
+        previous_street
+        or ""
+    ).upper()
+
+    if (
+        not current_token
+        or status_token != current_token
+        or status_street != expected_street
+    ):
+        return retained
+
+    pending = (
+        state.get("pending_boundary_route")
+        or {}
+    )
+
+    same_boundary = bool(
+        isinstance(pending, dict)
+        and str(
+            pending.get("hand_token")
+            or ""
+        ) == current_token
+        and str(
+            pending.get("previous_street")
+            or ""
+        ).upper() == expected_street
+        and str(
+            pending.get("next_street")
+            or ""
+        ).upper()
+        == str(
+            next_street
+            or ""
+        ).upper()
+    )
+
+    freshness_floor = None
+
+    if same_boundary:
+        required_cursor = pending.get(
+            "required_event_cursor"
+        )
+
+        last_acknowledged_cursor = pending.get(
+            "last_acknowledged_event_cursor"
+        )
+
+        if required_cursor is not None:
+            freshness_floor = int(
+                required_cursor
+            )
+        elif last_acknowledged_cursor is not None:
+            freshness_floor = int(
+                last_acknowledged_cursor
+            )
+
+    try:
+        status_cursor = int(
+            status.get(
+                "processed_event_cursor"
+            )
+            or 0
+        )
+    except Exception:
+        status_cursor = 0
+
+    if (
+        freshness_floor is not None
+        and status_cursor < freshness_floor
+    ):
+        return retained
+
+    players_owing = {
+        str(seat)
+        for seat in (
+            status.get(
+                "players_owing_action"
+            )
+            or []
+        )
+        if seat
+    }
+
+    canonical_to_act = {
+        str(seat)
+        for seat in (
+            status.get(
+                "canonical_players_to_act"
+            )
+            or []
+        )
+        if seat
+    }
+
+    return (
+        players_owing
+        | canonical_to_act
+    )
+
+
 def maybe_route_acknowledged_boundary(state):
     """
     Route a preserved physical street boundary only after authoritative
@@ -4413,8 +4909,83 @@ def maybe_route_acknowledged_boundary(state):
         status=status,
     )
 
-    # The authoritative state machine has now decided who still owes action.
-    # Whether that set was nonempty or empty, this boundary is resolved.
+    # Cursor acknowledgement establishes that the state machine has consumed
+    # coordinator events through this boundary. It does NOT by itself mean
+    # the authoritative old betting round has completed.
+    #
+    # Preserve physical old-street ownership while canonical poker state
+    # still reports actors owing action. Later acknowledged status may shrink
+    # or clear this set; only authoritative completion retires the boundary.
+    owing = {
+        str(seat)
+        for seat in (
+            status.get("players_owing_action")
+            or []
+        )
+        if seat
+    }
+
+    canonical_to_act = {
+        str(seat)
+        for seat in (
+            status.get("canonical_players_to_act")
+            or []
+        )
+        if seat
+    }
+
+    authoritative_owing = (
+        owing
+        | canonical_to_act
+    )
+
+    round_complete = bool(
+        status.get("complete")
+    )
+
+    betting_open = bool(
+        status.get("betting_open")
+    )
+
+    if (
+        not round_complete
+        and (
+            betting_open
+            or authoritative_owing
+        )
+    ):
+        pending[
+            "old_street_owing_seats"
+        ] = sorted(
+            authoritative_owing
+        )
+
+        # This ACK has been consumed. Keep the physical boundary alive, but
+        # require the next coordinator publication boundary to arm a fresh
+        # cursor before another authoritative routing decision.
+        pending[
+            "last_acknowledged_event_cursor"
+        ] = acknowledged_cursor
+
+        pending[
+            "required_event_cursor"
+        ] = None
+
+        state["pending_boundary_route"] = pending
+
+        print(
+            "[BOUNDARY_ACK_RETAIN] "
+            f"street={previous_street} "
+            f"next={next_street} "
+            f"required={required_cursor} "
+            f"ack={acknowledged_cursor} "
+            f"owing={sorted(authoritative_owing)} "
+            f"queued={bool(payload)}",
+            flush=True,
+        )
+
+        return state, payload
+
     state["pending_boundary_route"] = None
 
     print(
@@ -4745,7 +5316,13 @@ def maybe_queue_boundary_stack_request(
     return state, payload
 
 
-def queue_board_request(state, expected_len, frame):
+def queue_board_request(
+    state,
+    expected_len,
+    frame,
+    *,
+    replay_frame_ts=None,
+):
     request_id = uuid.uuid4().hex
 
     queued_ts = time.time()
@@ -4771,6 +5348,11 @@ def queue_board_request(state, expected_len, frame):
     state["board_request_id"] = request_id
     state["board_request_expected_len"] = expected_len
     state["board_request_ts"] = queued_ts
+    state["board_request_replay_frame_ts"] = (
+        float(replay_frame_ts)
+        if replay_frame_ts is not None
+        else None
+    )
 
     print(
         f"[BOARD] queued request={request_id[:8]} "
@@ -4811,6 +5393,7 @@ def apply_board_result(state, result):
     # Clear the pending request regardless of success so failure can retry.
     state["board_request_id"] = None
     state["board_request_expected_len"] = None
+    state["board_request_replay_frame_ts"] = None
 
     if result.get("hand_token") != state.get("hand_token"):
         print("[BOARD] ignored stale result from another hand")
@@ -4900,7 +5483,13 @@ def apply_board_result(state, result):
     return state, True
 
 
-def maybe_read_board(state, count, frame):
+def maybe_read_board(
+    state,
+    count,
+    frame,
+    *,
+    replay_frame_ts=None,
+):
     if state.get("phase") == "WAITING":
         return state
 
@@ -4910,6 +5499,18 @@ def maybe_read_board(state, count, frame):
         result = find_board_result(pending_id)
 
         if result is None:
+            # Deterministic replay owns this request until its worker result
+            # physically resolves. Wall-clock latency must never retire the
+            # request and cause a later recorded frame to queue replacement
+            # board work.
+            if (
+                state.get(
+                    "board_request_replay_frame_ts"
+                )
+                is not None
+            ):
+                return state
+
             request_ts = state.get(
                 "board_request_ts"
             )
@@ -4941,6 +5542,7 @@ def maybe_read_board(state, count, frame):
             state["board_request_id"] = None
             state["board_request_expected_len"] = None
             state["board_request_ts"] = None
+            state["board_request_replay_frame_ts"] = None
 
         else:
             log_latency(
@@ -4996,6 +5598,7 @@ def maybe_read_board(state, count, frame):
         state,
         expected_next,
         frame,
+        replay_frame_ts=replay_frame_ts,
     )
 
 
@@ -6426,6 +7029,45 @@ def _append_coordinator_timing(payload):
 
 
 
+def replay_board_semantic_barrier_allows_advance(
+    state,
+    *,
+    next_frame_ts,
+):
+    """
+    Replay-only ordering barrier for asynchronous board recognition.
+
+    A board request created from a recorded frame owns canonical street
+    progression. Once replay would advance beyond that owning frame, the
+    worker result must physically exist before another recorded perception
+    frame may enter LocalEventDetector.
+
+    Live capture never calls this helper.
+    """
+    request_id = state.get("board_request_id")
+
+    if not request_id:
+        return True
+
+    request_frame_ts = state.get(
+        "board_request_replay_frame_ts"
+    )
+
+    if request_frame_ts is None:
+        return True
+
+    if (
+        float(next_frame_ts)
+        <= float(request_frame_ts) + 1e-9
+    ):
+        return True
+
+    return (
+        find_board_result(request_id)
+        is not None
+    )
+
+
 def replay_outstanding_transport(state):
     """
     Return durable asynchronous transport that must settle before a replay
@@ -6577,10 +7219,32 @@ def ingest_eof_stack_semantics(
     if state.get("terminal_action_frozen"):
         return []
 
-    street = str(
-        state.get("phase")
-        or "WAITING"
-    ).upper()
+    details = (
+        getattr(
+            changes,
+            "stack_change_details",
+            {},
+        )
+        or {}
+    )
+
+    origin_streets = {
+        str(detail.get("origin_street") or "").upper()
+        for detail in details.values()
+        if isinstance(detail, dict)
+        and detail.get("origin_street")
+    }
+
+    # A replay-reconciled quantitative transition owns the street on which
+    # its physical candidate originated. Coordinator phase may already have
+    # advanced at a board boundary, so phase alone is not authoritative here.
+    if len(origin_streets) == 1:
+        street = next(iter(origin_streets))
+    else:
+        street = str(
+            state.get("phase")
+            or "WAITING"
+        ).upper()
 
     if street == "WAITING":
         return []
@@ -7295,6 +7959,17 @@ def main():
                 replay.index
             ]
 
+            if not replay_board_semantic_barrier_allows_advance(
+                state,
+                next_frame_ts=float(
+                    next_record["ts"]
+                ),
+            ):
+                # Poll asynchronous board transport without allowing worker
+                # wall time to advance recorded perception.
+                time.sleep(0.01)
+                continue
+
             replay_stack_gate = (
                 reconcile_replay_stack_before_capture(
                     state,
@@ -7309,6 +7984,33 @@ def main():
             )
 
             if replay_stack_gate.get("reconciled"):
+                semantic_changes = replay_stack_gate.get(
+                    "semantic_changes"
+                )
+
+                if (
+                    semantic_changes is not None
+                    and getattr(
+                        semantic_changes,
+                        "stack_changed_seats",
+                        None,
+                    )
+                ):
+                    # This is semantic reconciliation only. Do not create a
+                    # synthetic perception frame. Carry the already-validated
+                    # quantitative evidence through the same replay-only
+                    # observer/episode/inference path used at EOF.
+                    state = release_corroborated_bet_amount_results(
+                        state,
+                        semantic_changes,
+                    )
+
+                    ingest_eof_stack_semantics(
+                        semantic_changes,
+                        state,
+                        runtime,
+                    )
+
                 save_state(state)
 
             if not replay_stack_gate.get("advance"):
@@ -7509,9 +8211,28 @@ def main():
         old_street_owing_seats = set()
 
         if event_street != previous_canonical_street:
+            # A physical board boundary may remain visible across several
+            # frames before canonical old-street chronology is complete.
+            #
+            # Preserve the last authoritative owing set owned by that exact
+            # unresolved boundary. A newer valid state-machine status below
+            # refreshes it; a temporarily missing/stale artifact must not
+            # erase ownership merely because this is not the first boundary
+            # frame.
             boundary_status = load_betting_round_status()
 
-            if (
+            old_street_owing_seats = (
+                refresh_boundary_old_street_owing_seats(
+                    state,
+                    previous_street=(
+                        previous_canonical_street
+                    ),
+                    next_street=event_street,
+                    status=boundary_status,
+                )
+            )
+
+            authoritative_boundary_status = bool(
                 str(
                     (boundary_status or {}).get("hand_token")
                     or ""
@@ -7522,13 +8243,7 @@ def main():
                     or ""
                 ).upper()
                 == previous_canonical_street
-            ):
-                old_street_owing_seats = set(
-                    (boundary_status or {}).get(
-                        "players_owing_action"
-                    )
-                    or []
-                )
+            )
 
             existing_boundary = state.get(
                 "pending_boundary_route"
@@ -7557,6 +8272,13 @@ def main():
                 == event_street
             )
 
+            if same_boundary:
+                existing_boundary[
+                    "old_street_owing_seats"
+                ] = sorted(
+                    old_street_owing_seats
+                )
+
             if not same_boundary:
                 state["pending_boundary_route"] = {
                     "hand_token": state.get("hand_token"),
@@ -7565,6 +8287,12 @@ def main():
                     ),
                     "next_street": event_street,
                     "frames": list(boundary_frame_buffer),
+                    # Preserve the latest authoritative old-street action
+                    # ownership across every frame of this unresolved
+                    # physical boundary.
+                    "old_street_owing_seats": sorted(
+                        old_street_owing_seats
+                    ),
                     # Set after this frame's ready quantitative evidence
                     # has been reconciled and emitted.
                     "required_event_cursor": None,
@@ -7916,6 +8644,9 @@ def main():
                 state,
                 changes,
                 event_street,
+                old_street_owing_seats=(
+                    old_street_owing_seats
+                ),
             )
 
         log_observation(changes)
@@ -8483,7 +9214,19 @@ def main():
         before_board_len = state.get("confirmed_board_len", 0)
 
         board_started = time.perf_counter()
-        state = maybe_read_board(state, count, frame)
+        state = maybe_read_board(
+            state,
+            count,
+            frame,
+            replay_frame_ts=(
+                (
+                    replay.first_recorded_ts
+                    + replay.current_recorded_elapsed
+                )
+                if replay is not None
+                else None
+            ),
+        )
         frame_timings["board_coordination"] = round(
             (time.perf_counter() - board_started) * 1000.0,
             3,

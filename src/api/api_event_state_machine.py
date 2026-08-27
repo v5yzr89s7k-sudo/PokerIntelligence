@@ -235,6 +235,11 @@ def default_state():
         "pending_stack_updates": [],
         "unresolved_stack_candidates": {},
         "unresolved_provisional_bets": {},
+        # Durable same-hand commitment identities whose quantitative action
+        # has already been accepted into canonical chronology. Asynchronous
+        # bet-sizing results may arrive later, but they must never recreate
+        # provisional ownership for an already-consumed commitment.
+        "consumed_quantitative_commitments": {},
         "pending_pot_updates": [],
         "pending_high_pot": None,
         "pending_terminal_events": [],
@@ -1166,6 +1171,7 @@ def handle_hero_cards(state, event):
         or []
     )
     state["pending_stack_updates"] = []
+    state["consumed_quantitative_commitments"] = {}
     state["pending_pot_updates"] = []
     state["pending_terminal_events"] = []
 
@@ -1966,6 +1972,22 @@ def handle_board(state, event):
                 still_pending
             )
 
+    # The board is canonical now.
+    #
+    # Reconstruct physical chronology before admitting quantitative actions.
+    # A later actor observed on this street may first prove passive actions by
+    # earlier seats. handle_actor_observed() will itself retry quantitative
+    # evidence whenever that advancement makes it admissible.
+    state = replay_pending_actor_observations(
+        state
+    )
+
+    # Anything not consumed by actor-observation advancement still receives
+    # one ordinary retry after street promotion.
+    state = replay_pending_inferred_actions(
+        state
+    )
+
     return state
 
 
@@ -2433,6 +2455,15 @@ def handle_stack_candidate_closed(state, event):
         state
     )
 
+    # Retrospective boundary evidence may also have been preserved while this
+    # same stack candidate made semantic promotion unsafe. Candidate removal
+    # is the causal point at which that evidence becomes eligible for the
+    # existing boundary resolver again.
+    state = replay_preserved_boundary_evidence(
+        state,
+        street=street,
+    )
+
     return state
 
 
@@ -2450,6 +2481,23 @@ def handle_provisional_bet_opened(state, event):
         and current_token
         and event_token != current_token
     ):
+        return state
+
+    key = f"{street}:{seat}"
+
+    consumed = (
+        state.get("consumed_quantitative_commitments")
+        or {}
+    )
+
+    if key in consumed:
+        print(
+            "[PROVISIONAL_BET_STATE] "
+            f"ignored_late_open seat={seat} "
+            f"street={street} "
+            "reason=quantitative_commitment_already_consumed",
+            flush=True,
+        )
         return state
 
     blockers = dict(
@@ -2574,6 +2622,52 @@ def handle_actor_observed(
         return state
 
     if event_street != current_street:
+        # Physical chronology may already have entered the immediately next
+        # street while canonical chronology is still completing the prior
+        # street behind a confirmed pending board.
+        #
+        # Observing a later actor on that next street is durable chronology
+        # evidence: once the board is promoted it may safely resolve passive
+        # predecessors through the ordinary actor_observed path.
+        next_street = {
+            "PREFLOP": "FLOP",
+            "FLOP": "TURN",
+            "TURN": "RIVER",
+        }.get(current_street)
+
+        matching_pending_board = any(
+            transition_for_board_len(
+                len(item.get("board") or [])
+            )
+            == event_street
+            for item in (
+                state.get("pending_board_events")
+                or []
+            )
+            if isinstance(item, dict)
+        )
+
+        if (
+            preserve_if_blocked
+            and event_street == next_street
+            and matching_pending_board
+        ):
+            state = preserve_pending_actor_observation(
+                state,
+                event,
+            )
+
+            print(
+                "[ACTOR_OBSERVED_FUTURE_PRESERVED] "
+                f"street={event_street} "
+                f"current={current_street} "
+                f"actor={seat} "
+                "reason=confirmed_pending_board",
+                flush=True,
+            )
+
+            return state
+
         print(
             "[ACTOR_OBSERVED_SKIP] "
             f"seat={seat} "
@@ -3242,6 +3336,52 @@ def handle_inferred_action(state, event):
         action_street
         and action_street != canonical_street
     ):
+        # A confirmed next-street board may be physically visible while
+        # canonical chronology is still resolving the previous street.
+        #
+        # Quantitative evidence explicitly owned by that immediately-next
+        # street is future evidence, not stale evidence. Preserve it until
+        # the pending board becomes canonical rather than submitting it to
+        # the current-street tracker, where it would be rejected.
+        next_street = {
+            "PREFLOP": "FLOP",
+            "FLOP": "TURN",
+            "TURN": "RIVER",
+        }.get(canonical_street)
+
+        matching_pending_board = any(
+            transition_for_board_len(
+                len(item.get("board") or [])
+            )
+            == action_street
+            for item in (
+                state.get("pending_board_events")
+                or []
+            )
+            if isinstance(item, dict)
+        )
+
+        if (
+            action_street == next_street
+            and matching_pending_board
+        ):
+            state = preserve_pending_inferred_action(
+                state,
+                event,
+            )
+
+            print(
+                "[CANONICAL_DEFER_FUTURE_STREET] "
+                f"street={action_street} "
+                f"current={canonical_street} "
+                f"seat={seat} "
+                f"action={event.get('action')} "
+                "reason=confirmed_pending_board",
+                flush=True,
+            )
+
+            return state
+
         evidence_key = (
             f"{str(state.get('hand_token') or '')}:"
             f"{action_street}"
@@ -3305,8 +3445,16 @@ def handle_inferred_action(state, event):
         )
     }
 
+    # StreetCommitmentTracker owns authoritative outstanding poker
+    # chronology. canonical.players_to_act is a materialized hand field and
+    # may temporarily lag after boundary/historical reconciliation.
+    #
+    # Quantitative admission must therefore derive predecessor ownership from
+    # the tracker rather than from the potentially stale materialized queue.
     queue = list(
-        canonical.players_to_act
+        tracker.commitment_tracker.players_owing_action(
+            action_street
+        )
         or []
     )
 
@@ -3433,6 +3581,29 @@ def handle_inferred_action(state, event):
         f"canonical_action {added.street} "
         f"{added.seat} {added.action}",
     )
+
+    # Canonical quantitative ingestion is the irreversible semantic boundary
+    # for this physical commitment. Preserve that ownership fact so a slower
+    # asynchronous bet-sizing result cannot later recreate a provisional
+    # blocker for the same hand/street/seat.
+    consumed_key = (
+        f"{str(added.street or '').upper()}:"
+        f"{str(added.seat or '')}"
+    )
+
+    consumed = dict(
+        state.get("consumed_quantitative_commitments")
+        or {}
+    )
+
+    consumed[consumed_key] = {
+        "seat": str(added.seat or ""),
+        "street": str(added.street or "").upper(),
+        "action": str(added.action or ""),
+        "ts": event.get("ts"),
+    }
+
+    state["consumed_quantitative_commitments"] = consumed
 
     # A validated stack candidate remains a chronology blocker until the
     # corresponding quantitative inferred_action is actually canonical.
@@ -3856,6 +4027,93 @@ def preserve_boundary_evidence(state, result):
     )
 
     return state
+
+
+def replay_preserved_boundary_evidence(
+    state,
+    *,
+    street,
+):
+    """
+    Reconsider durable old-street boundary evidence after a commitment
+    blocker disappears.
+
+    The original boundary handler intentionally preserves objective evidence
+    when unresolved quantitative ownership prevents semantic promotion.
+    Once that blocker is gone, this helper re-enters the same existing
+    boundary semantic path rather than inventing a parallel action rule.
+    """
+    hand_token = str(
+        state.get("hand_token")
+        or ""
+    )
+
+    street = str(
+        street
+        or ""
+    ).upper()
+
+    if (
+        not hand_token
+        or street not in (
+            "PREFLOP",
+            "FLOP",
+            "TURN",
+        )
+    ):
+        return state
+
+    store = (
+        state.get("preserved_boundary_evidence")
+        or {}
+    )
+
+    key = f"{hand_token}:{street}"
+
+    bucket = store.get(key)
+
+    if not isinstance(bucket, dict):
+        return state
+
+    observations_by_seat = dict(
+        bucket.get("observations_by_seat")
+        or {}
+    )
+
+    if not observations_by_seat:
+        return state
+
+    result = {
+        "type": "boundary_stack_result",
+        "request_id": (
+            bucket.get("request_id")
+            or f"preserved-{street.lower()}"
+        ),
+        "hand_token": hand_token,
+        "street": street,
+        "ts": (
+            bucket.get("last_result_ts")
+            or time.time()
+        ),
+        "observations": [
+            dict(item)
+            for item in observations_by_seat.values()
+            if isinstance(item, dict)
+        ],
+    }
+
+    print(
+        "[BOUNDARY_EVIDENCE_REPLAY] "
+        f"street={street} "
+        f"seats={list(observations_by_seat)}",
+        flush=True,
+    )
+
+    return handle_boundary_stack_result(
+        state,
+        result,
+        reconsider_observed_after_candidate_release=True,
+    )
 
 
 def preserve_old_street_inferred_action(
@@ -4318,6 +4576,7 @@ def resolve_silent_boundary_obligations(
     tracker,
     street,
     observed_seats=None,
+    reconsider_observed_after_candidate_release=False,
 ):
     """
     Conservatively complete silent old-street obligations at a physically
@@ -4379,10 +4638,19 @@ def resolve_silent_boundary_obligations(
 
         seat = owing[0]
 
-        # An explicit boundary observation existed for this seat but did not
-        # resolve it. Never replace ambiguous quantitative evidence with a
-        # passive guess.
-        if seat in observed_seats:
+        # An explicit boundary observation that failed to classify an action
+        # remains authoritative ambiguity during the ordinary boundary pass.
+        #
+        # A deliberate post-candidate-removal replay is different: if the
+        # quantitative candidate that caused the ambiguity has definitively
+        # disappeared, and no qualified quantitative action remains preserved,
+        # the observation must not become a permanent veto. The normal betting
+        # state below can then determine whether the only remaining passive
+        # action is CHECK or FOLD.
+        if (
+            seat in observed_seats
+            and not reconsider_observed_after_candidate_release
+        ):
             print(
                 "[BOUNDARY_PASSIVE_BLOCK] "
                 f"street={street} "
@@ -4488,7 +4756,12 @@ def resolve_silent_boundary_obligations(
     return state, resolved
 
 
-def handle_boundary_stack_result(state, result):
+def handle_boundary_stack_result(
+    state,
+    result,
+    *,
+    reconsider_observed_after_candidate_release=False,
+):
     """
     Consume one asynchronous retrospective stack result.
 
@@ -4751,6 +5024,9 @@ def handle_boundary_stack_result(state, result):
             tracker=tracker,
             street=old_street,
             observed_seats=unresolved_observation_seats,
+            reconsider_observed_after_candidate_release=(
+                reconsider_observed_after_candidate_release
+            ),
         )
     )
 
@@ -4799,7 +5075,25 @@ def handle_boundary_stack_result(state, result):
                 flush=True,
             )
 
+        # Persist boundary chronology before replay. handle_inferred_action()
+        # reloads CanonicalHand, so the newly consumed passive predecessor
+        # must already be durable before a deferred quantitative successor
+        # is retried.
         canonical_save(canonical)
+
+        # Boundary promotion can expose an already-qualified quantitative
+        # action as the new head of poker order. Re-enter that event through
+        # the normal inferred-action path immediately; do not wait for an
+        # unrelated later event to trigger replay.
+        state = replay_pending_inferred_actions(
+            state
+        )
+
+        # Quantitative replay may have consumed another action, removed its
+        # awaiting-action stack candidate, or advanced the betting round.
+        # Reload before evaluating old-street completion below.
+        canonical = canonical_load()
+        tracker = tracker_for_hand(canonical)
 
     old_status = (
         tracker.commitment_tracker.round_status(

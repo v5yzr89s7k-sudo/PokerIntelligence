@@ -84,7 +84,12 @@ def main():
             return_value={
                 "hand_token": HAND,
                 "street": "FLOP",
+                "complete": False,
+                "betting_open": True,
                 "players_owing_action": [
+                    "seat_lower_left",
+                ],
+                "canonical_players_to_act": [
                     "seat_lower_left",
                 ],
                 "processed_event_cursor": 12,
@@ -100,7 +105,21 @@ def main():
         assert payload["seats"] == [
             "seat_lower_left"
         ]
-        assert state["pending_boundary_route"] is None
+        assert state["pending_boundary_route"] is not None
+        assert set(
+            state["pending_boundary_route"].get(
+                "old_street_owing_seats"
+            )
+            or []
+        ) == {
+            "seat_lower_left",
+        }
+        assert (
+            state["pending_boundary_route"].get(
+                "required_event_cursor"
+            )
+            is None
+        )
 
         written = [
             json.loads(raw)
@@ -133,7 +152,10 @@ def main():
             return_value={
                 "hand_token": HAND,
                 "street": "FLOP",
+                "complete": True,
+                "betting_open": False,
                 "players_owing_action": [],
+                "canonical_players_to_act": [],
                 "processed_event_cursor": 12,
             },
         ):
@@ -148,10 +170,10 @@ def main():
         assert not request_path.exists()
 
     print(
-        "PASS boundary event-cursor ACK: stale status cannot "
-        "freeze ownership; acknowledged status routes only "
-        "the authoritative reconciled owing set; empty owing "
-        "sets retire the pending boundary cleanly"
+        "PASS boundary event-cursor ACK: stale status waits; "
+        "acknowledged open rounds route and retain authoritative "
+        "owing ownership; authoritative completed empty rounds "
+        "retire the pending boundary cleanly"
     )
 
 

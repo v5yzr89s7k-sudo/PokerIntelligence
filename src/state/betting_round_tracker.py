@@ -846,13 +846,26 @@ class BettingRoundTracker:
         }
 
         if canonical_action not in forced_actions:
-            queue = list(self.hand.players_to_act or [])
+            # StreetCommitmentTracker is the durable authority for outstanding
+            # betting obligations. CanonicalHand.players_to_act is a
+            # materialized traversal field and may temporarily lag after
+            # boundary or historical reconciliation.
+            #
+            # Quantitative evidence may therefore be admitted only against the
+            # durable obligation queue. It must never use a stale materialized
+            # predecessor as evidence that the predecessor acted.
+            authoritative_queue = list(
+                self.commitment_tracker.players_owing_action(
+                    action_street
+                )
+                or []
+            )
 
-            if seat in queue:
-                actor_index = queue.index(seat)
+            if seat in authoritative_queue:
+                actor_index = authoritative_queue.index(seat)
 
                 if actor_index > 0:
-                    skipped_seats = queue[:actor_index]
+                    skipped_seats = authoritative_queue[:actor_index]
 
                     self._record_decision(
                         episode_id,
@@ -886,9 +899,17 @@ class BettingRoundTracker:
 
                     return None
 
-            # The actor is now chronologically admissible. Consume exactly
-            # that actor and no unresolved predecessor.
-            self._consume_action_queue(seat)
+            # Quantitative evidence owns only this actor. Remove exactly this
+            # seat from the materialized canonical queue if it is still
+            # present; never consume stale predecessors.
+            self.hand.players_to_act = [
+                pending_seat
+                for pending_seat in (
+                    self.hand.players_to_act
+                    or []
+                )
+                if pending_seat != seat
+            ]
 
         # Mandatory blinds are seeded during hand initialization.
         # Never duplicate them from later visual inference.
