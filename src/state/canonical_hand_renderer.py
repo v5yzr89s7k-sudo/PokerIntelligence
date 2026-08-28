@@ -147,7 +147,46 @@ def _append_street_pot(
     lines.append(f"{label}: {value}")
 
 
-def render_canonical_hand(hand: CanonicalHand) -> str:
+def format_provisional_action(
+    hand: CanonicalHand,
+    item,
+) -> str:
+    seat = str(item.get("seat") or "")
+    kind = str(item.get("action") or "").upper()
+
+    player = hand.players.get(seat)
+
+    if player is None:
+        label = seat
+    else:
+        position = (
+            player.position
+            if player.position != "unknown"
+            else player.seat
+        )
+
+        if (
+            player.name
+            and player.name
+            not in {
+                player.seat,
+                position,
+            }
+        ):
+            label = f"{position} ({player.name})"
+        else:
+            label = position
+
+    if kind == "BET":
+        return f"{label} bets"
+
+    return f"{label} {kind.lower().replace('_', ' ')}"
+
+
+def render_canonical_hand(
+    hand: CanonicalHand,
+    provisional_actions=None,
+) -> str:
     lines = [
         "CURRENT HAND",
         "=" * 72,
@@ -200,6 +239,47 @@ def render_canonical_hand(hand: CanonicalHand) -> str:
         street: []
         for street in ("PREFLOP", "FLOP", "TURN", "RIVER")
     }
+
+    provisional_by_street = {
+        street: []
+        for street in ("PREFLOP", "FLOP", "TURN", "RIVER")
+    }
+
+    for item in list(provisional_actions or []):
+        if not isinstance(item, dict):
+            continue
+
+        street = str(
+            item.get("street") or ""
+        ).upper()
+
+        seat = str(
+            item.get("seat") or ""
+        )
+
+        action = str(
+            item.get("action") or ""
+        ).upper()
+
+        if (
+            street not in provisional_by_street
+            or not seat
+            or action != "BET"
+        ):
+            continue
+
+        # Once canonical owns an action for this seat/street,
+        # the provisional presentation must disappear.
+        if any(
+            existing.street == street
+            and existing.seat == seat
+            for existing in hand.actions
+        ):
+            continue
+
+        provisional_by_street[
+            street
+        ].append(dict(item))
 
     for action in hand.actions:
         if action.street in actions_by_street:
@@ -261,7 +341,18 @@ def render_canonical_hand(hand: CanonicalHand) -> str:
 
         flop = actions_by_street["FLOP"]
         lines.extend(format_action(item) for item in flop)
-        if not flop:
+
+        provisional_flop = provisional_by_street["FLOP"]
+
+        lines.extend(
+            format_provisional_action(
+                hand,
+                item,
+            )
+            for item in provisional_flop
+        )
+
+        if not flop and not provisional_flop:
             lines.append("")
 
         _append_street_pot(
@@ -287,7 +378,18 @@ def render_canonical_hand(hand: CanonicalHand) -> str:
 
         turn = actions_by_street["TURN"]
         lines.extend(format_action(item) for item in turn)
-        if not turn:
+
+        provisional_turn = provisional_by_street["TURN"]
+
+        lines.extend(
+            format_provisional_action(
+                hand,
+                item,
+            )
+            for item in provisional_turn
+        )
+
+        if not turn and not provisional_turn:
             lines.append("")
 
         _append_street_pot(
@@ -313,7 +415,18 @@ def render_canonical_hand(hand: CanonicalHand) -> str:
 
         river = actions_by_street["RIVER"]
         lines.extend(format_action(item) for item in river)
-        if not river:
+
+        provisional_river = provisional_by_street["RIVER"]
+
+        lines.extend(
+            format_provisional_action(
+                hand,
+                item,
+            )
+            for item in provisional_river
+        )
+
+        if not river and not provisional_river:
             lines.append("")
 
         _append_street_pot(

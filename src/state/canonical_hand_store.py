@@ -58,6 +58,21 @@ class CanonicalHandStore:
         data = json.loads(self.json_path.read_text())
         return CanonicalHand.from_dict(data)
 
+    def save_live_presentation(
+        self,
+        hand: CanonicalHand,
+        provisional_actions=None,
+    ):
+        rendered = render_canonical_hand(
+            hand,
+            provisional_actions=provisional_actions,
+        )
+
+        self._atomic_write(
+            self.text_path,
+            rendered,
+        )
+
     def save(self, hand: CanonicalHand):
         json_text = json.dumps(
             hand.to_dict(),

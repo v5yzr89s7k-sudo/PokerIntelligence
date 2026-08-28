@@ -1306,6 +1306,7 @@ def emit_fast_actor_observations(
             "seat": seat,
             "street": current_street,
             "source": "bet_region_appeared",
+            "commitment_visible": True,
             "blocked_seats": chronology_blockers,
             "ts": time.time(),
         })

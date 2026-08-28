@@ -20,6 +20,35 @@ def main():
                 json_path=Path(tmp) / "canonical.json",
                 text_path=Path(tmp) / "current_hand.txt",
             )
+
+            presentation_writes = []
+
+            original_save_live_presentation = (
+                sm.CANONICAL_STORE.save_live_presentation
+            )
+
+            def capture_live_presentation(
+                hand,
+                provisional_actions=None,
+            ):
+                result = original_save_live_presentation(
+                    hand,
+                    provisional_actions=provisional_actions,
+                )
+
+                presentation_writes.append(
+                    (
+                        Path(tmp)
+                        / "current_hand.txt"
+                    ).read_text()
+                )
+
+                return result
+
+            sm.CANONICAL_STORE.save_live_presentation = (
+                capture_live_presentation
+            )
+
             sm._ACTIVE_TRACKER = None
             sm._ACTIVE_HAND_ID = None
 
@@ -99,6 +128,7 @@ def main():
                 "seat": "villain",
                 "street": "RIVER",
                 "source": "bet_region_appeared",
+                "commitment_visible": True,
                 "blocked_seats": [],
                 "ts": 10.5,
             }
@@ -201,6 +231,45 @@ def main():
             )
 
             canonical = sm.canonical_load()
+
+            print(
+                "presentation writes after release:",
+                len(presentation_writes),
+            )
+
+            for index, rendered in enumerate(
+                presentation_writes,
+                1,
+            ):
+                river_lines = [
+                    line.strip()
+                    for line in rendered.splitlines()
+                    if (
+                        "Hero" in line
+                        or "Villain" in line
+                    )
+                    and (
+                        "check" in line.lower()
+                        or "bet" in line.lower()
+                    )
+                ]
+
+                print(
+                    f"presentation {index}:",
+                    river_lines,
+                )
+
+            assert any(
+                "SB (Hero) checks" in rendered
+                and "BB (Villain) bets" in rendered
+                and "BB (Villain) bets 6.75 BB"
+                not in rendered
+                for rendered in presentation_writes
+            ), (
+                "RED: future-street physical commitment was "
+                "quantitatively settled before its unsized BET "
+                "could reach current_hand.txt"
+            )
 
             river_actions = [
                 (

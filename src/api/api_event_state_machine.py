@@ -169,6 +169,270 @@ def canonical_save(hand):
     CANONICAL_STORE.save(hand)
 
 
+def refresh_live_presentation(state):
+    if not state.get("canonical_snapshot_ready"):
+        return state
+
+    canonical = canonical_load()
+
+    presentation = {}
+
+    # ------------------------------------------------------------
+    # Earliest physical commitment presentation
+    # ------------------------------------------------------------
+    #
+    # These entries exist only for current_hand.txt latency.
+    # They carry no quantitative or betting-accounting authority.
+    live_commitments = dict(
+        state.get("pending_live_commitments")
+        or {}
+    )
+
+    for key, item in list(
+        live_commitments.items()
+    ):
+        if not isinstance(item, dict):
+            live_commitments.pop(
+                key,
+                None,
+            )
+            continue
+
+        street = str(
+            item.get("street") or ""
+        ).upper()
+
+        seat = str(
+            item.get("seat") or ""
+        )
+
+        if (
+            street not in {"FLOP", "TURN", "RIVER"}
+            or not seat
+        ):
+            live_commitments.pop(
+                key,
+                None,
+            )
+            continue
+
+        # Canonical settlement owns presentation immediately.
+        # Remove stale physical-only overlay ownership.
+        canonical_owner_exists = any(
+            action.street == street
+            and action.seat == seat
+            for action in canonical.actions
+        )
+
+        if canonical_owner_exists:
+            live_commitments.pop(
+                key,
+                None,
+            )
+            continue
+
+        presentation[
+            f"{street}:{seat}"
+        ] = {
+            "seat": seat,
+            "street": street,
+            "action": "BET",
+            "ts": item.get("ts"),
+        }
+
+    state[
+        "pending_live_commitments"
+    ] = live_commitments
+
+    # ------------------------------------------------------------
+    # Existing Stage-1 quantitative provisional lifecycle
+    # ------------------------------------------------------------
+    for item in (
+        state.get("unresolved_provisional_bets")
+        or {}
+    ).values():
+        if not isinstance(item, dict):
+            continue
+
+        street = str(
+            item.get("street") or ""
+        ).upper()
+
+        seat = str(
+            item.get("seat") or ""
+        )
+
+        if (
+            street not in {"FLOP", "TURN", "RIVER"}
+            or not seat
+        ):
+            continue
+
+        # Stage 1/2 expose only an unsized opening BET.
+        # Once canonical aggression already exists, CALL versus
+        # RAISE semantics may be unresolved and must not be guessed.
+        existing_aggression = any(
+            action.street == street
+            and action.action.upper()
+            in {"BET", "RAISE", "BET_OR_RAISE"}
+            for action in canonical.actions
+        )
+
+        if existing_aggression:
+            continue
+
+        # Canonical action for this exact seat/street always wins.
+        if any(
+            action.street == street
+            and action.seat == seat
+            for action in canonical.actions
+        ):
+            continue
+
+        presentation.setdefault(
+            f"{street}:{seat}",
+            {
+                "seat": seat,
+                "street": street,
+                "action": "BET",
+                "ts": item.get("ts"),
+            },
+        )
+
+    provisional = list(
+        presentation.values()
+    )
+
+    provisional.sort(
+        key=lambda item: float(
+            item.get("ts") or 0.0
+        )
+    )
+
+    CANONICAL_STORE.save_live_presentation(
+        canonical,
+        provisional_actions=provisional,
+    )
+
+    return state
+
+
+def record_physical_live_commitment(
+    state,
+    event,
+):
+    """
+    Record presentation-only opening-bet evidence from the fastest
+    trustworthy physical signal.
+
+    This must never mutate CanonicalHand, pot accounting, stack accounting,
+    betting price, response queues, or quantitative commitment ownership.
+    """
+    if not event.get("commitment_visible"):
+        return state
+
+    if (
+        str(event.get("source") or "")
+        != "bet_region_appeared"
+    ):
+        return state
+
+    if not state.get("canonical_snapshot_ready"):
+        return state
+
+    street = str(
+        event.get("street")
+        or state.get("phase")
+        or ""
+    ).upper()
+
+    seat = str(
+        event.get("seat")
+        or ""
+    )
+
+    if (
+        street not in {"FLOP", "TURN", "RIVER"}
+        or not seat
+    ):
+        return state
+
+    canonical = canonical_load()
+
+    if (
+        str(canonical.current_street or "").upper()
+        != street
+    ):
+        return state
+
+    if seat not in canonical.players:
+        return state
+
+    # The actor-observed chronology transaction has already run.
+    # The commitment seat must now be the legitimate head actor.
+    queue = list(
+        canonical.players_to_act
+        or []
+    )
+
+    if not queue or queue[0] != seat:
+        return state
+
+    # Only an unopened postflop street is semantically safe to
+    # display as BET without sizing. Facing existing aggression,
+    # commitment could still resolve as CALL or RAISE.
+    existing_aggression = any(
+        action.street == street
+        and action.action.upper()
+        in {"BET", "RAISE", "BET_OR_RAISE"}
+        for action in canonical.actions
+    )
+
+    if existing_aggression:
+        return state
+
+    # Canonical ownership always supersedes presentation ownership.
+    if any(
+        action.street == street
+        and action.seat == seat
+        for action in canonical.actions
+    ):
+        return state
+
+    pending = dict(
+        state.get("pending_live_commitments")
+        or {}
+    )
+
+    key = f"{street}:{seat}"
+
+    pending[key] = {
+        "seat": seat,
+        "street": street,
+        "action": "BET",
+        "source": "bet_region_appeared",
+        "ts": event.get("ts")
+        or time.time(),
+    }
+
+    state[
+        "pending_live_commitments"
+    ] = pending
+
+    print(
+        "[LIVE_COMMITMENT_PRESENTED] "
+        f"street={street} "
+        f"seat={seat} "
+        "action=BET "
+        "source=bet_region_appeared",
+        flush=True,
+    )
+
+    return refresh_live_presentation(
+        state
+    )
+
+
 def read_cursor():
     if CURSOR.exists():
         return int(CURSOR.read_text().strip() or "0")
@@ -2530,6 +2794,10 @@ def handle_provisional_bet_opened(state, event):
         flush=True,
     )
 
+    state = refresh_live_presentation(
+        state
+    )
+
     return state
 
 
@@ -2580,6 +2848,10 @@ def handle_provisional_bet_closed(state, event):
     )
 
     state = replay_pending_inferred_actions(
+        state
+    )
+
+    state = refresh_live_presentation(
         state
     )
 
@@ -2821,8 +3093,17 @@ def handle_actor_observed(
             state
         )
 
+        # Chronology is authoritative now. Give the fastest trustworthy
+        # physical presentation one TXT write before quantitative settlement
+        # can overtake it.
+        state = record_physical_live_commitment(
+            state,
+            event,
+        )
+
         # Chronology advancement may make an already-qualified quantitative
-        # action admissible. Retry the normal inference queue immediately.
+        # action admissible. Retry it only after the physical presentation
+        # has had a chance to reach current_hand.txt.
         pending = list(
             state.get("pending_inferred_actions")
             or []
@@ -2848,6 +3129,13 @@ def handle_actor_observed(
                     state,
                     pending_event,
                 )
+
+        return state
+
+    state = record_physical_live_commitment(
+        state,
+        event,
+    )
 
     return state
 
