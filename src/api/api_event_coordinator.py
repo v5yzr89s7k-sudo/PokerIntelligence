@@ -4921,15 +4921,90 @@ def maybe_route_acknowledged_boundary(state):
 
         return state, None
 
-    state, payload = maybe_queue_boundary_stack_request(
-        state,
-        previous_street=previous_street,
-        next_street=next_street,
-        frames=list(
-            pending.get("frames") or []
-        ),
-        status=status,
-    )
+    if bool(
+        status.get(
+            "boundary_can_skip_stack_ocr"
+        )
+    ):
+        if pending.get(
+            "passive_result_emitted"
+        ):
+            # The zero-OCR result already entered the authoritative
+            # event stream. Preserve physical boundary ownership until
+            # the state machine consumes it and publishes a newer
+            # acknowledged status.
+            return state, None
+
+        request_id = (
+            "passive-"
+            + str(uuid.uuid4())[:8]
+        )
+
+        payload = {
+            "type": "boundary_stack_result",
+            "request_id": request_id,
+            "hand_token": hand_token,
+            "street": previous_street,
+            "next_street": next_street,
+            "observations": [],
+            "ts": time.time(),
+        }
+
+        # Unlike real boundary workers, this result has no asynchronous
+        # transport owner. The router therefore owns publication.
+        emit(payload)
+
+        pending[
+            "passive_result_emitted"
+        ] = True
+
+        pending[
+            "passive_result_request_id"
+        ] = request_id
+
+        pending[
+            "last_acknowledged_event_cursor"
+        ] = acknowledged_cursor
+
+        # The emitted result itself must now be acknowledged before this
+        # physical boundary can make another routing decision.
+        pending[
+            "required_event_cursor"
+        ] = event_log_next_cursor()
+
+        state[
+            "pending_boundary_route"
+        ] = pending
+
+        print(
+            "[BOUNDARY_STACK_OCR_SKIP] "
+            f"request={request_id[:16]} "
+            f"street={previous_street} "
+            f"next={next_street} "
+            "reason=authoritative_clean_postflop_boundary "
+            "emitted=yes",
+            flush=True,
+        )
+
+        state[
+            "last_boundary_request_key"
+        ] = (
+            f"{hand_token}:"
+            f"{previous_street}:"
+            f"{next_street}:"
+            "passive"
+        )
+
+    else:
+        state, payload = maybe_queue_boundary_stack_request(
+            state,
+            previous_street=previous_street,
+            next_street=next_street,
+            frames=list(
+                pending.get("frames") or []
+            ),
+            status=status,
+        )
 
     # Cursor acknowledgement establishes that the state machine has consumed
     # coordinator events through this boundary. It does NOT by itself mean

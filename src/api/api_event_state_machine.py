@@ -117,6 +117,107 @@ def write_betting_round_status(
     status["canonical_players_to_act"] = list(
         canonical.players_to_act or []
     )
+
+    current_street = str(
+        canonical.current_street
+        or ""
+    ).upper()
+
+    unresolved_candidates = {
+        str(item.get("seat") or "")
+        for item in (
+            (state or {}).get(
+                "unresolved_stack_candidates"
+            )
+            or {}
+        ).values()
+        if (
+            isinstance(item, dict)
+            and str(
+                item.get("street")
+                or ""
+            ).upper()
+            == current_street
+            and item.get("seat")
+        )
+    }
+
+    provisional_bets = {
+        str(item.get("seat") or "")
+        for item in (
+            (state or {}).get(
+                "unresolved_provisional_bets"
+            )
+            or {}
+        ).values()
+        if (
+            isinstance(item, dict)
+            and str(
+                item.get("street")
+                or ""
+            ).upper()
+            == current_street
+            and item.get("seat")
+        )
+    }
+
+    # Reuse the exact ownership helper already used by board
+    # promotion rather than inventing a second interpretation
+    # of physical commitment state.
+    ownership = (
+        unresolved_board_ownership(
+            state,
+            street=current_street,
+        )
+    )
+
+    commitment_candidates = set(
+        ownership.get(
+            "commitment_candidates"
+        )
+        or []
+    )
+
+    status[
+        "boundary_can_skip_stack_ocr"
+    ] = (
+        boundary_can_resolve_passively_without_stack_ocr(
+            street=current_street,
+            betting_open=bool(
+                status.get("betting_open")
+            ),
+            current_price=status.get(
+                "current_price"
+            ),
+            last_aggressor=status.get(
+                "last_aggressor"
+            ),
+            unresolved_candidates=(
+                unresolved_candidates
+            ),
+            provisional_bets=(
+                provisional_bets
+            ),
+            commitment_candidates=(
+                commitment_candidates
+            ),
+        )
+    )
+
+    status[
+        "boundary_skip_stack_ocr_context"
+    ] = {
+        "street": current_street,
+        "unresolved_candidates": sorted(
+            unresolved_candidates
+        ),
+        "provisional_bets": sorted(
+            provisional_bets
+        ),
+        "commitment_candidates": sorted(
+            commitment_candidates
+        ),
+    }
     status["processed_episode_count"] = len(
         tracker.processed_episode_ids
     )
@@ -4865,6 +4966,72 @@ def clear_preserved_boundary_evidence(
         )
 
     return state
+
+
+def boundary_can_resolve_passively_without_stack_ocr(
+    *,
+    street,
+    betting_open,
+    current_price,
+    last_aggressor,
+    unresolved_candidates,
+    provisional_bets,
+    commitment_candidates,
+):
+    """
+    True only when a confirmed next-street boundary closes an
+    genuinely unopened postflop street with no surviving quantitative
+    or physical commitment ownership.
+
+    This predicate does not itself resolve actions or advance streets.
+    """
+    street = str(
+        street
+        or ""
+    ).upper()
+
+    if street not in {
+        "FLOP",
+        "TURN",
+    }:
+        return False
+
+    if betting_open:
+        return False
+
+    try:
+        price = float(
+            current_price
+            or 0.0
+        )
+    except (TypeError, ValueError):
+        return False
+
+    if abs(price) > 1e-9:
+        return False
+
+    if last_aggressor:
+        return False
+
+    if set(
+        unresolved_candidates
+        or []
+    ):
+        return False
+
+    if set(
+        provisional_bets
+        or []
+    ):
+        return False
+
+    if set(
+        commitment_candidates
+        or []
+    ):
+        return False
+
+    return True
 
 
 def boundary_observation_must_block_passive_resolution(
