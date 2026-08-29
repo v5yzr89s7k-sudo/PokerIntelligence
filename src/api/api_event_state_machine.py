@@ -2161,6 +2161,16 @@ def handle_board(state, event):
             flush=True,
         )
 
+        # The asynchronous boundary worker may have completed before
+        # this board became pending. Re-enter any matching preserved
+        # old-street result now; otherwise both artifacts can wait on
+        # each other indefinitely.
+        state = (
+            replay_pending_boundary_results_for_current_street(
+                state
+            )
+        )
+
         return state
 
     next_phase = transition_for_board_len(n)
@@ -4857,6 +4867,54 @@ def clear_preserved_boundary_evidence(
     return state
 
 
+def boundary_observation_must_block_passive_resolution(
+    *,
+    seat,
+    observed_seats,
+    unresolved_candidates,
+    preserved_actions,
+    reconsider_observed_after_candidate_release=False,
+):
+    """
+    Decide whether an explicit boundary observation still owns enough
+    semantic authority to veto passive old-street resolution.
+
+    An observation by itself is not commitment ownership. It remains a
+    blocker only while surviving quantitative or qualified action
+    evidence still exists for that seat.
+
+    Deliberate candidate-release replay may reconsider the observation
+    after the quantitative blocker is gone.
+    """
+    observed_seats = set(
+        observed_seats
+        or []
+    )
+
+    unresolved_candidates = set(
+        unresolved_candidates
+        or []
+    )
+
+    preserved_actions = (
+        preserved_actions
+        or {}
+    )
+
+    if seat not in observed_seats:
+        return False
+
+    if (
+        reconsider_observed_after_candidate_release
+    ):
+        return False
+
+    return (
+        seat in unresolved_candidates
+        or seat in preserved_actions
+    )
+
+
 def resolve_silent_boundary_obligations(
     state,
     *,
@@ -4935,15 +4993,21 @@ def resolve_silent_boundary_obligations(
         # the observation must not become a permanent veto. The normal betting
         # state below can then determine whether the only remaining passive
         # action is CHECK or FOLD.
-        if (
-            seat in observed_seats
-            and not reconsider_observed_after_candidate_release
+        if boundary_observation_must_block_passive_resolution(
+            seat=seat,
+            observed_seats=observed_seats,
+            unresolved_candidates=unresolved_candidates,
+            preserved_actions=preserved_actions,
+            reconsider_observed_after_candidate_release=(
+                reconsider_observed_after_candidate_release
+            ),
         ):
             print(
                 "[BOUNDARY_PASSIVE_BLOCK] "
                 f"street={street} "
                 f"seat={seat} "
-                "reason=explicit_boundary_observation_unresolved",
+                "reason=explicit_boundary_observation_with_"
+                "surviving_commitment_ownership",
                 flush=True,
             )
             break
@@ -5042,6 +5106,104 @@ def resolve_silent_boundary_obligations(
         )
 
     return state, resolved
+
+
+def replay_pending_boundary_results_for_current_street(
+    state,
+):
+    """
+    Replay asynchronous boundary results that arrived before their
+    matching confirmed next-street board became pending.
+
+    The old street must still be canonical. This closes the ordering
+    race:
+
+        boundary result -> deferred
+        next-street board -> pending
+        deferred boundary result -> old-street reconciliation
+
+    Results for other streets remain preserved.
+    """
+    pending = list(
+        state.get("pending_boundary_results")
+        or []
+    )
+
+    if not pending:
+        return state
+
+    current_street = str(
+        state.get("phase")
+        or ""
+    ).upper()
+
+    expected_next = {
+        "PREFLOP": "FLOP",
+        "FLOP": "TURN",
+        "TURN": "RIVER",
+    }.get(current_street)
+
+    if not expected_next:
+        return state
+
+    matching_pending_board = any(
+        transition_for_board_len(
+            len(item.get("board") or [])
+        )
+        == expected_next
+        for item in (
+            state.get("pending_board_events")
+            or []
+        )
+        if isinstance(item, dict)
+    )
+
+    if not matching_pending_board:
+        return state
+
+    ready = []
+    remaining = []
+
+    for item in pending:
+        item_street = str(
+            item.get("street")
+            or ""
+        ).upper()
+
+        if item_street == current_street:
+            ready.append(item)
+        else:
+            remaining.append(item)
+
+    if not ready:
+        return state
+
+    ready.sort(
+        key=lambda item: float(
+            item.get("ts")
+            or 0.0
+        )
+    )
+
+    state["pending_boundary_results"] = (
+        remaining
+    )
+
+    print(
+        "[BOUNDARY_RESULT_CURRENT_REPLAY] "
+        f"street={current_street} "
+        f"next={expected_next} "
+        f"count={len(ready)}",
+        flush=True,
+    )
+
+    for item in ready:
+        state = handle_boundary_stack_result(
+            state,
+            item,
+        )
+
+    return state
 
 
 def handle_boundary_stack_result(

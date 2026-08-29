@@ -918,13 +918,15 @@ def stack_candidate_must_remain_open_for_authoritative_owing(
         or []
     )
 
-    if not (
-        {
-            "stack_motion",
-            "bet_region_appeared",
-        }
-        & sources
-    ):
+    # Authoritative canonical owing may extend the lifetime of
+    # independently corroborated physical commitment evidence, but it
+    # must not turn raw stack motion into an immortal candidate.
+    #
+    # Motion-only candidates still receive the ordinary bounded
+    # quantitative settlement/retry window. After trusted unchanged
+    # stack reads, canonical "owing" is not independent evidence that
+    # chips actually moved.
+    if "bet_region_appeared" not in sources:
         return False
 
     next_street = str(
@@ -2151,6 +2153,24 @@ def enrich_stack_change_measurements(
         or {}
     )
 
+    # Deterministic bottom-strip/nameplate animation is useful
+    # physical activity evidence, but it is not quantitative
+    # evidence that the numeric stack changed.
+    #
+    # Keep stack_changed_seats untouched for legacy observation
+    # semantics. Only exclude independently classified UI-only
+    # activity from the expensive quantitative/OCR lane.
+    ui_activity_seats = set(
+        getattr(changes, "ui_activity_seats", [])
+        or []
+    )
+
+    quantitative_motion_seats = [
+        seat
+        for seat in raw_changed_seats
+        if seat not in ui_activity_seats
+    ]
+
     # A confirmed bet-region appearance is independent evidence that this
     # seat may have committed chips. Schedule the same settled quantitative
     # stack read even when the stack pixel-motion detector missed the change.
@@ -2163,7 +2183,7 @@ def enrich_stack_change_measurements(
     )
 
     candidate_seats = list(dict.fromkeys(
-        raw_changed_seats + bet_evidence_seats
+        quantitative_motion_seats + bet_evidence_seats
     ))
 
     pending = state.setdefault(
@@ -2333,7 +2353,7 @@ def enrich_stack_change_measurements(
         # owns candidate matching and canonical promotion.
         if (
             is_new_candidate
-            and seat in raw_changed_seats
+            and seat in quantitative_motion_seats
             and canonical_values.get(seat) is None
             and prechange_image is not None
         ):
@@ -2403,7 +2423,7 @@ def enrich_stack_change_measurements(
 
         sources = set(entry.get("trigger_sources") or [])
 
-        if seat in raw_changed_seats:
+        if seat in quantitative_motion_seats:
             sources.add("stack_motion")
 
         fresh_commitment_evidence = bool(
@@ -3376,6 +3396,7 @@ def enrich_stack_change_measurements(
                 entry[
                     "unchanged_stack_reads"
                 ] = unchanged_stack_reads
+
             else:
                 attempts += 1
                 entry["validation_attempts"] = attempts
@@ -8402,13 +8423,13 @@ def main():
         emit_fast_actor_observations(
             state,
             changes,
-            street=current_stack_street,
+            street=event_street,
         )
 
         emit_physical_actor_completions(
             changes,
             state,
-            street=current_stack_street,
+            street=event_street,
         )
         frame_timings["fast_actor"] = round(
             (time.perf_counter() - actor_started) * 1000.0,
@@ -9246,8 +9267,6 @@ def main():
                 3,
             )
 
-            frame_timings["board_sync_sleep"] = 500.0
-
             _append_coordinator_timing({
                 "ts": time.time(),
                 "frame": iteration_frame,
@@ -9275,7 +9294,6 @@ def main():
                 ),
             })
 
-            time.sleep(0.5)
             continue
 
         # Non-blocking temporal Hero-turn sensor.

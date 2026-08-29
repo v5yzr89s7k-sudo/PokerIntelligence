@@ -57,6 +57,7 @@ class ChangeSet:
     hero_nameplate_blinking: bool = False
     stack_changed_seats: list = field(default_factory=list)
     stack_change_details: dict = field(default_factory=dict)
+    ui_activity_seats: list = field(default_factory=list)
     bet_region_occupancy: dict = field(default_factory=dict)
     occupied_bet_regions: list = field(default_factory=list)
     bet_region_transitions: dict = field(default_factory=dict)
@@ -84,6 +85,7 @@ class ChangeSet:
             self.action_buttons_visible,
             self.hero_nameplate_blinking,
             bool(self.stack_changed_seats),
+            bool(self.ui_activity_seats),
             bool(self.bet_region_appeared),
             bool(self.bet_region_cleared),
             self.hero_cards_appeared,
@@ -107,6 +109,7 @@ class ChangeSet:
             "hero_nameplate_blinking": self.hero_nameplate_blinking,
             "stack_changed_seats": list(self.stack_changed_seats),
             "stack_change_details": self.stack_change_details,
+            "ui_activity_seats": list(self.ui_activity_seats),
             "bet_region_occupancy": self.bet_region_occupancy,
             "occupied_bet_regions": list(self.occupied_bet_regions),
             "bet_region_transitions": self.bet_region_transitions,
@@ -144,6 +147,9 @@ class ChangeSet:
             parts.append("hero_nameplate_blinking")
         if self.stack_changed_seats:
             parts.append("stack_changed=" + ",".join(self.stack_changed_seats))
+
+        if self.ui_activity_seats:
+            parts.append("ui_activity=" + ",".join(self.ui_activity_seats))
 
         if getattr(
             self,
@@ -348,6 +354,73 @@ class LocalEventDetector:
             seat for seat, info in changes.stack_change_details.items()
             if info.get("changed")
         ]
+
+        # Parallel observational channel for deterministic ACR
+        # bottom-strip/nameplate animation.
+        #
+        # Phase 1 only: this does NOT alter stack_changed_seats
+        # and therefore does not alter OCR/candidate behavior.
+        changes.ui_activity_seats = []
+
+        for seat, rect in GEOM["stack_regions"].items():
+
+            x = int(rect["x"])
+            y = int(rect["y"])
+            w = int(rect["width"])
+            h = int(rect["height"])
+
+            previous_crop = self.previous_frame[
+                y:y + h,
+                x:x + w,
+            ]
+
+            current_crop = frame[
+                y:y + h,
+                x:x + w,
+            ]
+
+            if (
+                previous_crop.size == 0
+                or current_crop.size == 0
+                or previous_crop.shape != current_crop.shape
+                or h <= 7
+            ):
+                continue
+
+            previous_gray = cv2.cvtColor(
+                previous_crop,
+                cv2.COLOR_BGR2GRAY,
+            )
+
+            current_gray = cv2.cvtColor(
+                current_crop,
+                cv2.COLOR_BGR2GRAY,
+            )
+
+            difference = cv2.absdiff(
+                previous_gray,
+                current_gray,
+            )
+
+            body_mean = float(
+                np.mean(
+                    difference[:-7, :]
+                )
+            )
+
+            bottom_mean = float(
+                np.mean(
+                    difference[-7:, :]
+                )
+            )
+
+            if (
+                body_mean <= 1.0
+                and bottom_mean >= 20.0
+            ):
+                changes.ui_activity_seats.append(
+                    seat
+                )
 
         changes.opponent_hole_card_changed_seats = (
             opponent_hole_card_changed_seats(
