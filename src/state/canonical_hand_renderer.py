@@ -186,6 +186,9 @@ def format_provisional_action(
     if kind == "CALL_OR_RAISE":
         return f"{label} calls or raises"
 
+    if kind == "COMMITMENT":
+        return f"{label} commits chips"
+
     return f"{label} {kind.lower().replace('_', ' ')}"
 
 
@@ -274,6 +277,7 @@ def render_canonical_hand(
                 "BET",
                 "BET_OR_RAISE",
                 "CALL_OR_RAISE",
+                "COMMITMENT",
             }
         ):
             continue
@@ -345,10 +349,19 @@ def render_canonical_hand(
         opening=False,
     )
 
-    if len(hand.board) >= 3:
+    if (
+        len(hand.board) >= 3
+        or provisional_by_street["FLOP"]
+    ):
+        flop_header = (
+            f"FLOP: {' '.join(hand.board[:3])}"
+            if len(hand.board) >= 3
+            else "FLOP"
+        )
+
         lines.extend([
             "",
-            f"FLOP: {' '.join(hand.board[:3])}",
+            flop_header,
             "-" * 72,
         ])
 
@@ -382,10 +395,19 @@ def render_canonical_hand(
             opening=False,
         )
 
-    if len(hand.board) >= 4:
+    if (
+        len(hand.board) >= 4
+        or provisional_by_street["TURN"]
+    ):
+        turn_header = (
+            f"TURN: {hand.board[3]}"
+            if len(hand.board) >= 4
+            else "TURN"
+        )
+
         lines.extend([
             "",
-            f"TURN: {hand.board[3]}",
+            turn_header,
             "-" * 72,
         ])
 
@@ -419,10 +441,19 @@ def render_canonical_hand(
             opening=False,
         )
 
-    if len(hand.board) >= 5:
+    if (
+        len(hand.board) >= 5
+        or provisional_by_street["RIVER"]
+    ):
+        river_header = (
+            f"RIVER: {hand.board[4]}"
+            if len(hand.board) >= 5
+            else "RIVER"
+        )
+
         lines.extend([
             "",
-            f"RIVER: {hand.board[4]}",
+            river_header,
             "-" * 72,
         ])
 

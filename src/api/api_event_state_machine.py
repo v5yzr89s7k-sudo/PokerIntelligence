@@ -432,6 +432,88 @@ def refresh_live_presentation(state):
     return state
 
 
+def record_future_street_live_commitment(
+    state,
+    event,
+):
+    """
+    Presentation-only ownership for trustworthy physical commitment
+    evidence from the immediate next street while canonical chronology
+    is still settling the prior street.
+
+    This must not mutate canonical actions, queues, stacks, pots, board,
+    or canonical street.
+    """
+    if not event.get("commitment_visible"):
+        return state
+
+    if (
+        str(event.get("source") or "")
+        != "bet_region_appeared"
+    ):
+        return state
+
+    if not state.get("canonical_snapshot_ready"):
+        return state
+
+    street = str(
+        event.get("street") or ""
+    ).upper()
+
+    seat = str(
+        event.get("seat") or ""
+    )
+
+    if (
+        street
+        not in {
+            "FLOP",
+            "TURN",
+            "RIVER",
+        }
+        or not seat
+    ):
+        return state
+
+    canonical = canonical_load()
+
+    if seat not in canonical.players:
+        return state
+
+    pending = dict(
+        state.get("pending_live_commitments")
+        or {}
+    )
+
+    key = f"{street}:{seat}"
+
+    pending[key] = {
+        "seat": seat,
+        "street": street,
+        "action": "COMMITMENT",
+        "source": "bet_region_appeared",
+        "ts": event.get("ts")
+        or time.time(),
+    }
+
+    state[
+        "pending_live_commitments"
+    ] = pending
+
+    print(
+        "[LIVE_FUTURE_COMMITMENT_PRESENTED] "
+        f"street={street} "
+        f"seat={seat} "
+        "action=COMMITMENT "
+        "source=bet_region_appeared",
+        flush=True,
+    )
+
+    return refresh_live_presentation(
+        state
+    )
+
+
 def record_physical_live_commitment(
     state,
     event,
@@ -3166,12 +3248,33 @@ def handle_actor_observed(
                 event,
             )
 
+            state = record_future_street_live_commitment(
+                state,
+                event,
+            )
+
             print(
                 "[ACTOR_OBSERVED_FUTURE_PRESERVED] "
                 f"street={event_street} "
                 f"current={current_street} "
                 f"actor={seat} "
                 "reason=confirmed_pending_board",
+                flush=True,
+            )
+
+            return state
+
+        if event_street == next_street:
+            state = record_future_street_live_commitment(
+                state,
+                event,
+            )
+
+            print(
+                "[ACTOR_OBSERVED_FUTURE_PRESENTED] "
+                f"street={event_street} "
+                f"current={current_street} "
+                f"actor={seat}",
                 flush=True,
             )
 
