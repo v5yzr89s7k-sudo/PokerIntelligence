@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import os
 import time
 
 
@@ -61,6 +62,14 @@ class PacedReplayCapture:
         # frames immediately. Stateful perception must still observe the
         # original recorded spacing between those frames.
         self.current_recorded_elapsed = 0.0
+
+        # Development/validation mode only. Preserve the original recorded
+        # timestamps as semantic detector time while releasing frames as fast
+        # as the machine can process them.
+        self.fast = (
+            os.environ.get("POKER_REPLAY_FAST", "").strip()
+            in {"1", "true", "TRUE", "yes", "YES"}
+        )
 
     def _load_records(self):
         records = []
@@ -151,7 +160,7 @@ class PacedReplayCapture:
             - actual_elapsed
         )
 
-        if remaining > 0:
+        if remaining > 0 and not self.fast:
             time.sleep(remaining)
 
         self.index += 1

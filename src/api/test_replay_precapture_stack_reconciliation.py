@@ -160,12 +160,12 @@ def main():
 
             # Required replay pre-capture contract:
             #
-            # - current semantic frame is 51
-            # - next replay frame 52 reaches/crosses release boundary
-            # - request-1 physically exists
-            # - reconcile request-1 BEFORE capture(52)
-            # - unchanged validation preserves candidate
-            # - deterministic retry ownership is established
+            # - the next replay frame reaches/crosses the release boundary
+            # - the outstanding request physically exists
+            # - reconcile that request BEFORE capturing the next frame
+            # - trusted unchanged motion-only evidence closes its candidate
+            # - no replacement OCR ownership is manufactured
+            # - unrelated candidates remain untouched
             result = (
                 c.reconcile_replay_stack_before_capture(
                     state,
@@ -192,29 +192,35 @@ def main():
         "was not reconciled before capture"
     )
 
-    entry = state[
-        "pending_stack_reads"
-    ][SEAT]
-
-    new_request_id = entry.get(
-        "stack_worker_request_id"
+    pending_reads = (
+        state.get("pending_stack_reads")
+        or {}
     )
 
-    assert new_request_id, entry
-    assert new_request_id != "request-1", entry
-
-    assert (
-        "request-1"
-        not in state[
-            "pending_stack_worker_requests"
-        ]
+    assert SEAT not in pending_reads, (
+        "trusted unchanged motion-only result "
+        "did not close its semantic candidate"
     )
 
-    assert (
-        new_request_id
-        in state[
-            "pending_stack_worker_requests"
-        ]
+    transport = (
+        state.get("pending_stack_worker_requests")
+        or {}
+    )
+
+    assert "request-1" not in transport, (
+        "reconciled worker result retained stale "
+        "transport ownership"
+    )
+
+    replacement_requests = [
+        request
+        for request in transport.values()
+        if request.get("seat") == SEAT
+    ]
+
+    assert replacement_requests == [], (
+        "pre-capture reconciliation manufactured "
+        "replacement OCR for terminal motion-only evidence"
     )
 
     unrelated_requests = [
@@ -237,21 +243,6 @@ def main():
         "unrelated stack candidate a synthetic scheduling cycle"
     )
 
-    assert (
-        entry.get("retry_not_before_ts")
-        is None
-    ), entry
-
-    assert (
-        Path(
-            state[
-                "pending_stack_worker_requests"
-            ][new_request_id]["frame"]
-        ).name
-        == "0052_full.png"
-    ), state[
-        "pending_stack_worker_requests"
-    ]
 
     print(
         "PASS pre-capture reconciliation contract: "

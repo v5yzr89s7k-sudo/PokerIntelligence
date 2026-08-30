@@ -299,6 +299,46 @@ def _canonical_stack_values():
     return values
 
 
+def _canonical_player_ineligible_for_settled_stack(seat):
+    """
+    Return True only when authoritative CanonicalHand state positively
+    establishes that this seat can no longer own a betting commitment.
+
+    This is deliberately fail-open. Missing, unreadable, incomplete, or
+    not-yet-published canonical state must preserve existing transport
+    behavior rather than suppress legitimate quantitative evidence.
+    """
+    if not seat or not CANONICAL_HAND_JSON.exists():
+        return False
+
+    try:
+        data = json.loads(CANONICAL_HAND_JSON.read_text())
+    except Exception:
+        return False
+
+    players = data.get("players") or {}
+
+    if isinstance(players, list):
+        players = {
+            item.get("seat"): item
+            for item in players
+            if isinstance(item, dict) and item.get("seat")
+        }
+
+    if not isinstance(players, dict):
+        return False
+
+    player = players.get(seat)
+
+    if not isinstance(player, dict):
+        return False
+
+    return bool(
+        player.get("folded") is True
+        or player.get("active") is False
+    )
+
+
 def event_street_for_frame(state, local_board_count):
     """
     Resolve the street for local perception events on the current frame.
@@ -1416,6 +1456,19 @@ def queue_stack_worker_request(
         )
         return None
 
+    if (
+        str(purpose or "settled") == "settled"
+        and _canonical_player_ineligible_for_settled_stack(seat)
+    ):
+        print(
+            "[STACK_WORKER] skip ineligible settled request "
+            f"seat={seat} "
+            f"street={str(street or 'WAITING').upper()} "
+            "reason=canonical_folded_or_inactive",
+            flush=True,
+        )
+        return None
+
     request_id = uuid.uuid4().hex
 
     request = {
@@ -1818,6 +1871,15 @@ def reconcile_replay_stack_before_capture(
 
         # A validated/terminal result may have closed the candidate.
         if entry.get("stack_worker_request_id"):
+            continue
+
+        # Trusted unchanged quantitative evidence may deliberately
+        # preserve semantic candidate ownership while disarming
+        # expensive polling. Pre-capture replay must not manufacture
+        # another request for that dormant candidate.
+        if entry.get(
+            "trusted_unchanged_polling_disarmed"
+        ):
             continue
 
         retry_frame_path = entry.get(
@@ -2426,9 +2488,21 @@ def enrich_stack_change_measurements(
         if seat in quantitative_motion_seats:
             sources.add("stack_motion")
 
+        # A bet-region appearance is fresh either when this candidate
+        # has never seen that evidence before, or when quantitative
+        # polling was explicitly disarmed by a trusted unchanged read.
+        #
+        # trigger_sources is historical candidate provenance; it cannot
+        # by itself distinguish a later physical edge from the original
+        # edge that opened the candidate.
         fresh_commitment_evidence = bool(
             seat in bet_evidence_seats
-            and "bet_region_appeared" not in sources
+            and (
+                "bet_region_appeared" not in sources
+                or entry.get(
+                    "trusted_unchanged_polling_disarmed"
+                )
+            )
         )
 
         if seat in bet_evidence_seats:
@@ -2478,6 +2552,10 @@ def enrich_stack_change_measurements(
             )
             entry.pop(
                 "retry_frame_ts",
+                None,
+            )
+            entry.pop(
+                "trusted_unchanged_polling_disarmed",
                 None,
             )
 
@@ -2709,6 +2787,11 @@ def enrich_stack_change_measurements(
                 # A request is already running. Never execute OCR or queue
                 # duplicate work while capture continues.
                 if entry.get("stack_worker_request_id"):
+                    continue
+
+                if entry.get(
+                    "trusted_unchanged_polling_disarmed"
+                ):
                     continue
 
                 # Replay/live semantic retry gate.
@@ -3344,39 +3427,121 @@ def enrich_stack_change_measurements(
                 )
             )
 
-            if unchanged_physical_candidate:
-                last_sample_ts = entry.get(
-                    "last_stack_sample_ts"
+            # A trusted unchanged quantitative read is terminal for a
+            # motion-only candidate. Raw stack-region motion is only a weak
+            # hypothesis that the numeric stack changed; once trusted OCR
+            # confirms the canonical value is unchanged, there is no
+            # independent commitment evidence justifying another expensive
+            # settled-stack read.
+            #
+            # Stronger candidates remain on the existing bounded retry path.
+            # In particular, bet-region evidence may precede the displayed
+            # numeric stack update and must retain its opportunity to settle.
+            motion_only_unchanged = bool(
+                validation.reason == "no_stack_change"
+                and trigger_sources == {"stack_motion"}
+                and not has_commitment_evidence
+            )
+
+            if motion_only_unchanged:
+                close_pending_stack_candidate(
+                    state,
+                    pending,
+                    seat,
+                    reason="trusted_unchanged_motion_only",
                 )
 
-                if last_sample_ts is not None:
-                    retry_not_before_ts = (
-                        float(last_sample_ts)
-                        + settle_seconds
+                print(
+                    "[STACK_MOTION_ONLY_CLOSED] "
+                    f"seat={seat} "
+                    f"street={entry.get('origin_street')} "
+                    f"previous={previous:.2f} "
+                    f"current={current:.2f} "
+                    "reason=trusted_unchanged_stack",
+                    flush=True,
+                )
+
+                continue
+
+            if unchanged_physical_candidate:
+                # Candidate lifetime and OCR polling lifetime are
+                # intentionally separate.
+                #
+                # Bet-region-originated candidates may become dormant after
+                # one trusted unchanged read and wait for a genuinely fresh
+                # physical edge to rearm them.
+                #
+                # response_to_aggression is different: it represents an
+                # unresolved action obligation and may not produce another
+                # distinct bet-region edge before the boundary must resolve.
+                # Preserve the existing bounded retry behavior for that case.
+                response_obligation = (
+                    "response_to_aggression"
+                    in trigger_sources
+                )
+
+                if not response_obligation:
+                    entry.pop(
+                        "retry_not_before_ts",
+                        None,
+                    )
+                    entry.pop(
+                        "retry_frame_path",
+                        None,
+                    )
+                    entry.pop(
+                        "retry_frame_ts",
+                        None,
+                    )
+                    entry[
+                        "trusted_unchanged_polling_disarmed"
+                    ] = True
+
+                    print(
+                        "[STACK_POLLING_DISARMED] "
+                        f"seat={seat} "
+                        f"street={entry.get('origin_street')} "
+                        f"sources={sorted(trigger_sources)} "
+                        "reason=trusted_unchanged_stack",
+                        flush=True,
+                    )
+                else:
+                    last_sample_ts = entry.get(
+                        "last_stack_sample_ts"
                     )
 
-                    entry["retry_not_before_ts"] = (
-                        retry_not_before_ts
-                    )
-
-                    if replay_records:
-                        target_record = next(
-                            (
-                                record
-                                for record in replay_records
-                                if float(record["ts"])
-                                >= retry_not_before_ts
-                            ),
-                            None,
+                    if last_sample_ts is not None:
+                        retry_not_before_ts = (
+                            float(last_sample_ts)
+                            + settle_seconds
                         )
 
-                        if target_record is not None:
-                            entry["retry_frame_path"] = str(
-                                target_record["frame_path"]
+                        entry[
+                            "retry_not_before_ts"
+                        ] = retry_not_before_ts
+
+                        if replay_records:
+                            target_record = next(
+                                (
+                                    record
+                                    for record in replay_records
+                                    if float(record["ts"])
+                                    >= retry_not_before_ts
+                                ),
+                                None,
                             )
-                            entry["retry_frame_ts"] = float(
-                                target_record["ts"]
-                            )
+
+                            if target_record is not None:
+                                entry[
+                                    "retry_frame_path"
+                                ] = str(
+                                    target_record["frame_path"]
+                                )
+                                entry[
+                                    "retry_frame_ts"
+                                ] = float(
+                                    target_record["ts"]
+                                )
 
             attempts = int(
                 entry.get("validation_attempts")
@@ -7132,37 +7297,18 @@ def replay_board_semantic_barrier_allows_advance(
     next_frame_ts,
 ):
     """
-    Replay-only ordering barrier for asynchronous board recognition.
+    Preserve asynchronous board transport ownership without allowing
+    board-worker wall time to block recorded perception.
 
-    A board request created from a recorded frame owns canonical street
-    progression. Once replay would advance beyond that owning frame, the
-    worker result must physically exist before another recorded perception
-    frame may enter LocalEventDetector.
+    Canonical board publication remains owned by the outstanding board
+    request and is reconciled through the normal worker-result path.
+    Local perception, however, must continue at recorded pace just as it
+    does during live capture.
 
-    Live capture never calls this helper.
+    next_frame_ts remains part of this replay contract so callers do not
+    need a separate scheduling path.
     """
-    request_id = state.get("board_request_id")
-
-    if not request_id:
-        return True
-
-    request_frame_ts = state.get(
-        "board_request_replay_frame_ts"
-    )
-
-    if request_frame_ts is None:
-        return True
-
-    if (
-        float(next_frame_ts)
-        <= float(request_frame_ts) + 1e-9
-    ):
-        return True
-
-    return (
-        find_board_result(request_id)
-        is not None
-    )
+    return True
 
 
 def replay_outstanding_transport(state):

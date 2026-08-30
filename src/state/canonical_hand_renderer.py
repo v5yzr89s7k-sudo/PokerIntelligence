@@ -180,6 +180,12 @@ def format_provisional_action(
     if kind == "BET":
         return f"{label} bets"
 
+    if kind == "BET_OR_RAISE":
+        return f"{label} bets or raises"
+
+    if kind == "CALL_OR_RAISE":
+        return f"{label} calls or raises"
+
     return f"{label} {kind.lower().replace('_', ' ')}"
 
 
@@ -264,7 +270,11 @@ def render_canonical_hand(
         if (
             street not in provisional_by_street
             or not seat
-            or action != "BET"
+            or action not in {
+                "BET",
+                "BET_OR_RAISE",
+                "CALL_OR_RAISE",
+            }
         ):
             continue
 
@@ -315,7 +325,17 @@ def render_canonical_hand(
             )
         )
 
-    if not preflop:
+    provisional_preflop = provisional_by_street["PREFLOP"]
+
+    lines.extend(
+        format_provisional_action(
+            hand,
+            item,
+        )
+        for item in provisional_preflop
+    )
+
+    if not preflop and not provisional_preflop:
         lines.append("")
 
     _append_street_pot(

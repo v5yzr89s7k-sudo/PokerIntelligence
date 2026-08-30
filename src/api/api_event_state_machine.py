@@ -308,7 +308,7 @@ def refresh_live_presentation(state):
         )
 
         if (
-            street not in {"FLOP", "TURN", "RIVER"}
+            street not in {"PREFLOP", "FLOP", "TURN", "RIVER"}
             or not seat
         ):
             live_commitments.pop(
@@ -322,6 +322,11 @@ def refresh_live_presentation(state):
         canonical_owner_exists = any(
             action.street == street
             and action.seat == seat
+            and action.action.upper()
+            not in {
+                "POST_SMALL_BLIND",
+                "POST_BIG_BLIND",
+            }
             for action in canonical.actions
         )
 
@@ -332,12 +337,21 @@ def refresh_live_presentation(state):
             )
             continue
 
+        presentation_action = str(
+            item.get("action")
+            or (
+                "BET_OR_RAISE"
+                if street == "PREFLOP"
+                else "BET"
+            )
+        ).upper()
+
         presentation[
             f"{street}:{seat}"
         ] = {
             "seat": seat,
             "street": street,
-            "action": "BET",
+            "action": presentation_action,
             "ts": item.get("ts"),
         }
 
@@ -430,15 +444,36 @@ def record_physical_live_commitment(
     betting price, response queues, or quantitative commitment ownership.
     """
     if not event.get("commitment_visible"):
+        print(
+            "[LIVE_COMMITMENT_SKIP] "
+            f"street={event.get('street')} "
+            f"seat={event.get('seat')} "
+            "reason=commitment_not_visible",
+            flush=True,
+        )
         return state
 
     if (
         str(event.get("source") or "")
         != "bet_region_appeared"
     ):
+        print(
+            "[LIVE_COMMITMENT_SKIP] "
+            f"street={event.get('street')} "
+            f"seat={event.get('seat')} "
+            "reason=source_not_commitment_appearance",
+            flush=True,
+        )
         return state
 
     if not state.get("canonical_snapshot_ready"):
+        print(
+            "[LIVE_COMMITMENT_SKIP] "
+            f"street={event.get('street')} "
+            f"seat={event.get('seat')} "
+            "reason=canonical_snapshot_not_ready",
+            flush=True,
+        )
         return state
 
     street = str(
@@ -453,9 +488,16 @@ def record_physical_live_commitment(
     )
 
     if (
-        street not in {"FLOP", "TURN", "RIVER"}
+        street not in {"PREFLOP", "FLOP", "TURN", "RIVER"}
         or not seat
     ):
+        print(
+            "[LIVE_COMMITMENT_SKIP] "
+            f"street={street} "
+            f"seat={seat} "
+            "reason=street_or_seat_not_eligible",
+            flush=True,
+        )
         return state
 
     canonical = canonical_load()
@@ -464,9 +506,24 @@ def record_physical_live_commitment(
         str(canonical.current_street or "").upper()
         != street
     ):
+        print(
+            "[LIVE_COMMITMENT_SKIP] "
+            f"street={street} "
+            f"seat={seat} "
+            f"canonical={canonical.current_street} "
+            "reason=canonical_street_mismatch",
+            flush=True,
+        )
         return state
 
     if seat not in canonical.players:
+        print(
+            "[LIVE_COMMITMENT_SKIP] "
+            f"street={street} "
+            f"seat={seat} "
+            "reason=unknown_seat",
+            flush=True,
+        )
         return state
 
     # The actor-observed chronology transaction has already run.
@@ -477,6 +534,14 @@ def record_physical_live_commitment(
     )
 
     if not queue or queue[0] != seat:
+        print(
+            "[LIVE_COMMITMENT_SKIP] "
+            f"street={street} "
+            f"seat={seat} "
+            f"queue_head={queue[0] if queue else None} "
+            "reason=not_head_actor",
+            flush=True,
+        )
         return state
 
     # Only an unopened postflop street is semantically safe to
@@ -490,12 +555,23 @@ def record_physical_live_commitment(
     )
 
     if existing_aggression:
-        return state
+        presentation_action = "CALL_OR_RAISE"
+    elif street == "PREFLOP":
+        presentation_action = "BET_OR_RAISE"
+    else:
+        presentation_action = "BET"
 
-    # Canonical ownership always supersedes presentation ownership.
+    # Existing voluntary canonical action supersedes presentation
+    # ownership. Forced blind posts do not: a blind may still make a
+    # later voluntary commitment on PREFLOP.
     if any(
         action.street == street
         and action.seat == seat
+        and action.action.upper()
+        not in {
+            "POST_SMALL_BLIND",
+            "POST_BIG_BLIND",
+        }
         for action in canonical.actions
     ):
         return state
@@ -510,7 +586,7 @@ def record_physical_live_commitment(
     pending[key] = {
         "seat": seat,
         "street": street,
-        "action": "BET",
+        "action": presentation_action,
         "source": "bet_region_appeared",
         "ts": event.get("ts")
         or time.time(),
@@ -524,7 +600,7 @@ def record_physical_live_commitment(
         "[LIVE_COMMITMENT_PRESENTED] "
         f"street={street} "
         f"seat={seat} "
-        "action=BET "
+        f"action={presentation_action} "
         "source=bet_region_appeared",
         flush=True,
     )
@@ -2675,6 +2751,42 @@ def replay_pending_actor_observations(state):
     return state
 
 
+def player_can_acquire_commitment_ownership(
+    state,
+    seat,
+    street,
+):
+    """
+    Return True only when this canonical player may still acquire new
+    voluntary commitment ownership.
+
+    Perception may continue to observe visual changes at a physical seat
+    after that player has folded. Those observations remain perception
+    evidence only; they may never become durable poker-action ownership.
+    """
+    if not state.get("canonical_snapshot_ready"):
+        return True
+
+    canonical = canonical_load()
+    player = canonical.players.get(seat)
+
+    if player is None:
+        return False
+
+    if player.folded or not player.active:
+        print(
+            "[COMMITMENT_OWNERSHIP_REJECT] "
+            f"street={street} "
+            f"seat={seat} "
+            f"folded={player.folded} "
+            f"active={player.active}",
+            flush=True,
+        )
+        return False
+
+    return True
+
+
 def handle_stack_candidate_opened(state, event):
     seat = str(event.get("seat") or "")
     street = str(event.get("street") or "").upper()
@@ -2688,6 +2800,13 @@ def handle_stack_candidate_opened(state, event):
         event_token
         and current_token
         and event_token != current_token
+    ):
+        return state
+
+    if not player_can_acquire_commitment_ownership(
+        state,
+        seat,
+        street,
     ):
         return state
 
@@ -2855,6 +2974,13 @@ def handle_provisional_bet_opened(state, event):
         event_token
         and current_token
         and event_token != current_token
+    ):
+        return state
+
+    if not player_can_acquire_commitment_ownership(
+        state,
+        seat,
+        street,
     ):
         return state
 
