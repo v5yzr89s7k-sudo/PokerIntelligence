@@ -166,6 +166,11 @@ def fresh_state():
         "hero_read": False,
         "confirmed_board_len": 0,
         "confirmed_board": [],
+        # A longer board read may expose an earlier API card error.
+        # Never rewrite confirmed board from one contradictory read.
+        # Two identical independently requested longer reads are
+        # required before repairing the shorter confirmed prefix.
+        "board_prefix_contradiction": None,
         "stable_board_count": 0,
         "stable_seen": 0,
         "last_api_attempt_ts": 0,
@@ -5707,14 +5712,94 @@ def apply_board_result(state, result):
         observed_prefix = board_to_emit[:prefix_len]
 
         if observed_prefix != expected_prefix:
-            print(
-                "[BOARD] prefix mutation rejected "
-                f"confirmed={expected_prefix} "
-                f"observed={observed_prefix} "
-                f"expected_len={expected_len}",
-                flush=True,
+            contradiction = (
+                state.get(
+                    "board_prefix_contradiction"
+                )
+                or {}
             )
-            return state, False
+
+            contradiction_board = list(
+                contradiction.get("board")
+                or []
+            )
+
+            contradiction_expected_len = (
+                contradiction.get(
+                    "expected_len"
+                )
+            )
+
+            contradiction_confirmed_len = (
+                contradiction.get(
+                    "confirmed_len"
+                )
+            )
+
+            # Repair is deliberately narrow:
+            #
+            # - canonical board already has a shorter prefix
+            # - this result is exactly the next street
+            # - a prior independently requested result returned
+            #   the exact same longer board
+            #
+            # One contradictory API response can never rewrite
+            # confirmed board ownership.
+            repeated_longer_contradiction = (
+                expected_len
+                == confirmed + 1
+                and contradiction_expected_len
+                == expected_len
+                and contradiction_confirmed_len
+                == confirmed
+                and contradiction_board
+                == list(board_to_emit)
+            )
+
+            if repeated_longer_contradiction:
+                print(
+                    "[BOARD_PREFIX_REPAIRED] "
+                    f"confirmed={expected_prefix} "
+                    f"repaired={observed_prefix} "
+                    f"board={board_to_emit} "
+                    f"expected_len={expected_len}",
+                    flush=True,
+                )
+
+                state[
+                    "board_prefix_contradiction"
+                ] = None
+
+            else:
+                state[
+                    "board_prefix_contradiction"
+                ] = {
+                    "board": list(
+                        board_to_emit
+                    ),
+                    "expected_len":
+                        expected_len,
+                    "confirmed_len":
+                        confirmed,
+                }
+
+                print(
+                    "[BOARD] prefix mutation rejected "
+                    f"confirmed={expected_prefix} "
+                    f"observed={observed_prefix} "
+                    f"expected_len={expected_len} "
+                    "contradiction_saved=True",
+                    flush=True,
+                )
+
+                return state, False
+
+        else:
+            # A valid prefix disproves any outstanding contradiction
+            # against this confirmed board.
+            state[
+                "board_prefix_contradiction"
+            ] = None
 
     state["confirmed_board"] = list(board_to_emit)
     state["confirmed_board_len"] = expected_len
