@@ -9223,15 +9223,25 @@ def main():
 
         observer_persist_started = time.perf_counter()
 
+        # Preserve all observer semantics in memory.
         timeline.add_many(observations)
-        timeline.write_json(TIMELINE_JSON)
         correlator.ingest(observations)
-        CORRELATOR_JSON.write_text(
-            json.dumps(
-                correlator.summary(),
-                indent=2,
+
+        # These JSON files are diagnostic artifacts, not inputs to the
+        # live action pipeline. Rewriting the entire growing timeline on
+        # every frame creates progressively worse real-time latency.
+        if os.environ.get(
+            "POKER_PERSIST_OBSERVER_DIAGNOSTICS"
+        ) == "1":
+            timeline.write_json(
+                TIMELINE_JSON
             )
-        )
+            CORRELATOR_JSON.write_text(
+                json.dumps(
+                    correlator.summary(),
+                    indent=2,
+                )
+            )
 
         frame_timings["observer_persist"] = round(
             (
