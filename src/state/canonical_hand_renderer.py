@@ -282,11 +282,21 @@ def render_canonical_hand(
         ):
             continue
 
-        # Once canonical owns an action for this seat/street,
+        # Once canonical owns a voluntary action for this seat/street,
         # the provisional presentation must disappear.
+        #
+        # Forced blind posts do not own the player's voluntary action slot.
+        # In particular, SB/BB must still be able to publish an immediate
+        # physical CALL_OR_RAISE/BET_OR_RAISE before quantitative settlement.
         if any(
             existing.street == street
             and existing.seat == seat
+            and existing.action.upper()
+            not in {
+                "POST_SMALL_BLIND",
+                "POST_BIG_BLIND",
+                "POST_ANTE",
+            }
             for existing in hand.actions
         ):
             continue
