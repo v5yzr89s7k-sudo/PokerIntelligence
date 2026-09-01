@@ -14,7 +14,7 @@ final class LatestFrameStreamer: NSObject, SCStreamOutput {
     private let bytesPerPixel = 4
 
     private var lastSent = CFAbsoluteTimeGetCurrent()
-    private let minimumSendInterval = 1.0 / 30.0
+    private let minimumSendInterval = 1.0 / 60.0
 
     override init() {
         super.init()

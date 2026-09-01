@@ -8077,11 +8077,25 @@ def main():
     previous_blink_visible = False
 
     sequence_recorder = runtime.sequence_recorder
-    sequence_dir = sequence_recorder.start_session()
-    print(
-        f"[DEBUG_SEQUENCE] recording to {sequence_dir}",
-        flush=True,
+    record_action_sequence = (
+        os.environ.get(
+            "POKER_RECORD_ACTION_SEQUENCE"
+        )
+        == "1"
     )
+
+    if record_action_sequence:
+        sequence_dir = sequence_recorder.start_session()
+        print(
+            f"[DEBUG_SEQUENCE] recording to {sequence_dir}",
+            flush=True,
+        )
+    else:
+        print(
+            "[DEBUG_SEQUENCE] disabled for live speed "
+            "(set POKER_RECORD_ACTION_SEQUENCE=1 to enable)",
+            flush=True,
+        )
 
     observer = runtime.observer
     timeline = runtime.timeline
@@ -9146,12 +9160,24 @@ def main():
                 else ""
             )
 
-        sequence_recorder.record(
-            frame=img,
-            changes=changes,
-            state=state,
-            source_frame=frame,
-            tournament_level=level,
+        sequence_record_started = time.perf_counter()
+
+        if record_action_sequence:
+            sequence_recorder.record(
+                frame=img,
+                changes=changes,
+                state=state,
+                source_frame=frame,
+                tournament_level=level,
+            )
+
+        frame_timings["sequence_recorder"] = round(
+            (
+                time.perf_counter()
+                - sequence_record_started
+            )
+            * 1000.0,
+            3,
         )
 
         print(
@@ -9195,6 +9221,8 @@ def main():
                     None,
                 )
 
+        observer_persist_started = time.perf_counter()
+
         timeline.add_many(observations)
         timeline.write_json(TIMELINE_JSON)
         correlator.ingest(observations)
@@ -9203,6 +9231,15 @@ def main():
                 correlator.summary(),
                 indent=2,
             )
+        )
+
+        frame_timings["observer_persist"] = round(
+            (
+                time.perf_counter()
+                - observer_persist_started
+            )
+            * 1000.0,
+            3,
         )
 
         if state.get("phase") != "WAITING":
@@ -9715,18 +9752,25 @@ def main():
             "stages_ms": frame_timings,
         })
 
-        # Poll worker result files aggressively only while requests are pending.
-        # This removes avoidable coordinator delay without increasing API calls.
-        if state.get("hero_request_id") is not None:
-            time.sleep(0.02)
-        elif state.get("board_request_id") is not None:
-            time.sleep(0.02)
-        elif state.get("phase") == "WAITING":
-            time.sleep(0.5)
-        elif state.get("hero_decision_active"):
-            time.sleep(0.05)
-        else:
-            time.sleep(0.10)
+        # ScreenCaptureKit is already a blocking, frame-paced source.
+        #
+        # In live SCK mode, immediately return to source.read() after
+        # processing this frame. The socket blocks naturally until the next
+        # sampled frame arrives, so an additional coordinator sleep only adds
+        # avoidable action-detection latency.
+        #
+        # Preserve the historical polling cadence for replay/legacy capture.
+        if not use_sck_capture:
+            if state.get("hero_request_id") is not None:
+                time.sleep(0.02)
+            elif state.get("board_request_id") is not None:
+                time.sleep(0.02)
+            elif state.get("phase") == "WAITING":
+                time.sleep(0.5)
+            elif state.get("hero_decision_active"):
+                time.sleep(0.05)
+            else:
+                time.sleep(0.10)
 
 
 if __name__ == "__main__":
