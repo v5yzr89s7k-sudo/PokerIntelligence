@@ -2423,7 +2423,13 @@ def enrich_stack_change_measurements(
             and seat in quantitative_motion_seats
             and canonical_values.get(seat) is None
             and prechange_image is not None
+            and not queue_stack_ocr
         ):
+            # Legacy synchronous regression mode only.
+            #
+            # Production uses queue_stack_ocr=True and must never perform
+            # ~400ms stack OCR inside the coordinator frame loop. Starting
+            # stack recovery is owned by the asynchronous stack-worker path.
             baseline = prechange_stack_observation(
                 prechange_image,
                 seat,
