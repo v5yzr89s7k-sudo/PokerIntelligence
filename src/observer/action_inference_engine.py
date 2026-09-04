@@ -231,14 +231,17 @@ class ActionInferenceEngine:
         confidence = min(episode_confidence, 0.45)
         reason = "insufficient evidence"
 
+        # infer_episode() normalizes dict and ActionEpisode inputs into
+        # `item` at entry. Never return to the raw input here: ActionEpisode
+        # is a dataclass and intentionally does not implement dict.get().
         maturity_reason = str(
-            episode.get("maturity_reason")
+            item.get("maturity_reason")
             or ""
         )
 
         quantitative_stack_commitment = bool(
             STACK_CHANGED in kinds
-            and episode.get("evidence_mature")
+            and item.get("evidence_mature")
             and maturity_reason
             == "quantitative_stack_commitment"
         )

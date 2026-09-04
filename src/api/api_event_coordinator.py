@@ -1235,6 +1235,44 @@ def emit_fast_actor_observations(
     deferred_bet_blockers = []
     pending_bet_blockers = []
 
+    # Same-frame stack motion is only the instantaneous edge. A physical
+    # commitment candidate may remain unresolved across later frames while
+    # asynchronous quantitative stack evidence settles.
+    #
+    # If that candidate was independently opened/corroborated by a bet-region
+    # appearance on this same street, chronology must continue treating the
+    # seat as unresolved until close_pending_stack_candidate() retires it.
+    #
+    # Do not promote motion-only candidates into durable blockers: raw stack
+    # motion is deliberately weaker evidence and may be ordinary visual noise.
+    durable_stack_candidate_blockers = []
+
+    for candidate_seat, candidate in (
+        state.get("pending_stack_reads")
+        or {}
+    ).items():
+        if not isinstance(candidate, dict):
+            continue
+
+        candidate_street = str(
+            candidate.get("origin_street")
+            or ""
+        ).upper()
+
+        candidate_sources = set(
+            candidate.get("trigger_sources")
+            or []
+        )
+
+        if (
+            candidate_seat
+            and candidate_street == current_street
+            and "bet_region_appeared" in candidate_sources
+        ):
+            durable_stack_candidate_blockers.append(
+                str(candidate_seat)
+            )
+
     current_token = str(
         state.get("hand_token")
         or ""
@@ -1338,6 +1376,7 @@ def emit_fast_actor_observations(
     chronology_blockers = list(
         dict.fromkeys(
             same_frame_blockers
+            + durable_stack_candidate_blockers
             + pending_bet_blockers
             + deferred_bet_blockers
         )
@@ -4391,6 +4430,19 @@ def materialize_worker_frame(
 
 
 def queue_hero_request(state, frame):
+    # A Hero worker request must own a real immutable frame.
+    #
+    # consume_ready_worker_results() intentionally calls maybe_read_hero()
+    # without a capture frame while consuming completed transport. That
+    # control path may process an existing result, but it must never create
+    # a new filesystem-backed Hero request from frame=None.
+    if frame is None:
+        print(
+            "[HERO] deferred request: no capture frame available",
+            flush=True,
+        )
+        return state
+
     request_id = uuid.uuid4().hex
     queued_ts = time.time()
 
@@ -4461,7 +4513,13 @@ def find_hero_result(request_id):
     return None
 
 
-def maybe_read_hero(state, hero_visible, board_count, frame):
+def maybe_read_hero(
+    state,
+    hero_visible,
+    board_count,
+    frame,
+    img=None,
+):
     if state.get("phase") != "WAITING":
         return state
 
@@ -4750,7 +4808,24 @@ def maybe_read_hero(state, hero_visible, board_count, frame):
     if state["hero_visible_seen"] < 2:
         return state
 
-    return queue_hero_request(state, frame)
+    # Legacy/replay capture already owns a filesystem frame.
+    #
+    # Live ScreenCaptureKit intentionally keeps ordinary samples in memory
+    # and therefore supplies frame=None. Only now, when a Hero worker request
+    # actually needs immutable filesystem ownership of this exact sample,
+    # materialize the canonical image once.
+    request_frame = frame
+
+    if request_frame is None and img is not None:
+        request_frame = materialize_worker_frame(
+            img,
+            purpose="hero",
+        )
+
+    return queue_hero_request(
+        state,
+        request_frame,
+    )
 
 
 def append_jsonl(path, payload):
@@ -5595,8 +5670,31 @@ def queue_board_request(
     frame,
     *,
     replay_frame_ts=None,
+    img=None,
 ):
+    # A Board worker request must own a real immutable filesystem frame.
+    #
+    # Live SCK acquisition is in memory, so `frame` is None there. Never
+    # serialize that as the literal path "None". Materialize the current
+    # canonical SCK image only when Board work is actually being queued.
+    #
+    # Replay/legacy callers already provide a durable filesystem path and
+    # continue to use it unchanged.
     request_id = uuid.uuid4().hex
+
+    if frame is None:
+        if img is None:
+            print(
+                "[BOARD] deferred request: no capture frame available",
+                flush=True,
+            )
+            return state
+
+        frame = materialize_worker_frame(
+            img,
+            purpose="board",
+            request_id=request_id,
+        )
 
     queued_ts = time.time()
 
@@ -5842,6 +5940,7 @@ def maybe_read_board(
     frame,
     *,
     replay_frame_ts=None,
+    img=None,
 ):
     if state.get("phase") == "WAITING":
         return state
@@ -5952,6 +6051,7 @@ def maybe_read_board(
         expected_next,
         frame,
         replay_frame_ts=replay_frame_ts,
+        img=img,
     )
 
 
@@ -9586,6 +9686,7 @@ def main():
             hero_visible,
             count,
             frame,
+            img=img,
         )
         frame_timings["hero_read_coordination"] = round(
             (time.perf_counter() - hero_read_started) * 1000.0,
@@ -9607,6 +9708,7 @@ def main():
                 if replay is not None
                 else None
             ),
+            img=img,
         )
         frame_timings["board_coordination"] = round(
             (time.perf_counter() - board_started) * 1000.0,

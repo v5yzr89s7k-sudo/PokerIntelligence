@@ -3649,55 +3649,29 @@ def handle_physical_actor_completed(
         return state
 
     if queue[0] != seat:
-        # A later physical completion is also chronology evidence that all
-        # earlier seats have already completed their actions. Reuse the
-        # existing actor_observed path, which may resolve only safe passive
-        # predecessors and is blocked by unresolved commitment evidence.
-        state = handle_actor_observed(
-            state,
-            {
-                "type": "actor_observed",
-                "hand_token": event_token,
-                "seat": seat,
-                "street": event_street,
-                "source": (
-                    event.get("source")
-                    or "physical_actor_completed"
-                ),
-                "blocked_seats": list(
-                    event.get("blocked_seats")
-                    or []
-                ),
-                "ts": event.get("ts") or time.time(),
-            },
-            preserve_if_blocked=preserve_if_blocked,
-        )
-
-        # actor_observed may have advanced the queue through missed passive
-        # predecessors. Reload the canonical hand before applying the direct
-        # head-only physical completion.
-        canonical = canonical_load()
-        queue = list(
-            canonical.players_to_act
-            or []
-        )
-
-        if not queue or queue[0] != seat:
-            if preserve_if_blocked:
-                state = preserve_physical_actor_completion(
-                    state,
-                    event,
-                )
-
-            print(
-                "[PHYSICAL_ACTOR_PENDING] "
-                f"street={event_street} "
-                f"seat={seat} "
-                f"head={queue[0] if queue else None}",
-                flush=True,
+        # Direct physical completion evidence belongs only to the observed
+        # seat. It must never be promoted into generic skipped-actor
+        # chronology evidence for unresolved predecessors.
+        #
+        # Preserve the later-seat completion until normal chronology makes
+        # that seat the queue head. This keeps the state-machine contract
+        # aligned with BettingRoundTracker.resolve_physically_completed_actor().
+        if preserve_if_blocked:
+            state = preserve_physical_actor_completion(
+                state,
+                event,
             )
 
-            return state
+        print(
+            "[PHYSICAL_ACTOR_PENDING] "
+            f"street={event_street} "
+            f"seat={seat} "
+            f"head={queue[0] if queue else None} "
+            "reason=later_seat_cannot_resolve_predecessors",
+            flush=True,
+        )
+
+        return state
 
     # Do not resolve through unresolved quantitative commitment evidence.
     if physical_completion_stack_blocked(

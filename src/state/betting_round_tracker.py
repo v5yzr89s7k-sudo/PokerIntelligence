@@ -791,9 +791,41 @@ class BettingRoundTracker:
                         "price; resolved as BET"
                     )
 
-                elif target_commitment <= current_price + tolerance:
+                elif (
+                    target_commitment
+                    < current_price - tolerance
+                ):
+                    # A materially short commitment cannot be a raise.
+                    # Preserve the measured incremental amount; this covers
+                    # short/all-in-style calls where the player cannot reach
+                    # the full live price.
                     canonical_action = CALL
                     amount_bb = delta_bb
+                    reason = (
+                        "stack-derived commitment remained materially "
+                        "below the live price; resolved as short CALL"
+                    )
+
+                elif (
+                    abs(target_commitment - current_price)
+                    <= tolerance
+                ):
+                    canonical_action = CALL
+
+                    # Stack delta is quantitative perception evidence.
+                    # Only an approximately exact-price commitment is
+                    # normalized to the established betting price. A
+                    # materially short commitment must preserve its measured
+                    # amount (for example, a short/all-in call).
+                    amount_bb = round(
+                        max(
+                            0.0,
+                            current_price
+                            - prior_live_committed,
+                        ),
+                        4,
+                    )
+
                     reason = (
                         "total street commitment matched the live "
                         "price; resolved as CALL"

@@ -143,11 +143,20 @@ def resolve_boundary_action(
             )
 
         if abs(target_live - current_price) <= tolerance:
+            # The stack delta is perception evidence. Once that evidence
+            # uniquely establishes an exact-price CALL within tolerance,
+            # canonical accounting must use the established betting price,
+            # not retain measurement noise from the stack read.
+            canonical_call_amount = round(
+                max(0.0, current_price - prior_live),
+                4,
+            )
+
             return BoundaryActionResolution(
                 street=street,
                 seat=seat,
                 action="CALL",
-                amount_bb=round(float(delta), 4),
+                amount_bb=canonical_call_amount,
                 resolved=True,
                 reason=(
                     "trusted boundary stack decrease brought live "

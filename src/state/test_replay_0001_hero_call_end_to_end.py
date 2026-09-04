@@ -196,6 +196,37 @@ def main():
     hand = make_hand()
     tracker = BettingRoundTracker(hand)
 
+    # Current chronology contract:
+    #
+    # Hero's quantitative stack/bet evidence proves only Hero's own
+    # commitment. It cannot independently prove that earlier preflop
+    # actors folded.
+    #
+    # Replay 0001's known chronology has UTG, UTG+1, HJ, and CO fold
+    # before Hero opens. Establish that physical chronology explicitly
+    # before admitting Hero's quantitative action.
+    prior_actions = tracker.advance_to_observed_actor(
+        "hero",
+        ts=9.5,
+        blocked_seats=[],
+    )
+
+    assert [
+        (action.seat, action.action)
+        for action in prior_actions
+    ] == [
+        ("seat_upper_left", "FOLD"),
+        ("seat_top", "FOLD"),
+        ("seat_mid_right", "FOLD"),
+        ("seat_lower_right", "FOLD"),
+    ]
+
+    assert hand.players_to_act == [
+        "hero",
+        "seat_lower_left",
+        "seat_mid_left",
+    ]
+
     hero_open = tracker.ingest({
         "episode_id": 100,
         "seat": "hero",
@@ -217,6 +248,28 @@ def main():
     assert hero_open is not None
     assert hero_open.action == "RAISE"
     assert hero_open.raise_to_bb == 3.5
+
+    # Replay 0001 chronology continues:
+    #
+    # After Hero opens, SB folds and BB is then physically observed acting.
+    # BB's quantitative three-bet evidence cannot itself prove the SB fold,
+    # so establish that physical chronology before ingesting the BB action.
+    sb_response = tracker.advance_to_observed_actor(
+        "seat_mid_left",
+        ts=19.5,
+        blocked_seats=[],
+    )
+
+    assert [
+        (action.seat, action.action)
+        for action in sb_response
+    ] == [
+        ("seat_lower_left", "FOLD"),
+    ]
+
+    assert hand.players_to_act == [
+        "seat_mid_left",
+    ]
 
     bb_three_bet = tracker.ingest({
         "episode_id": 101,
