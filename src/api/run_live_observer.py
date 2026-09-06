@@ -18,6 +18,7 @@ CURRENT_HAND = LIVE / "current_hand.txt"
 DEBUG_LOG = LIVE / "observer_debug.log"
 CURRENT_REPLAY_FRAME = LIVE / "current_replay_frame.json"
 HAND_PROGRESSION_ROOT = ROOT / "runtime/debug/hand_progression"
+LIVE_PROGRESSION_ROOT = ROOT / "runtime/debug/live_hand_progression"
 
 SCK_SOURCE = ROOT / "src/capture/sck_sampler.swift"
 SCK_BINARY = ROOT / "runtime/bin/poker_intelligence_sck_sampler"
@@ -466,131 +467,158 @@ def read_current_hand():
 
 def record_hand_progression(content):
     """
-    Replay-debug audit trail.
+    Preserve every distinct current_hand.txt version.
 
-    Every distinct current_hand.txt version is paired with the most recently
-    released replay frame. Normal live observation is intentionally untouched.
+    This runs in the runner/display process, never in the coordinator
+    perception hot path.
+
+    Replay:
+        pair each product version with its replay frame.
+
+    Live:
+        preserve every distinct product version with wall-clock time,
+        current canonical state, event cursor, and coordinator/state-machine
+        snapshots when available.
+
+    The purpose is forensic chronology: if correct live output later changes,
+    we retain the exact sequence instead of only the final overwritten state.
     """
     global hand_progression_sequence
+
+    if not content:
+        return
 
     replay_session = os.environ.get(
         "POKER_REPLAY_SESSION"
     )
 
-    if not replay_session:
-        return
+    if replay_session:
+        root = HAND_PROGRESSION_ROOT
 
-    if not content:
-        return
+        if not CURRENT_REPLAY_FRAME.exists():
+            return
 
-    if not CURRENT_REPLAY_FRAME.exists():
-        return
-
-    try:
-        frame_state = json.loads(
-            CURRENT_REPLAY_FRAME.read_text(
-                encoding="utf-8"
+        try:
+            frame_state = json.loads(
+                CURRENT_REPLAY_FRAME.read_text(
+                    encoding="utf-8"
+                )
             )
-        )
 
-        frame_number = int(
-            frame_state["frame"]
-        )
+            frame_number = int(
+                frame_state["frame"]
+            )
 
-        frame_path = Path(
-            frame_state["frame_path"]
-        )
-
-        if not frame_path.exists():
+            frame_path = Path(
+                frame_state["frame_path"]
+            )
+        except Exception as exc:
             debug(
-                "hand progression frame missing: "
-                f"{frame_path}"
+                "could not read replay progression frame: "
+                f"{exc}"
             )
             return
 
-        session_name = (
-            Path(replay_session).name
-            or "replay"
-        )
+        run_dir = root / "replay"
 
-        out = (
-            HAND_PROGRESSION_ROOT
-            / session_name
-        )
+        metadata = {
+            "mode": "replay",
+            "frame": frame_number,
+            "frame_path": str(frame_path),
+            "ts": time.time(),
+        }
 
-        out.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+    else:
+        root = LIVE_PROGRESSION_ROOT
 
-        hand_progression_sequence += 1
-        sequence = hand_progression_sequence
-
-        stem = (
-            f"{sequence:03d}_"
-            f"frame_{frame_number:04d}"
-        )
-
-        image_destination = (
-            out / f"{stem}.png"
-        )
-
-        text_destination = (
-            out / f"{stem}_current_hand.txt"
-        )
-
-        metadata_destination = (
-            out / f"{stem}_meta.json"
-        )
-
-        shutil.copy2(
-            frame_path,
-            image_destination,
-        )
-
-        text_destination.write_text(
-            content.rstrip() + "\n",
-            encoding="utf-8",
+        # One directory per observer process/run.
+        run_dir = root / (
+            f"run_{os.getpid()}"
         )
 
         metadata = {
-            "sequence": sequence,
-            "frame": frame_number,
-            "source_frame": str(
-                frame_path
-            ),
-            "image": image_destination.name,
-            "current_hand": (
-                text_destination.name
-            ),
-            "captured_at": (
-                datetime.now().isoformat()
-            ),
-            **frame_state,
+            "mode": "live",
+            "ts": time.time(),
         }
 
-        metadata_destination.write_text(
-            json.dumps(
-                metadata,
-                indent=2,
+    run_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    hand_progression_sequence += 1
+
+    sequence = hand_progression_sequence
+
+    prefix = (
+        f"{sequence:05d}_"
+        f"{int(metadata['ts'] * 1000)}"
+    )
+
+    # Product exactly as the user saw it.
+    (
+        run_dir
+        / f"{prefix}_current_hand.txt"
+    ).write_text(
+        content.rstrip() + "\n",
+        encoding="utf-8",
+    )
+
+    # Preserve canonical/state ownership at the same observation point.
+    snapshot_files = (
+        "canonical_hand.json",
+        "api_event_state_machine_state.json",
+        "api_event_coordinator_state.json",
+    )
+
+    for name in snapshot_files:
+        source = LIVE / name
+
+        if not source.exists():
+            continue
+
+        try:
+            (
+                run_dir
+                / f"{prefix}_{name}"
+            ).write_bytes(
+                source.read_bytes()
             )
-            + "\n",
-            encoding="utf-8",
-        )
+        except OSError as exc:
+            debug(
+                f"could not archive progression {name}: "
+                f"{exc}"
+            )
 
-        debug(
-            "[HAND_PROGRESSION] "
-            f"sequence={sequence:03d} "
-            f"frame={frame_number:04d} "
-            f"text={text_destination.name}"
-        )
+    try:
+        metadata["event_count"] = event_count()
+    except Exception:
+        metadata["event_count"] = None
 
-    except Exception as exc:
-        debug(
-            "could not record hand progression: "
-            f"{exc}"
-        )
+    try:
+        metadata["state_cursor"] = cursor_count()
+    except Exception:
+        metadata["state_cursor"] = None
 
+    (
+        run_dir
+        / f"{prefix}_metadata.json"
+    ).write_text(
+        json.dumps(
+            metadata,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    debug(
+        "[HAND_PROGRESSION] "
+        f"mode={metadata['mode']} "
+        f"sequence={sequence} "
+        f"path={run_dir}"
+    )
 
 def render_live_display(force=False):
     global last_displayed_content

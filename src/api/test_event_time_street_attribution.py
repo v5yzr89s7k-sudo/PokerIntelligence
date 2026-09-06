@@ -170,6 +170,12 @@ def main():
     turn_state = {
         "phase": "TURN",
         "pending_stack_reads": {},
+        # This seat's commitment physically began on TURN and remains
+        # unresolved when local RIVER visibility arrives. Old-street
+        # ownership must therefore survive the visual boundary.
+        "bet_region_street_owners": {
+            "seat_lower_left": "TURN",
+        },
     }
 
     river_event_street = (

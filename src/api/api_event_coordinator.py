@@ -224,6 +224,13 @@ def fresh_state():
         "startup_stack_retry_index": 0,
         "startup_stack_last_retry_ts": 0.0,
         "bootstrap_occupancy_diagnosed": False,
+        # SB/BB chip occupancy present at hand bootstrap is a forced post,
+        # not evidence that voluntary action has reached that seat.
+        #
+        # Ownership persists only until that seat's initial bet region clears.
+        # A later fresh appearance is therefore eligible for ordinary fast
+        # actor publication.
+        "forced_blind_bootstrap_pending_clear": [],
         "last_boundary_stack_request_key": None,
         # A physical street boundary may appear before the state machine has
         # consumed quantitative old-street events emitted on the same frame.
@@ -364,6 +371,14 @@ def event_street_for_frame(state, local_board_count):
     except (TypeError, ValueError):
         count = 0
 
+    # WAITING has no active canonical hand ownership.
+    #
+    # A board visible while WAITING belongs to a previous/foreign hand.
+    # It may participate in clean-hand startup gating, but it must never
+    # create provisional FLOP/TURN/RIVER attribution for action chronology.
+    if canonical == "WAITING":
+        return canonical
+
     local_street = {
         3: "FLOP",
         4: "TURN",
@@ -457,6 +472,7 @@ def queue_one_startup_stack_async(
     frame_path,
     *,
     local_board_count=0,
+    img=None,
 ):
     """
     Non-blocking replacement for retry_one_startup_stack().
@@ -508,6 +524,40 @@ def queue_one_startup_stack_async(
 
     seat = unresolved[0]
 
+    # Replay/legacy callers explicitly supply an immutable historical
+    # frame and retain ownership of it. Live SCK must instead reuse the
+    # single immutable frame captured for this hand's starting roster.
+    # A startup baseline is a pre-action fact; later live pixels must
+    # never redefine it seat-by-seat.
+    request_frame = frame_path
+
+    if request_frame is None:
+        request_frame = state.get(
+            "startup_stack_baseline_frame"
+        )
+
+    if request_frame is None:
+        if img is None:
+            print(
+                "[STARTUP_STACK_ASYNC] deferred "
+                f"seat={seat} no_capture_frame",
+                flush=True,
+            )
+            return state
+
+        # Compatibility fallback for callers that have not yet
+        # established hand-start frame ownership. Materialize once,
+        # then make that frame authoritative for all remaining startup
+        # baseline reads in this hand.
+        request_frame = materialize_worker_frame(
+            img,
+            purpose="startup_stack",
+        )
+
+        state["startup_stack_baseline_frame"] = str(
+            request_frame
+        )
+
     request_id = queue_stack_worker_request(
         state,
         seat=seat,
@@ -515,7 +565,7 @@ def queue_one_startup_stack_async(
             "phase",
             "PREFLOP",
         ),
-        frame_path=str(frame_path or ""),
+        frame_path=str(request_frame),
         purpose="baseline",
     )
 
@@ -601,6 +651,21 @@ def consume_startup_stack_worker_results(
                 "ts": result.get("ts")
                 or time.time(),
             }
+
+            # Preserve the canonical ownership contract of the legacy
+            # synchronous startup retry. The worker supplies perception
+            # evidence only; CanonicalHand remains authoritative.
+            emit({
+                "type": "stack_baseline_observation",
+                "hand_token": state.get("hand_token"),
+                "seat": seat,
+                "observed_stack_bb": float(value),
+                "confidence": confidence,
+                "votes": votes,
+                "mode": independent.get("mode"),
+                "origin_street": "PREFLOP",
+                "source": "async_startup_stack",
+            })
 
             retry_seats = [
                 candidate
@@ -1087,6 +1152,46 @@ def commitment_evidence_street(
         or "WAITING"
     ).upper()
 
+    # A fresh independently observed bet-region onset on a physically newer
+    # street is new commitment evidence unless seat-local physical ownership
+    # already ties that evidence to the old street.
+    #
+    # Canonical old-street owing is chronology context, not by itself proof
+    # that a brand-new physical commitment began on the old street.
+    poker_streets = (
+        "PREFLOP",
+        "FLOP",
+        "TURN",
+        "RIVER",
+    )
+
+    fresh_bet_region_appearance = bool(
+        seat in (
+            getattr(
+                changes,
+                "bet_region_appeared",
+                [],
+            )
+            or []
+        )
+    )
+
+    physically_newer_street = bool(
+        canonical in poker_streets
+        and fallback in poker_streets
+        and poker_streets.index(fallback)
+        > poker_streets.index(canonical)
+    )
+
+    if (
+        fresh_bet_region_appearance
+        and physically_newer_street
+        and not candidate_street
+        and not owner_street
+        and not detail_street
+    ):
+        return fallback
+
     if (
         seat in old_street_owing_seats
         and canonical != "WAITING"
@@ -1212,10 +1317,145 @@ def emit_fast_actor_observations(
     if state.get("terminal_action_frozen"):
         return
 
+    # Forced SB/BB bootstrap ownership is part of physical actor
+    # chronology itself. Retire that ownership on the first observed
+    # physical clear BEFORE considering any later appearance from the
+    # same seat as voluntary action evidence.
+    forced_pending_clear = set(
+        state.get(
+            "forced_blind_bootstrap_pending_clear"
+        )
+        or []
+    )
+
+    if (
+        current_street == "PREFLOP"
+        and forced_pending_clear
+    ):
+        cleared_forced = [
+            seat
+            for seat in (
+                getattr(
+                    changes,
+                    "bet_region_cleared",
+                    [],
+                )
+                or []
+            )
+            if seat in forced_pending_clear
+        ]
+
+        if cleared_forced:
+            forced_pending_clear.difference_update(
+                cleared_forced
+            )
+
+            state[
+                "forced_blind_bootstrap_pending_clear"
+            ] = sorted(
+                forced_pending_clear
+            )
+
+            print(
+                "[FORCED_BLIND_BOOTSTRAP_CLEAR] "
+                f"seats={cleared_forced} "
+                f"remaining={sorted(forced_pending_clear)}",
+                flush=True,
+            )
+
     actor_seats = list(dict.fromkeys(
         getattr(changes, "bet_region_appeared", [])
         or []
     ))
+
+    # A forced blind may later produce a genuinely new physical
+    # commitment without this coordinator observing a separate clear
+    # event first. BetRegionStateTracker already owns that lifecycle and
+    # exposes the stronger transition identity:
+    #
+    #     previous_occupied=False
+    #     current_occupied=True
+    #     appeared=True
+    #
+    # Such an edge is a new physical generation, not the bootstrap blind
+    # occupancy. Retire stale forced-blind ownership before actor
+    # suppression so the ordinary fast chronology path may publish it.
+    if (
+        current_street == "PREFLOP"
+        and forced_pending_clear
+        and actor_seats
+    ):
+        transitions = dict(
+            getattr(
+                changes,
+                "bet_region_transitions",
+                {},
+            )
+            or {}
+        )
+
+        fresh_forced_generations = []
+
+        for seat in actor_seats:
+            if seat not in forced_pending_clear:
+                continue
+
+            transition = dict(
+                transitions.get(seat)
+                or {}
+            )
+
+            if (
+                transition.get("appeared") is True
+                and transition.get("previous_occupied") is False
+                and transition.get("current_occupied") is True
+            ):
+                fresh_forced_generations.append(
+                    seat
+                )
+
+        if fresh_forced_generations:
+            forced_pending_clear.difference_update(
+                fresh_forced_generations
+            )
+
+            state[
+                "forced_blind_bootstrap_pending_clear"
+            ] = sorted(
+                forced_pending_clear
+            )
+
+            print(
+                "[FORCED_BLIND_BOOTSTRAP_FRESH_GENERATION] "
+                f"seats={fresh_forced_generations} "
+                f"remaining={sorted(forced_pending_clear)}",
+                flush=True,
+            )
+
+    if (
+        current_street == "PREFLOP"
+        and forced_pending_clear
+    ):
+        suppressed = [
+            seat
+            for seat in actor_seats
+            if seat in forced_pending_clear
+        ]
+
+        if suppressed:
+            print(
+                "[ACTOR_OBSERVED_SUPPRESS] "
+                f"street={current_street} "
+                f"seats={suppressed} "
+                "reason=forced_blind_bootstrap",
+                flush=True,
+            )
+
+        actor_seats = [
+            seat
+            for seat in actor_seats
+            if seat not in forced_pending_clear
+        ]
 
     if not actor_seats:
         return
@@ -4588,6 +4828,16 @@ def maybe_read_hero(
         starting_roster_seats = []
 
         starting_roster_frame = result.get("canonical_frame")
+
+        # Starting-stack baselines must describe the same pre-action
+        # table state used to establish the frozen starting roster.
+        # All asynchronous baseline workers for this hand therefore
+        # share this one immutable canonical frame.
+        state["startup_stack_baseline_frame"] = (
+            str(starting_roster_frame)
+            if starting_roster_frame
+            else None
+        )
         starting_roster_image = (
             cv2.imread(str(starting_roster_frame))
             if starting_roster_frame
@@ -4664,6 +4914,21 @@ def maybe_read_hero(
         starting_roster_seats = bootstrap["starting_roster_seats"]
         dealer = bootstrap["dealer"]
         positions = bootstrap["positions"]
+
+        # HeroBootstrap owns the first authoritative position map for this
+        # hand. The initial SB/BB bet-region occupancy belongs to mandatory
+        # blind posts, not voluntary action chronology.
+        state["forced_blind_bootstrap_pending_clear"] = sorted(
+            seat
+            for seat, position in positions.items()
+            if str(position or "").upper() in {"SB", "BB"}
+        )
+
+        print(
+            "[FORCED_BLIND_BOOTSTRAP] "
+            f"pending_clear={state['forced_blind_bootstrap_pending_clear']}",
+            flush=True,
+        )
 
         print(
             f"[PARTICIPANT_FREEZE_PUBLISH] "
@@ -8862,20 +9127,22 @@ def main():
             3,
         )
 
-        # Complete ambiguous starting stacks proactively, but only AFTER the
-        # chronology fast path above has had the opportunity to publish this
-        # frame's physical action evidence.
+        # Complete ambiguous starting stacks asynchronously, but only AFTER
+        # the chronology fast path above has had the opportunity to publish
+        # this frame's physical action evidence. OCR must never execute on
+        # the live coordinator thread.
         startup_started = time.perf_counter()
-        state = retry_one_startup_stack(
+        state = queue_one_startup_stack_async(
             state,
-            img,
+            frame,
             local_board_count=getattr(
                 changes,
                 "board_count",
                 0,
             ),
+            img=img,
         )
-        frame_timings["startup_stack_retry"] = round(
+        frame_timings["startup_stack_queue"] = round(
             (time.perf_counter() - startup_started) * 1000.0,
             3,
         )
@@ -8992,6 +9259,23 @@ def main():
                 )
                 * 1000.0,
                 3,
+            )
+
+            baseline_stack_worker_results = {
+                seat: item
+                for seat, item
+                in ready_stack_worker_results.items()
+                if (
+                    (item.get("request") or {}).get(
+                        "purpose"
+                    )
+                    == "baseline"
+                )
+            }
+
+            state = consume_startup_stack_worker_results(
+                state,
+                baseline_stack_worker_results,
             )
 
             settled_stack_worker_results = {
@@ -9326,6 +9610,7 @@ def main():
                     cleared_seat,
                     None,
                 )
+
 
         observer_persist_started = time.perf_counter()
 

@@ -266,8 +266,21 @@ def canonical_load():
     return CANONICAL_STORE.load()
 
 
-def canonical_save(hand):
+def canonical_save(hand, state=None):
+    """
+    Persist authoritative CanonicalHand state.
+
+    current_hand.txt is a live presentation product. When the caller
+    supplies state, any still-valid presentation-only commitment
+    ownership must survive this canonical persistence write.
+    """
     CANONICAL_STORE.save(hand)
+
+    if (
+        state is not None
+        and state.get("canonical_snapshot_ready")
+    ):
+        refresh_live_presentation(state)
 
 
 def refresh_live_presentation(state):
@@ -1170,7 +1183,7 @@ def handle_table_snapshot(state, event):
             seed_forced_blinds(state, canonical)
 
         state["canonical_snapshot_ready"] = True
-        canonical_save(canonical)
+        canonical_save(canonical, state=state)
 
         pending_events = []
 
@@ -1528,7 +1541,7 @@ def handle_table_context(state, event):
                 dealt_in_seats=dealt_in_seats,
             )
 
-            canonical_save(canonical)
+            canonical_save(canonical, state=state)
 
             # The persistent betting tracker may have been initialized against
             # the smaller snapshot roster. Force it to rebuild from the
@@ -1822,7 +1835,7 @@ def handle_stack_baseline_observation(state, event):
         )
         return state
 
-    canonical_save(canonical)
+    canonical_save(canonical, state=state)
 
     print(
         "[CANONICAL_STACK_BASELINE] "
@@ -1876,7 +1889,7 @@ def handle_stack_update(state, event):
         print(f"[SKIP] stack_update unknown seat={seat}")
         return state
 
-    canonical_save(canonical)
+    canonical_save(canonical, state=state)
 
     print(
         f"[CANONICAL_STACK] seat={seat} "
@@ -1992,7 +2005,7 @@ def handle_pot_update(state, event):
                 observed
             )
 
-            canonical_save(canonical)
+            canonical_save(canonical, state=state)
 
             state["final_pot_bb"] = round(
                 float(accepted),
@@ -2142,7 +2155,7 @@ def handle_pot_update(state, event):
         state["pending_high_pot"] = None
 
     accepted = canonical.set_observed_pot(observed)
-    canonical_save(canonical)
+    canonical_save(canonical, state=state)
 
     print(
         f"[CANONICAL_POT] accepted={accepted:.2f} "
@@ -2442,7 +2455,7 @@ def handle_board(state, event):
         board,
         ts=event.get("ts") or time.time(),
     )
-    canonical_save(canonical)
+    canonical_save(canonical, state=state)
 
     state = record_timeline(
         state,
@@ -2617,7 +2630,7 @@ def handle_hero_fold(state, event):
             ],
             ts=event.get("ts") or time.time(),
         )
-        canonical_save(canonical)
+        canonical_save(canonical, state=state)
 
         print(
             f"[CANONICAL_ACTION] {added.street} "
@@ -3154,6 +3167,36 @@ def handle_provisional_bet_closed(state, event):
         "unresolved_provisional_bets"
     ] = blockers
 
+    # The low-latency TXT presentation is the presentation-only shadow
+    # of this same physical commitment lifecycle. Once the provisional
+    # owner closes, stale presentation ownership must close with it.
+    #
+    # Canonical action ownership, when present, remains authoritative
+    # and is unaffected by this retirement.
+    live_commitments = dict(
+        state.get("pending_live_commitments")
+        or {}
+    )
+
+    if key:
+        retired = live_commitments.pop(
+            key,
+            None,
+        )
+
+        state[
+            "pending_live_commitments"
+        ] = live_commitments
+
+        if retired is not None:
+            print(
+                "[LIVE_COMMITMENT_RETIRED] "
+                f"seat={seat} "
+                f"street={street} "
+                "reason=provisional_bet_closed",
+                flush=True,
+            )
+
     print(
         "[PROVISIONAL_BET_STATE] "
         f"closed seat={seat} "
@@ -3403,7 +3446,7 @@ def handle_actor_observed(
         return state
 
     if added:
-        canonical_save(canonical)
+        canonical_save(canonical, state=state)
 
         for action in added:
             print(
@@ -3715,7 +3758,8 @@ def handle_physical_actor_completed(
         return state
 
     canonical_save(
-        canonical
+        canonical,
+        state=state,
     )
 
     for action in added:
@@ -4171,7 +4215,7 @@ def handle_inferred_action(state, event):
 
         return state
 
-    canonical_save(canonical)
+    canonical_save(canonical, state=state)
 
     print(
         f"[CANONICAL_ACTION] {added.street} {added.seat} "
@@ -5028,7 +5072,7 @@ def reconcile_preserved_inferred_actions(
             seat,
         )
 
-    canonical_save(canonical)
+    canonical_save(canonical, state=state)
 
     print(
         "[PRESERVED_ACTION_RECONCILED] "
@@ -5899,7 +5943,7 @@ def handle_boundary_stack_result(
         # reloads CanonicalHand, so the newly consumed passive predecessor
         # must already be durable before a deferred quantitative successor
         # is retried.
-        canonical_save(canonical)
+        canonical_save(canonical, state=state)
 
         # Boundary promotion can expose an already-qualified quantitative
         # action as the new head of poker order. Re-enter that event through
