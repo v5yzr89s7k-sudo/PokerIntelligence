@@ -45,35 +45,55 @@ def build_engine():
 def main():
     engine = build_engine()
 
-    # Complete a deterministic preflop round.
-    engine.observe_cards_disappeared("lj")
-    engine.observe_stack_commitment(
-        "btn",
-        2.0,
+    # --------------------------------------------------------
+    # Complete preflop legitimately.
+    # --------------------------------------------------------
+
+    assert (
+        engine.observe_cards_disappeared(
+            "lj"
+        )
+        == "FOLD"
     )
-    engine.observe_stack_commitment(
-        "hero",
-        1.5,
+
+    assert (
+        engine.observe_stack_commitment(
+            "btn",
+            2.0,
+        )
+        == "RAISE"
     )
-    engine.observe_stack_commitment(
-        "bb",
-        1.0,
+
+    assert (
+        engine.observe_stack_commitment(
+            "hero",
+            1.5,
+        )
+        == "CALL"
     )
+
+    assert (
+        engine.observe_stack_commitment(
+            "bb",
+            1.0,
+        )
+        == "CALL"
+    )
+
+    assert engine.next_actor is None
 
     preflop_actions = list(
         engine.semantic_actions()
     )
 
-    assert engine.players["lj"].folded is True
-    assert engine.current_price_bb == 2.0
-
     print("===== END PREFLOP =====")
     print("street =", engine.street)
-    print("price =", engine.current_price_bb)
     print("next_actor =", engine.next_actor)
 
-    # Postflop order is supplied by poker-position/table state,
-    # not inferred by the perception layer.
+    # --------------------------------------------------------
+    # FLOP
+    # --------------------------------------------------------
+
     engine.start_street(
         "FLOP",
         [
@@ -83,12 +103,6 @@ def main():
         ],
     )
 
-    print()
-    print("===== START FLOP =====")
-    print("street =", engine.street)
-    print("price =", engine.current_price_bb)
-    print("next_actor =", engine.next_actor)
-
     assert engine.street == "FLOP"
     assert engine.current_price_bb == 0.0
     assert engine.next_actor == "bb"
@@ -97,10 +111,35 @@ def main():
     for player in engine.players.values():
         assert player.street_commitment_bb == 0.0
 
-    # Historical chronology must remain untouched.
-    assert engine.semantic_actions() == preflop_actions
+    # Starting a new street while FLOP remains open must fail.
+    try:
+        engine.start_street(
+            "TURN",
+            [
+                "bb",
+                "hero",
+                "btn",
+            ],
+        )
+    except ValueError as exc:
+        print(
+            "open-street guard =",
+            str(exc),
+        )
+    else:
+        raise AssertionError(
+            "TURN accepted while FLOP remained open"
+        )
 
-    # Folded players may not re-enter action order.
+    assert engine.street == "FLOP"
+
+    # Close FLOP.
+    assert engine.observe_no_commitment("bb") == "CHECK"
+    assert engine.observe_no_commitment("hero") == "CHECK"
+    assert engine.observe_no_commitment("btn") == "CHECK"
+    assert engine.next_actor is None
+
+    # Folded player may not re-enter TURN.
     try:
         engine.start_street(
             "TURN",
@@ -112,18 +151,20 @@ def main():
             ],
         )
     except ValueError as exc:
-        print()
         print(
             "folded-seat guard =",
             str(exc),
         )
     else:
         raise AssertionError(
-            "folded player incorrectly admitted to TURN"
+            "folded player admitted to TURN"
         )
 
-    # Failed transition must not mutate current street.
     assert engine.street == "FLOP"
+
+    # --------------------------------------------------------
+    # TURN
+    # --------------------------------------------------------
 
     engine.start_street(
         "TURN",
@@ -138,6 +179,15 @@ def main():
     assert engine.current_price_bb == 0.0
     assert engine.next_actor == "bb"
 
+    assert engine.observe_no_commitment("bb") == "CHECK"
+    assert engine.observe_no_commitment("hero") == "CHECK"
+    assert engine.observe_no_commitment("btn") == "CHECK"
+    assert engine.next_actor is None
+
+    # --------------------------------------------------------
+    # RIVER
+    # --------------------------------------------------------
+
     engine.start_street(
         "RIVER",
         [
@@ -151,7 +201,16 @@ def main():
     assert engine.current_price_bb == 0.0
     assert engine.next_actor == "bb"
 
-    # Illegal backward/duplicate street transition.
+    # Historical preflop chronology must remain intact.
+    observed_preflop = [
+        item
+        for item in engine.semantic_actions()
+        if item["street"] == "PREFLOP"
+    ]
+
+    assert observed_preflop == preflop_actions
+
+    # Duplicate/backward RIVER transition must fail.
     try:
         engine.start_street(
             "RIVER",
@@ -162,9 +221,8 @@ def main():
             ],
         )
     except ValueError as exc:
-        print()
         print(
-            "chronology guard =",
+            "river guard =",
             str(exc),
         )
     else:

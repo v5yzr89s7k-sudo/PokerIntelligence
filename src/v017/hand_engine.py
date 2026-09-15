@@ -179,10 +179,19 @@ class HandEngine:
             )
         ]
 
-    def observe_cards_disappeared(
+    def observe_fold(
         self,
         seat,
     ):
+        """
+        Record a fold from objective completion evidence.
+
+        The evidence source may differ by actor:
+        opponent card disappearance, Hero decision completion,
+        or another validated physical observation.
+
+        HandEngine alone owns the FOLD semantic.
+        """
         self._require_actor(seat)
 
         player = self.players[seat]
@@ -202,6 +211,20 @@ class HandEngine:
         self._advance_actor()
 
         return "FOLD"
+
+    def observe_cards_disappeared(
+        self,
+        seat,
+    ):
+        """
+        Opponent physical-card disappearance adapter.
+
+        Card perception supplies evidence only; fold semantics remain
+        owned by observe_fold().
+        """
+        return self.observe_fold(
+            seat
+        )
 
     def observe_no_commitment(
         self,
@@ -357,6 +380,13 @@ class HandEngine:
         Street-local betting state does not.
         """
         street = str(street).upper()
+
+        if self.next_actor is not None:
+            raise ValueError(
+                "cannot advance street while action remains: "
+                f"street={self.street} "
+                f"next_actor={self.next_actor}"
+            )
 
         allowed = {
             "FLOP",

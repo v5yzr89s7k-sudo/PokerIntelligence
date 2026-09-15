@@ -36,16 +36,39 @@ def build():
     )
 
 
-def main():
-    hand = build()
-
-    # Close preflop without changing the contract under test.
-    hand.observe_cards_disappeared("btn")
-    hand.observe_stack_commitment(
-        "hero",
-        0.5,
+def close_preflop(hand):
+    assert (
+        hand.observe_cards_disappeared(
+            "btn"
+        )
+        == "FOLD"
     )
-    hand.observe_no_commitment("bb")
+
+    assert (
+        hand.observe_stack_commitment(
+            "hero",
+            0.5,
+        )
+        == "CALL"
+    )
+
+    assert (
+        hand.observe_no_commitment(
+            "bb"
+        )
+        == "CHECK"
+    )
+
+    assert hand.next_actor is None
+
+
+def main():
+    # --------------------------------------------------------
+    # CHECK at zero price.
+    # --------------------------------------------------------
+
+    hand = build()
+    close_preflop(hand)
 
     hand.start_street(
         "FLOP",
@@ -55,9 +78,7 @@ def main():
         ],
     )
 
-    print("===== OPEN FLOP =====")
-    print("price =", hand.current_price_bb)
-    print("next =", hand.next_actor)
+    print("===== ZERO-PRICE CHECK =====")
 
     action = hand.observe_no_commitment(
         "hero"
@@ -67,19 +88,20 @@ def main():
     assert hand.next_actor == "bb"
     assert hand.current_price_bb == 0.0
 
-    action = hand.observe_stack_commitment(
-        "bb",
-        2.0,
+    # BB checks too, legitimately closing the round.
+    assert (
+        hand.observe_no_commitment(
+            "bb"
+        )
+        == "CHECK"
     )
 
-    assert action == "BET"
-    assert hand.current_price_bb == 2.0
+    assert hand.next_actor is None
 
-    print()
-    print("===== CHECK WHILE FACING BET =====")
+    # --------------------------------------------------------
+    # CHECK while facing a real bet must fail.
+    # --------------------------------------------------------
 
-    # Start another street so Hero is first, then create a price
-    # without allowing Hero to consume chronology.
     hand.start_street(
         "TURN",
         [
@@ -88,7 +110,27 @@ def main():
         ],
     )
 
-    hand.current_price_bb = 2.0
+    assert (
+        hand.observe_no_commitment(
+            "hero"
+        )
+        == "CHECK"
+    )
+
+    assert (
+        hand.observe_stack_commitment(
+            "bb",
+            2.0,
+        )
+        == "BET"
+    )
+
+    # Aggression must reopen action to Hero.
+    assert hand.next_actor == "hero"
+    assert hand.current_price_bb == 2.0
+
+    print()
+    print("===== CHECK WHILE FACING BET =====")
 
     try:
         hand.observe_no_commitment(
@@ -101,7 +143,19 @@ def main():
             "CHECK accepted while facing a bet"
         )
 
+    # Rejected observation must not consume chronology.
     assert hand.next_actor == "hero"
+
+    # Hero calls, legitimately closing TURN.
+    assert (
+        hand.observe_stack_commitment(
+            "hero",
+            2.0,
+        )
+        == "CALL"
+    )
+
+    assert hand.next_actor is None
 
     checks = [
         item
@@ -109,12 +163,20 @@ def main():
         if item["action"] == "CHECK"
     ]
 
-    assert len(checks) == 2
-    assert checks[0]["street"] == "PREFLOP"
-    assert checks[1]["street"] == "FLOP"
+    assert [
+        item["street"]
+        for item in checks
+    ] == [
+        "PREFLOP",
+        "FLOP",
+        "FLOP",
+        "TURN",
+    ]
 
     print()
-    print("V0.17 CHECK SEMANTICS: PASS")
+    print(
+        "V0.17 CHECK SEMANTICS: PASS"
+    )
 
 
 if __name__ == "__main__":
