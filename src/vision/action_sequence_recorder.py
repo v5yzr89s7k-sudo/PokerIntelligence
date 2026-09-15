@@ -26,11 +26,15 @@ class ActionSequenceRecorder:
     coordinator frames so action evidence can be audited frame by frame.
     """
 
-    def __init__(self, max_frames=240):
+    def __init__(self, max_frames=None):
         self.geometry = json.loads(
             GEOMETRY_PATH.read_text()
         )
-        self.max_frames = int(max_frames)
+        self.max_frames = (
+            int(max_frames)
+            if max_frames is not None
+            else None
+        )
         self.session_dir = None
         self.frame_index = 0
 
@@ -41,6 +45,36 @@ class ActionSequenceRecorder:
             parents=True,
             exist_ok=True,
         )
+
+        # Cross-process cold-path finalization ownership.
+        #
+        # The coordinator owns ActionSequenceRecorder, while the parent
+        # runner owns orderly shutdown of the asynchronous workers.
+        # Publish only the session destination here. The runner snapshots
+        # completed transport after workers stop; record() remains free of
+        # recurring transport-copy I/O.
+        session_pointer = (
+            ROOT
+            / "runtime/live/action_sequence_session.json"
+        )
+
+        session_pointer.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        session_pointer.write_text(
+            json.dumps(
+                {
+                    "session_dir": str(
+                        self.session_dir
+                    ),
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+
         self.frame_index = 0
         return self.session_dir
 
@@ -48,7 +82,10 @@ class ActionSequenceRecorder:
         if self.session_dir is None:
             self.start_session()
 
-        if self.frame_index >= self.max_frames:
+        if (
+            self.max_frames is not None
+            and self.frame_index >= self.max_frames
+        ):
             return False
 
         self.frame_index += 1

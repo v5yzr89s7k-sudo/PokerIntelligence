@@ -334,9 +334,18 @@ class CanonicalHand:
             for action in self.actions
         )
 
+        # A late snapshot may establish the canonical action queue only
+        # when no queue exists yet.
+        #
+        # Once players_to_act is non-empty, chronology already has an owner.
+        # That queue may have been physically synchronized forward without
+        # manufacturing actions for unseen predecessors. Snapshot enrichment
+        # may refresh roster metadata, but it must never rewind that live
+        # chronology merely because no voluntary action has canonicalized yet.
         if (
             self.current_street == "PREFLOP"
             and not prior_voluntary_action
+            and not self.players_to_act
         ):
             self._initialize_players_to_act()
 

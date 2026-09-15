@@ -15,7 +15,14 @@ def main():
     try:
         c.find_board_result = lambda request_id: None
 
-        allowed = (
+        owning_frame_allowed = (
+            c.replay_board_semantic_barrier_allows_advance(
+                state,
+                next_frame_ts=100.0,
+            )
+        )
+
+        later_frame_allowed = (
             c.replay_board_semantic_barrier_allows_advance(
                 state,
                 next_frame_ts=100.1,
@@ -23,13 +30,22 @@ def main():
         )
 
         print(
-            "perception advance allowed:",
-            allowed,
+            "request-owning frame allowed:",
+            owning_frame_allowed,
+        )
+        print(
+            "later frame allowed while unresolved:",
+            later_frame_allowed,
         )
 
-        assert allowed, (
-            "RED: asynchronous board worker wall time "
-            "still blocks the next recorded perception frame"
+        assert owning_frame_allowed is True, (
+            "the recorded request-owning frame must be allowed "
+            "to complete"
+        )
+
+        assert later_frame_allowed is False, (
+            "RED: replay advanced beyond the board request's "
+            "recorded semantic boundary before transport resolved"
         )
 
         assert (
@@ -50,7 +66,8 @@ def main():
 
         print(
             "PASS: pending board transport retains canonical "
-            "ownership without blocking recorded perception"
+            "ownership and gates only movement beyond its "
+            "recorded semantic boundary"
         )
 
     finally:

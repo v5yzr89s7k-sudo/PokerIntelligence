@@ -177,14 +177,56 @@ def format_provisional_action(
         else:
             label = position
 
+    if kind == "CALL":
+        amount = _format_bb(
+            item.get("amount_bb")
+        )
+        return f"{label} calls" + (
+            f" {amount}"
+            if amount
+            else ""
+        )
+
     if kind == "BET":
-        return f"{label} bets"
+        amount = _format_bb(
+            item.get("amount_bb")
+        )
+        return f"{label} bets" + (
+            f" {amount}"
+            if amount
+            else ""
+        )
+
+    if kind == "RAISE":
+        amount = _format_bb(
+            item.get("raise_to_bb")
+        )
+        return f"{label} raises" + (
+            f" to {amount}"
+            if amount
+            else ""
+        )
 
     if kind == "BET_OR_RAISE":
-        return f"{label} bets or raises"
+        amount = _format_bb(
+            item.get("raise_to_bb")
+            or item.get("amount_bb")
+        )
+        return f"{label} bets or raises" + (
+            f" to {amount}"
+            if amount
+            else ""
+        )
 
     if kind == "CALL_OR_RAISE":
-        return f"{label} calls or raises"
+        amount = _format_bb(
+            item.get("amount_bb")
+        )
+        return f"{label} calls or raises" + (
+            f" {amount}"
+            if amount
+            else ""
+        )
 
     if kind == "COMMITMENT":
         return f"{label} commits chips"
@@ -275,6 +317,8 @@ def render_canonical_hand(
             or not seat
             or action not in {
                 "BET",
+                "RAISE",
+                "CALL",
                 "BET_OR_RAISE",
                 "CALL_OR_RAISE",
                 "COMMITMENT",

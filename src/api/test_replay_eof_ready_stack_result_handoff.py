@@ -209,15 +209,14 @@ def main():
                 ],
             )
 
-            entry = (
-                state[
-                    "pending_stack_reads"
-                ][SEAT]
-            )
-
             print(
                 "candidate after drain:",
-                entry,
+                (
+                    state.get(
+                        "pending_stack_reads"
+                    )
+                    or {}
+                ).get(SEAT),
             )
 
             print(
@@ -228,60 +227,53 @@ def main():
             )
 
             assert observed_worker_results, (
-                "REPRODUCED: EOF drain did not call "
-                "stack processor"
+                "EOF drain did not call stack processor"
             )
 
             assert (
                 SEAT
                 in observed_worker_results[0]
             ), (
-                "REPRODUCED: semantically releasable "
-                "completed BB result was not handed "
-                "from EOF collector to stack processor"
+                "semantically releasable completed BB "
+                "result was not handed from EOF collector "
+                "to stack processor"
             )
 
-            # Once the unchanged result reaches the processor,
-            # request ownership must be acknowledged/cleared.
-            assert (
-                entry.get(
-                    "stack_worker_request_id"
-                )
-                is None
-            ), (
-                "REPRODUCED: BB processor received "
-                "completed unchanged result but retained "
-                "old request ownership"
-            )
-
-            # The ordinary retry machinery must now have
-            # selected frame 52, because:
+            # Current production contract:
             #
-            # 18.891 + 0.45 = 19.341
-            # frame 51 = 19.232 (too early)
-            # frame 52 = 19.568 (first eligible)
+            # The completed frame-50 result is semantically
+            # reconciled at EOF. Because the trusted stack
+            # remains unchanged at 48.57 BB and the candidate
+            # was motion-only, the processor closes the
+            # candidate rather than manufacturing another retry.
             assert (
-                Path(
-                    entry[
-                        "retry_frame_path"
-                    ]
-                ).name
-                == "0052_full.png"
-            ), entry
-
-            assert abs(
-                float(
-                    entry[
-                        "retry_frame_ts"
-                    ]
+                SEAT
+                not in (
+                    state.get(
+                        "pending_stack_reads"
+                    )
+                    or {}
                 )
-                - FRAME52_TS
-            ) < 1e-6
+            ), (
+                "trusted unchanged motion-only candidate "
+                "should close after EOF reconciliation"
+            )
+
+            assert (
+                REQUEST_ID
+                not in state[
+                    "pending_stack_worker_requests"
+                ]
+            ), (
+                "completed EOF request retained transport "
+                "ownership after semantic reconciliation"
+            )
 
             print(
                 "PASS replay EOF ready-result handoff: "
                 "completed frame-50 BB result reaches "
-                "processor and rearms frame-52 retry"
+                "processor and trusted unchanged motion-only "
+                "candidate closes without synthetic retry"
             )
 
         finally:

@@ -128,6 +128,35 @@ def dealt_in_seats(frame, geometry):
     ]
 
 
+def board_card_present(card_crop):
+    """
+    Return True only for a face-up community card.
+
+    This is intentionally stricter than generic card_present().
+    ACR Rabbit Hunt/result graphics contain large bright artwork
+    on black card backs and can satisfy the generic bright-pixel
+    presence rule.
+
+    Recorded calibration:
+      empty/preflop bright_ratio <= 0.0337
+      Rabbit Hunt bright_ratio   <= 0.3174
+      genuine flop bright_ratio  >= 0.6154
+    """
+    if card_crop is None or card_crop.size == 0:
+        return False
+
+    gray = cv2.cvtColor(
+        card_crop,
+        cv2.COLOR_BGR2GRAY,
+    )
+
+    bright_ratio = float(
+        (gray > 145).mean()
+    )
+
+    return bright_ratio > 0.45
+
+
 def count_board_cards(frame, geometry):
     count = 0
 
@@ -135,11 +164,10 @@ def count_board_cards(frame, geometry):
         "board",
         {},
     ).values():
-        if card_present(crop(frame, rect)):
+        if board_card_present(crop(frame, rect)):
             count += 1
 
     return count
-
 
 def hero_cards_visible(frame, geometry):
     hero = (

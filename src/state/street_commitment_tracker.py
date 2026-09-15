@@ -26,6 +26,15 @@ class StreetCommitmentState:
 
     committed: Set[str] = field(default_factory=set)
 
+    # Quantitatively established total live commitments that are owned by
+    # observed actions but have not yet been chronology-admitted.
+    #
+    # This is pricing evidence only. It does not create an action, consume
+    # an obligation, establish aggression, or mutate canonical betting state.
+    pending_quantitative_commitments: Dict[str, float] = field(
+        default_factory=dict
+    )
+
     # Immutable action order established at the start of this street.
     street_order: List[str] = field(default_factory=list)
 
@@ -205,6 +214,39 @@ class StreetCommitmentTracker:
 
         return self.players_owing_action(street)
 
+    def consume_observed_action(self, street, seat):
+        """
+        Project one already-established action into betting-round state.
+
+        This is the single gateway for the fact that a seat has acted.
+
+        It atomically clears both possible obligation representations:
+        unopened-street traversal and response-to-aggression. It also
+        records the seat as acted.
+
+        Semantic action existence is owned elsewhere. This method does
+        not infer, create, classify, size, or canonicalize an action.
+        Repeated calls are intentionally idempotent.
+        """
+        state = self._state(street)
+
+        state.pending_to_act = [
+            pending_seat
+            for pending_seat in state.pending_to_act
+            if pending_seat != seat
+        ]
+
+        state.needs_response_from = [
+            pending_seat
+            for pending_seat in state.needs_response_from
+            if pending_seat != seat
+        ]
+
+        if seat:
+            state.acted.add(seat)
+
+        return self.round_status(street)
+
     def consume_pending_action(self, street, seat):
         """
         Consume one player's unopened-street traversal obligation.
@@ -331,6 +373,123 @@ class StreetCommitmentTracker:
             ),
             "acted": sorted(state.acted),
         }
+
+    def record_pending_quantitative_commitment(
+        self,
+        street,
+        seat,
+        total_bb,
+    ):
+        """
+        Record quantitative pricing evidence for an already-owned action
+        that has not yet been chronology-admitted.
+
+        This method has no action-existence or chronology authority.
+        """
+        street = (street or "UNKNOWN").upper()
+        seat = str(seat or "")
+
+        if not seat or total_bb is None:
+            return False
+
+        total_bb = round(
+            float(total_bb),
+            4,
+        )
+
+        if total_bb < 0.0:
+            return False
+
+        state = self._state(street)
+
+        previous = state.pending_quantitative_commitments.get(
+            seat
+        )
+
+        if (
+            previous is None
+            or total_bb > float(previous)
+        ):
+            state.pending_quantitative_commitments[
+                seat
+            ] = total_bb
+
+        return True
+
+    def clear_pending_quantitative_commitment(
+        self,
+        street,
+        seat,
+    ):
+        """
+        Remove pending quantitative pricing evidence once the same owned
+        action has been chronology-admitted or otherwise invalidated.
+        """
+        state = self._state(street)
+
+        return (
+            state.pending_quantitative_commitments.pop(
+                str(seat or ""),
+                None,
+            )
+            is not None
+        )
+
+    def effective_price_before(
+        self,
+        street,
+        seat,
+        canonical_price=0.0,
+    ):
+        """
+        Return the best established betting price faced by `seat`.
+
+        Only quantitatively established PREDECESSORS in immutable street
+        order may raise the effective price. Later actors can never
+        retroactively change the price faced by an earlier actor.
+
+        This is a read-only pricing projection. It does not consume queues,
+        establish aggression, or mutate CanonicalHand.
+        """
+        state = self._state(street)
+
+        price = round(
+            float(canonical_price or 0.0),
+            4,
+        )
+
+        seat = str(seat or "")
+
+        if (
+            not seat
+            or seat not in state.street_order
+        ):
+            return price
+
+        actor_index = state.street_order.index(
+            seat
+        )
+
+        predecessors = state.street_order[
+            :actor_index
+        ]
+
+        for predecessor in predecessors:
+            total = (
+                state.pending_quantitative_commitments.get(
+                    predecessor
+                )
+            )
+
+            if total is None:
+                continue
+
+            price = max(
+                price,
+                round(float(total), 4),
+            )
+
+        return price
 
     def has_player_committed(self, street, seat):
         return (

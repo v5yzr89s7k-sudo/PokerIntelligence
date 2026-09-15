@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import os
 import sys
 import time
 
@@ -10,6 +11,9 @@ sys.path.insert(0, str(ROOT))
 
 from src.api.bet_amount_api_reader import (
     read_bet_amount,
+)
+from src.api.api_event_coordinator import (
+    find_replay_bet_amount_result,
 )
 from src.api.perception_latency import log as log_latency
 
@@ -43,6 +47,10 @@ def process_request(request):
     seat = request.get("seat")
     street = request.get("street")
     hand_token = request.get("hand_token")
+    source = request.get(
+        "source",
+        "transition",
+    )
 
     started = time.perf_counter()
 
@@ -60,21 +68,76 @@ def process_request(request):
     }
 
     try:
-        reading = read_bet_amount(
-            frame,
-            seat,
+        replay_session = os.environ.get(
+            "POKER_REPLAY_SESSION"
         )
 
-        result["bet_bb"] = reading.get(
-            "bet_bb"
-        )
-        result["raw_text"] = reading.get(
-            "raw_text"
-        )
+        if replay_session:
+            recorded = (
+                find_replay_bet_amount_result(
+                    frame=frame,
+                    seat=seat,
+                    street=street,
+                    source=source,
+                    replay_session=replay_session,
+                )
+            )
 
-        result["ok"] = (
-            result["bet_bb"] is not None
-        )
+            if recorded is None:
+                raise RuntimeError(
+                    "recorded bet-amount result "
+                    "not found for replay identity "
+                    f"frame={Path(str(frame or '')).name} "
+                    f"seat={seat} "
+                    f"street={street} "
+                    f"source={source}"
+                )
+
+            result["bet_bb"] = (
+                recorded.get("bet_bb")
+            )
+
+            result["raw_text"] = (
+                recorded.get("raw_text")
+            )
+
+            result["ok"] = bool(
+                recorded.get("ok")
+                and result["bet_bb"] is not None
+            )
+
+            result["error"] = (
+                recorded.get("error")
+            )
+
+            print(
+                "[BET_AMOUNT_REPLAY]",
+                f"request={str(request_id)[:8]}",
+                f"seat={seat}",
+                f"street={street}",
+                f"source={source}",
+                f"frame={Path(str(frame or '')).name}",
+                f"bet_bb={result['bet_bb']}",
+                flush=True,
+            )
+
+        else:
+            reading = read_bet_amount(
+                frame,
+                seat,
+            )
+
+            result["bet_bb"] = reading.get(
+                "bet_bb"
+            )
+
+            result["raw_text"] = reading.get(
+                "raw_text"
+            )
+
+            result["ok"] = (
+                result["bet_bb"] is not None
+            )
 
     except Exception as exc:
         result["error"] = str(exc)

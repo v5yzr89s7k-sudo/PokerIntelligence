@@ -2,6 +2,7 @@ from pathlib import Path
 from time import perf_counter
 from datetime import datetime
 import json
+import os
 import re
 import cv2
 import subprocess
@@ -30,6 +31,8 @@ from src.events.participant_evidence_store import (
 
 EVENT_LOG = ROOT / "runtime/live/api_events.jsonl"
 LATENCY_LOG = ROOT / "runtime/live/snapshot_latency.jsonl"
+SNAPSHOT_REQUESTS = ROOT / "runtime/live/snapshot_requests.jsonl"
+SNAPSHOT_RESULTS = ROOT / "runtime/live/snapshot_results.jsonl"
 CAPTURE_DIR = ROOT / "runtime/window_captures"
 SNAPSHOT_READER = ROOT / "src/api/table_snapshot_api_reader.py"
 
@@ -160,6 +163,135 @@ def emit(event):
         f.flush()
 
 
+
+def append_jsonl(path, item):
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with path.open("a") as handle:
+        handle.write(
+            json.dumps(item) + "\n"
+        )
+        handle.flush()
+
+
+def find_replay_snapshot_result(
+    canonical_frame,
+    replay_session=None,
+):
+    """
+    Resolve exactly one recorded snapshot result by frame identity.
+
+    Replay must not fall through to live snapshot perception.
+    """
+    session_value = (
+        replay_session
+        or os.environ.get(
+            "POKER_REPLAY_SESSION"
+        )
+    )
+
+    if not session_value:
+        return None
+
+    session = Path(session_value)
+
+    requests_path = (
+        session
+        / "snapshot_requests.jsonl"
+    )
+
+    results_path = (
+        session
+        / "snapshot_results.jsonl"
+    )
+
+    if (
+        not requests_path.exists()
+        or not results_path.exists()
+    ):
+        return None
+
+    target_frame = Path(
+        str(canonical_frame or "")
+    ).name
+
+    if not target_frame:
+        return None
+
+    request_matches = []
+
+    for line in (
+        requests_path
+        .read_text()
+        .splitlines()
+    ):
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        request_frame = Path(
+            str(
+                request.get(
+                    "canonical_frame"
+                )
+                or ""
+            )
+        ).name
+
+        if request_frame == target_frame:
+            request_matches.append(
+                request
+            )
+
+    if len(request_matches) != 1:
+        return None
+
+    recorded_request_id = (
+        request_matches[0].get(
+            "source_request_id"
+        )
+    )
+
+    if not recorded_request_id:
+        return None
+
+    result_matches = []
+
+    for line in (
+        results_path
+        .read_text()
+        .splitlines()
+    ):
+        try:
+            result = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        if (
+            str(
+                result.get(
+                    "source_request_id"
+                )
+                or ""
+            )
+            == str(recorded_request_id)
+        ):
+            result_matches.append(
+                result
+            )
+
+    if len(result_matches) != 1:
+        return None
+
+    return dict(
+        result_matches[0]
+    )
+
+
 def run_snapshot(frame, dealt_in_seats=None):
     t0 = perf_counter()
 
@@ -244,6 +376,30 @@ def process_event(event, processed_hero_events):
 
     request_id = event.get("source_request_id") or f"snapshot-{event_key}"
     hand_token = event.get("hand_token")
+
+    append_jsonl(
+        SNAPSHOT_REQUESTS,
+        {
+            "type": "snapshot_request",
+            "source_request_id": request_id,
+            "hand_token": hand_token,
+            "canonical_frame": event.get(
+                "canonical_frame"
+            ),
+            "roster_seats": list(
+                event.get(
+                    "roster_seats"
+                )
+                or []
+            ),
+            "dealt_in_seats": list(
+                event.get(
+                    "dealt_in_seats"
+                )
+                or []
+            ),
+        },
+    )
 
     log_latency(
         "trigger_consumed",
@@ -426,10 +582,51 @@ def process_event(event, processed_hero_events):
 
     # Snapshot enrichment reads every occupied starting seat so the TABLE
     # section receives all seated players in one atomic result.
-    snapshot, elapsed_ms = run_snapshot(
-        frame,
-        dealt_in_seats=roster_seats,
+    replay_session = os.environ.get(
+        "POKER_REPLAY_SESSION"
     )
+
+    if replay_session:
+        recorded = (
+            find_replay_snapshot_result(
+                canonical_frame=frame,
+                replay_session=replay_session,
+            )
+        )
+
+        if recorded is None:
+            raise RuntimeError(
+                "recorded snapshot result not found "
+                "for replay identity "
+                f"frame={frame.name}"
+            )
+
+        snapshot = dict(
+            recorded.get("snapshot")
+            or {}
+        )
+
+        if not snapshot:
+            raise RuntimeError(
+                "recorded snapshot result has no "
+                "snapshot payload "
+                f"frame={frame.name}"
+            )
+
+        elapsed_ms = 0.0
+
+        print(
+            "[SNAPSHOT_REPLAY] "
+            f"request={str(request_id)[:8]} "
+            f"frame={frame.name}",
+            flush=True,
+        )
+
+    else:
+        snapshot, elapsed_ms = run_snapshot(
+            frame,
+            dealt_in_seats=roster_seats,
+        )
 
     if snapshot:
         # V2 used roster_seats only as its read inventory. Restore the actual
@@ -597,6 +794,17 @@ def process_event(event, processed_hero_events):
         ok=True,
         elapsed_ms=elapsed_ms,
         player_count=len(players),
+    )
+
+    append_jsonl(
+        SNAPSHOT_RESULTS,
+        {
+            "type": "snapshot_result",
+            "source_request_id": request_id,
+            "hand_token": hand_token,
+            "canonical_frame": str(frame),
+            "snapshot": snapshot,
+        },
     )
 
     emit({

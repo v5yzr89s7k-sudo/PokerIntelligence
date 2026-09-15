@@ -259,16 +259,54 @@ def main():
                     river_lines,
                 )
 
-            assert any(
-                "SB (Hero) checks" in rendered
-                and "BB (Villain) bets" in rendered
-                and "BB (Villain) bets 6.75 BB"
-                not in rendered
-                for rendered in presentation_writes
+            unsized_indices = [
+                index
+                for index, write in enumerate(
+                    presentation_writes
+                )
+                if any(
+                    line.strip() == "BB (Villain) bets"
+                    for line in write.splitlines()
+                )
+            ]
+
+            sized_indices = [
+                index
+                for index, write in enumerate(
+                    presentation_writes
+                )
+                if any(
+                    line.strip()
+                    == "BB (Villain) bets 6.75 BB"
+                    for line in write.splitlines()
+                )
+            ]
+
+            print(
+                "unsized presentation indices:",
+                unsized_indices,
+            )
+            print(
+                "sized presentation indices:",
+                sized_indices,
+            )
+
+            assert unsized_indices, (
+                "RED: corroborated physical RIVER BET never "
+                "reached current_hand.txt unsized"
+            )
+
+            assert sized_indices, (
+                "RED: quantitative RIVER BET sizing never "
+                "reached current_hand.txt"
+            )
+
+            assert (
+                min(unsized_indices)
+                < min(sized_indices)
             ), (
-                "RED: future-street physical commitment was "
-                "quantitatively settled before its unsized BET "
-                "could reach current_hand.txt"
+                "RED: quantitative settlement overtook the "
+                "unsized physical RIVER BET presentation"
             )
 
             river_actions = [

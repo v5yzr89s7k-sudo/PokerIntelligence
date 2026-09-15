@@ -180,6 +180,8 @@ def reset_runtime():
         "pot_results.jsonl",
         "bet_amount_requests.jsonl",
         "bet_amount_results.jsonl",
+        "snapshot_requests.jsonl",
+        "snapshot_results.jsonl",
         "boundary_stack_requests.jsonl",
         "boundary_stack_results.jsonl",
         "stack_requests.jsonl",
@@ -191,6 +193,13 @@ def reset_runtime():
         "coordinator_timing.jsonl",
     ]:
         (LIVE / name).write_text("")
+
+    action_sequence_session_pointer = (
+        LIVE / "action_sequence_session.json"
+    )
+
+    if action_sequence_session_pointer.exists():
+        action_sequence_session_pointer.unlink()
 
     (LIVE / "participant_evidence.json").write_text("{}\n")
 
@@ -688,6 +697,63 @@ def stop_all(*_):
     terminate_process("hero_worker")
     terminate_process("pot_worker")
     terminate_process("bet_amount_worker")
+
+    # Action-sequence deterministic replay needs the original quantitative
+    # bet perception, not a fresh external API interpretation of the same
+    # pixels. The recorder publishes its session destination when recording
+    # begins; the runner owns this cold-path snapshot only after the
+    # bet_amount_worker has stopped and the transport files are stable.
+    #
+    # Preserve:
+    #   bet_amount_requests.jsonl
+    #   bet_amount_results.jsonl
+    action_sequence_session_pointer = (
+        LIVE / "action_sequence_session.json"
+    )
+
+    if action_sequence_session_pointer.exists():
+        try:
+            pointer = json.loads(
+                action_sequence_session_pointer.read_text()
+            )
+
+            session_dir = Path(
+                pointer.get("session_dir") or ""
+            )
+
+            if session_dir:
+                session_dir.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+                for transport_name in (
+                    "bet_amount_requests.jsonl",
+                    "bet_amount_results.jsonl",
+                    "snapshot_requests.jsonl",
+                    "snapshot_results.jsonl",
+                ):
+                    source = LIVE / transport_name
+
+                    if source.exists():
+                        (
+                            session_dir
+                            / transport_name
+                        ).write_bytes(
+                            source.read_bytes()
+                        )
+
+                debug(
+                    "preserved action-sequence bet transport "
+                    f"path={session_dir}"
+                )
+
+        except Exception as exc:
+            debug(
+                "WARNING: failed to preserve action-sequence "
+                f"bet transport: {exc}"
+            )
+
     terminate_process("boundary_stack_worker")
     terminate_process("stack_worker")
 

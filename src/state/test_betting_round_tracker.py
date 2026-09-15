@@ -296,35 +296,37 @@ def test_order_is_preserved():
     ]
 
 
-def test_later_actor_without_commitment_evidence_resolves_gap_as_fold():
+def test_later_actor_without_commitment_evidence_does_not_author_gap():
     hand = make_hand()
     tracker = BettingRoundTracker(hand)
 
     # Physical chronology establishes that seat_upper_right is now
-    # the acting seat. With no commitment evidence for seat_top,
-    # the skipped predecessor is safely resolved as a preflop fold.
+    # the observed actor. It does not establish what seat_top did.
+    #
+    # The skipped predecessor therefore remains unknown rather than
+    # being fabricated as a fold.
     resolved = tracker.advance_to_observed_actor(
         "seat_upper_right",
         ts=2.0,
     )
 
-    assert [
-        (action.seat, action.action)
-        for action in resolved
-    ] == [
-        ("seat_top", "FOLD"),
-    ]
+    assert resolved == []
 
-    assert hand.players["seat_top"].folded is True
-    assert hand.players["seat_top"].active is False
+    assert hand.players["seat_top"].folded is False
+    assert hand.players["seat_top"].active is True
 
     assert hand.players_to_act == [
         "seat_upper_right",
         "hero",
     ]
 
-    # Quantitative evidence may now consume exactly the observed
-    # actor because chronology has made that actor admissible.
+    assert not any(
+        action.seat == "seat_top"
+        for action in hand.actions
+    )
+
+    # Quantitative evidence may consume exactly the observed actor
+    # once chronology has made that actor admissible.
     result = tracker.ingest(
         inferred(
             1,
@@ -348,7 +350,6 @@ def test_later_actor_without_commitment_evidence_resolves_gap_as_fold():
         (action.seat, action.action)
         for action in hand.actions
     ] == [
-        ("seat_top", "FOLD"),
         ("seat_upper_right", BET_OR_RAISE),
     ]
 
@@ -397,25 +398,22 @@ def test_actor_outside_queue_does_not_corrupt_queue():
     assert hand.players_to_act == original_queue
 
 
-def test_postflop_skipped_seat_is_not_inferred_as_fold():
+def test_postflop_skipped_seat_does_not_author_action():
     hand = make_hand()
     hand.set_board(["Ah", "7c", "2d"])
     tracker = BettingRoundTracker(hand)
 
     # Physical chronology establishes that seat_upper_right is the
-    # next observed actor. With no open bet and no commitment evidence
-    # for seat_top, the skipped predecessor is a CHECK, never a FOLD.
+    # next observed actor. It does not establish what seat_top did.
+    #
+    # A skipped postflop predecessor therefore remains unknown rather
+    # than being fabricated as either CHECK or FOLD.
     resolved = tracker.advance_to_observed_actor(
         "seat_upper_right",
         ts=2.0,
     )
 
-    assert [
-        (action.seat, action.action)
-        for action in resolved
-    ] == [
-        ("seat_top", "CHECK"),
-    ]
+    assert resolved == []
 
     assert hand.players["seat_top"].folded is False
     assert hand.players["seat_top"].active is True
@@ -424,6 +422,11 @@ def test_postflop_skipped_seat_is_not_inferred_as_fold():
         "seat_upper_right",
         "hero",
     ]
+
+    assert not any(
+        action.seat == "seat_top"
+        for action in hand.actions
+    )
 
     result = tracker.ingest(
         inferred(
@@ -440,7 +443,6 @@ def test_postflop_skipped_seat_is_not_inferred_as_fold():
         (action.seat, action.action)
         for action in hand.actions
     ] == [
-        ("seat_top", "CHECK"),
         ("seat_upper_right", BET_OR_RAISE),
     ]
 
@@ -550,10 +552,10 @@ if __name__ == "__main__":
         test_street_change_resets_aggression,
         test_stale_street_action_is_rejected,
         test_order_is_preserved,
-        test_later_actor_without_commitment_evidence_resolves_gap_as_fold,
+        test_later_actor_without_commitment_evidence_does_not_author_gap,
         test_first_actor_consumes_only_itself,
         test_actor_outside_queue_does_not_corrupt_queue,
-        test_postflop_skipped_seat_is_not_inferred_as_fold,
+        test_postflop_skipped_seat_does_not_author_action,
         test_later_preflop_gap_with_commitment_evidence_is_deferred,
         test_forced_blinds_do_not_consume_preflop_queue,
     ]

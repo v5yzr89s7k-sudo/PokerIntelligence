@@ -29,7 +29,7 @@ from src.state.preserved_action_reconciler import (
 )
 
 from src.state.boundary_result_promoter import (
-    promote_boundary_observation,
+    resolve_boundary_observation,
 )
 from src.api.participant_validation_recorder import (
     record_participant_comparison,
@@ -268,24 +268,194 @@ def canonical_load():
 
 def canonical_save(hand, state=None):
     """
-    Persist authoritative CanonicalHand state.
+    Persist canonical state and publish current_hand.txt exactly once.
 
-    current_hand.txt is a live presentation product. When the caller
-    supplies state, any still-valid presentation-only commitment
-    ownership must survive this canonical persistence write.
+    CanonicalHandStore.save() owns durable JSON persistence only.
+    Presentation is published here as one transaction:
+
+    - live state available -> canonical + ActionTimeline/provisional overlay;
+    - no usable live state -> canonical-only presentation.
+
+    No intermediate canonical-only current_hand.txt is exposed before an
+    overlay-aware presentation replaces it.
     """
     CANONICAL_STORE.save(hand)
+
+    # Canonical persistence and live presentation have separate ownership.
+    # Bootstrap handlers may replay several already-buffered semantic events
+    # as one presentation transaction. Those mutations remain durable
+    # immediately, but no partial current_hand.txt may escape mid-transaction.
+    if (
+        state is not None
+        and state.get("suppress_live_presentation")
+    ):
+        return
 
     if (
         state is not None
         and state.get("canonical_snapshot_ready")
     ):
         refresh_live_presentation(state)
+    else:
+        CANONICAL_STORE.save_live_presentation(
+            hand,
+            provisional_actions=None,
+        )
 
 
-def refresh_live_presentation(state):
+def refine_action_timeline_from_canonical(
+    state,
+    action,
+):
+    """
+    Project authoritative semantic/quantitative settlement back into
+    the one durable action record.
+
+    Canonical settlement enriches the observation. It does not create
+    a second owner of whether the action happened.
+    """
+    if action is None:
+        return state
+
+    from src.state.action_timeline import (
+        find_action,
+        refine_action,
+    )
+
+    street = str(
+        getattr(action, "street", "")
+        or ""
+    ).upper()
+
+    seat = str(
+        getattr(action, "seat", "")
+        or ""
+    )
+
+    if not street or not seat:
+        return state
+
+    existing = find_action(
+        state,
+        hand_token=state.get("hand_token"),
+        street=street,
+        seat=seat,
+    )
+
+    # Passive inferred actions such as CHECK/FOLD may not originate
+    # from a chip-commitment observation. Do not fabricate a physical
+    # timeline record here.
+    if existing is None:
+        return state
+
+    state = refine_action(
+        state,
+        hand_token=state.get("hand_token"),
+        street=street,
+        seat=seat,
+        action=getattr(action, "action", None),
+        amount_bb=getattr(action, "amount_bb", None),
+        raise_to_bb=getattr(action, "raise_to_bb", None),
+        ts=getattr(action, "ts", None),
+        source=(
+            getattr(action, "source", None)
+            or "canonical_settlement"
+        ),
+        confidence=getattr(action, "confidence", None),
+        evidence=[
+            "canonical_settlement",
+        ],
+        confirmed=True,
+    )
+
+    print(
+        "[ACTION_TIMELINE_CONFIRMED] "
+        f"street={street} "
+        f"seat={seat} "
+        f"action={getattr(action, 'action', None)} "
+        f"amount={getattr(action, 'amount_bb', None)} "
+        f"raise_to={getattr(action, 'raise_to_bb', None)}",
+        flush=True,
+    )
+
+    return state
+
+
+def sync_live_commitment_projection(state):
+    """
+    Compatibility projection only.
+
+    action_timeline is the sole owner of action existence.
+    pending_live_commitments is derived from it and must never be
+    independently mutated.
+    """
+    from src.state.action_timeline import (
+        presentation_overlay,
+    )
+
+    state["pending_live_commitments"] = dict(
+        presentation_overlay(state)
+    )
+
+    return state
+
+
+def refresh_live_presentation(
+    state,
+    *,
+    publication_intent="ordinary",
+):
     if not state.get("canonical_snapshot_ready"):
         return state
+
+    # v0.16 PRESENTATION INTENT
+    #
+    # Canonical persistence and live-action publication have different
+    # latency contracts.
+    #
+    # Passive asynchronous enrichment may be coalesced while a startup
+    # presentation transaction is active. Directly observed/refined poker
+    # actions must never wait behind that enrichment transaction.
+    publication_intent = str(
+        publication_intent or "ordinary"
+    ).lower()
+
+    if (
+        state.get("suppress_live_presentation")
+        and publication_intent != "action"
+    ):
+        print(
+            "[LIVE_PRESENTATION_COALESCED] "
+            f"intent={publication_intent} "
+            f"phase={state.get('phase')}",
+            flush=True,
+        )
+        return state
+
+    # v0.16 diagnostic only: identify the exact production caller that owns
+    # every current_hand.txt publication. Remove after publication-boundary
+    # determinism is proven.
+    import inspect
+
+    caller = inspect.currentframe().f_back
+    caller_name = (
+        caller.f_code.co_name
+        if caller is not None
+        else "unknown"
+    )
+
+    print(
+        "[LIVE_PRESENTATION_PUBLISH] "
+        f"caller={caller_name} "
+        f"phase={state.get('phase')} "
+        f"snapshot_ready={state.get('canonical_snapshot_ready')} "
+        f"suppressed={state.get('suppress_live_presentation')} "
+        f"players={len(state.get('players') or [])} "
+        f"pending_pot={len(state.get('pending_pot_updates') or [])} "
+        f"pending_stack_baseline="
+        f"{len(state.get('pending_stack_baseline_observations') or [])}",
+        flush=True,
+    )
 
     canonical = canonical_load()
 
@@ -297,9 +467,28 @@ def refresh_live_presentation(state):
     #
     # These entries exist only for current_hand.txt latency.
     # They carry no quantitative or betting-accounting authority.
-    live_commitments = dict(
-        state.get("pending_live_commitments")
-        or {}
+    from src.state.action_timeline import (
+        presentation_overlay,
+    )
+
+    # v0.16: presentation is projected from the durable action
+    # timeline. pending_live_commitments remains only as a temporary
+    # compatibility cache while old downstream code is retired.
+    timeline_commitments = presentation_overlay(
+        state
+    )
+
+    live_commitments = (
+        timeline_commitments
+        if timeline_commitments
+        else dict(
+            state.get("pending_live_commitments")
+            or {}
+        )
+    )
+
+    state = sync_live_commitment_projection(
+        state
     )
 
     for key, item in list(
@@ -365,6 +554,12 @@ def refresh_live_presentation(state):
             "seat": seat,
             "street": street,
             "action": presentation_action,
+            "amount_bb": item.get(
+                "amount_bb"
+            ),
+            "raise_to_bb": item.get(
+                "raise_to_bb"
+            ),
             "ts": item.get("ts"),
         }
 
@@ -493,10 +688,42 @@ def record_future_street_live_commitment(
     if seat not in canonical.players:
         return state
 
-    pending = dict(
-        state.get("pending_live_commitments")
-        or {}
+    from src.state.action_timeline import (
+        observe_action,
+        presentation_overlay,
     )
+
+    # v0.16 SINGLE ACTION OWNERSHIP
+    #
+    # Future-street physical evidence enters the same durable action
+    # timeline as current-street physical evidence.
+    #
+    # pending_live_commitments is only a presentation projection.
+    state = observe_action(
+        state,
+        hand_token=(
+            event.get("hand_token")
+            or state.get("hand_token")
+        ),
+        street=street,
+        seat=seat,
+        action="COMMITMENT",
+        ts=(
+            event.get("ts")
+            or time.time()
+        ),
+        source=(
+            event.get("source")
+            or "bet_region_appeared"
+        ),
+        confidence=event.get("confidence"),
+        evidence=[
+            event.get("source")
+            or "bet_region_appeared"
+        ],
+    )
+
+    pending = presentation_overlay(state)
 
     key = f"{street}:{seat}"
 
@@ -524,6 +751,453 @@ def record_future_street_live_commitment(
 
     return refresh_live_presentation(
         state
+,
+        publication_intent="action",
+    )
+
+
+def record_blocked_hero_physical_commitment(
+    state,
+    event,
+):
+    """
+    Preserve directly observed Hero chip commitment while canonical
+    chronology is blocked by unresolved predecessor obligations.
+
+    This path owns physical action existence only. It intentionally
+    records generic COMMITMENT and grants no canonical betting,
+    ordering, classification, or sizing authority.
+    """
+    if not state.get("canonical_snapshot_ready"):
+        return state
+
+    street = str(
+        event.get("street")
+        or state.get("phase")
+        or ""
+    ).upper()
+
+    seat = str(
+        event.get("seat")
+        or ""
+    )
+
+    if seat != "hero":
+        return state
+
+    if street not in {
+        "PREFLOP",
+        "FLOP",
+        "TURN",
+        "RIVER",
+    }:
+        return state
+
+    canonical = canonical_load()
+
+    if (
+        str(canonical.current_street or "").upper()
+        != street
+    ):
+        return state
+
+    if seat not in canonical.players:
+        return state
+
+    from src.state.action_timeline import (
+        observe_action,
+        presentation_overlay,
+    )
+
+    state = observe_action(
+        state,
+        hand_token=(
+            event.get("hand_token")
+            or state.get("hand_token")
+        ),
+        street=street,
+        seat=seat,
+        action="COMMITMENT",
+        ts=(
+            event.get("ts")
+            or time.time()
+        ),
+        source=(
+            event.get("source")
+            or "bet_region_appeared"
+        ),
+        confidence=event.get("confidence"),
+        evidence=[
+            event.get("source")
+            or "bet_region_appeared",
+            "chronology_blocked",
+        ],
+    )
+
+    pending = presentation_overlay(state)
+
+    pending[f"{street}:{seat}"] = {
+        "seat": seat,
+        "street": street,
+        "action": "COMMITMENT",
+        "source": "bet_region_appeared",
+        "ts": event.get("ts")
+        or time.time(),
+    }
+
+    state[
+        "pending_live_commitments"
+    ] = pending
+
+    print(
+        "[BLOCKED_HERO_COMMITMENT_OBSERVED] "
+        f"street={street} "
+        f"seat={seat} "
+        "action=COMMITMENT "
+        "owner=ActionTimeline",
+        flush=True,
+    )
+
+    return refresh_live_presentation(
+        state
+,
+        publication_intent="action",
+    )
+
+
+
+def record_blocked_opponent_physical_commitment(
+    state,
+    event,
+):
+    """
+    Preserve directly observed opponent chip commitment while canonical
+    chronology is blocked by unresolved predecessor obligations.
+
+    This path owns physical action existence only. It intentionally
+    records generic COMMITMENT and grants no canonical betting,
+    ordering, classification, or sizing authority.
+    """
+    if not state.get("canonical_snapshot_ready"):
+        return state
+
+    street = str(
+        event.get("street")
+        or state.get("phase")
+        or ""
+    ).upper()
+
+    seat = str(
+        event.get("seat")
+        or ""
+    )
+
+    if not seat or seat == "hero":
+        return state
+
+    if street not in {
+        "PREFLOP",
+        "FLOP",
+        "TURN",
+        "RIVER",
+    }:
+        return state
+
+    canonical = canonical_load()
+
+    if (
+        str(canonical.current_street or "").upper()
+        != street
+    ):
+        return state
+
+    if seat not in canonical.players:
+        return state
+
+    from src.state.action_timeline import (
+        observe_action,
+        presentation_overlay,
+    )
+
+    state = observe_action(
+        state,
+        hand_token=(
+            event.get("hand_token")
+            or state.get("hand_token")
+        ),
+        street=street,
+        seat=seat,
+        action="COMMITMENT",
+        ts=(
+            event.get("ts")
+            or time.time()
+        ),
+        source=(
+            event.get("source")
+            or "bet_region_appeared"
+        ),
+        confidence=event.get("confidence"),
+        evidence=[
+            event.get("source")
+            or "bet_region_appeared",
+            "chronology_blocked",
+        ],
+    )
+
+    pending = presentation_overlay(state)
+
+    pending[f"{street}:{seat}"] = {
+        "seat": seat,
+        "street": street,
+        "action": "COMMITMENT",
+        "source": "bet_region_appeared",
+        "ts": event.get("ts")
+        or time.time(),
+    }
+
+    state[
+        "pending_live_commitments"
+    ] = pending
+
+    print(
+        "[BLOCKED_OPPONENT_COMMITMENT_OBSERVED] "
+        f"street={street} "
+        f"seat={seat} "
+        "action=COMMITMENT "
+        "owner=ActionTimeline",
+        flush=True,
+    )
+
+    return refresh_live_presentation(
+        state
+,
+        publication_intent="action",
+    )
+
+
+def record_hero_physical_live_commitment(
+    state,
+    event,
+):
+    """
+    Preserve Hero's existing immediate physical-action presentation.
+
+    Hero has an independent decision/action-complete lane unavailable for
+    opponents, so this fast presentation path remains intentionally separate
+    from generic opponent bet-region evidence.
+    """
+    if not state.get("canonical_snapshot_ready"):
+        return state
+
+    street = str(
+        event.get("street")
+        or state.get("phase")
+        or ""
+    ).upper()
+
+    seat = str(
+        event.get("seat")
+        or ""
+    )
+
+    if seat != "hero":
+        return state
+
+    if street not in {
+        "PREFLOP",
+        "FLOP",
+        "TURN",
+        "RIVER",
+    }:
+        return state
+
+    canonical = canonical_load()
+
+    if (
+        str(canonical.current_street or "").upper()
+        != street
+    ):
+        return state
+
+    if seat not in canonical.players:
+        return state
+
+    queue = list(
+        canonical.players_to_act
+        or []
+    )
+
+    if not queue or queue[0] != seat:
+        return state
+
+    existing_aggression = any(
+        action.street == street
+        and action.action.upper()
+        in {
+            "BET",
+            "RAISE",
+            "BET_OR_RAISE",
+        }
+        for action in canonical.actions
+    )
+
+    if existing_aggression:
+        presentation_action = "CALL_OR_RAISE"
+    elif street == "PREFLOP":
+        presentation_action = "BET_OR_RAISE"
+    else:
+        presentation_action = "BET"
+
+    if any(
+        action.street == street
+        and action.seat == seat
+        and action.action.upper()
+        not in {
+            "POST_SMALL_BLIND",
+            "POST_BIG_BLIND",
+        }
+        for action in canonical.actions
+    ):
+        return state
+
+    from src.state.action_timeline import (
+        find_action,
+        observe_action,
+        presentation_overlay,
+        project_action_to_canonical,
+        refine_action,
+    )
+
+    hand_token = str(
+        event.get("hand_token")
+        or state.get("hand_token")
+        or canonical.hand_id
+        or ""
+    )
+
+    existing_owner = find_action(
+        state,
+        hand_token=hand_token,
+        street=street,
+        seat=seat,
+    )
+
+    # v0.16 BLOCKED HERO OWNER RELEASE
+    #
+    # A Hero commitment may already have been durably observed while an
+    # unresolved predecessor still owned canonical chronology. That earlier
+    # observation deliberately owns only generic COMMITMENT.
+    #
+    # Once Hero is the actual canonical queue head, this helper owns the
+    # semantic release of that SAME ActionTimeline record. Never create a
+    # competing owner and never leave the generic COMMITMENT stranded.
+    if (
+        existing_owner is not None
+        and str(existing_owner.get("action") or "").upper()
+        == "COMMITMENT"
+    ):
+        state = refine_action(
+            state,
+            hand_token=hand_token,
+            street=street,
+            seat=seat,
+            action=presentation_action,
+            ts=(
+                event.get("ts")
+                or time.time()
+            ),
+            source=(
+                event.get("source")
+                or "bet_region_appeared"
+            ),
+            confidence=event.get("confidence"),
+            evidence=[
+                event.get("source")
+                or "bet_region_appeared",
+                "chronology_released",
+            ],
+            confirmed=False,
+        )
+
+        projected = project_action_to_canonical(
+            state,
+            hand=canonical,
+            hand_token=hand_token,
+            street=street,
+            seat=seat,
+        )
+
+        if projected is None:
+            raise AssertionError(
+                "released Hero ActionTimeline owner failed "
+                "canonical projection: "
+                f"street={street} seat={seat}"
+            )
+
+        canonical_save(
+            canonical,
+            state=state,
+        )
+
+        print(
+            "[BLOCKED_HERO_COMMITMENT_RELEASED] "
+            f"street={street} "
+            f"seat={seat} "
+            f"action={presentation_action} "
+            "owner=ActionTimeline",
+            flush=True,
+        )
+
+    else:
+        state = observe_action(
+            state,
+            hand_token=hand_token,
+            street=street,
+            seat=seat,
+            action=presentation_action,
+            ts=(
+                event.get("ts")
+                or time.time()
+            ),
+            source=(
+                event.get("source")
+                or "bet_region_appeared"
+            ),
+            confidence=event.get("confidence"),
+            evidence=[
+                event.get("source")
+                or "bet_region_appeared"
+            ],
+        )
+
+    pending = presentation_overlay(state)
+
+    pending[f"{street}:{seat}"] = {
+        "seat": seat,
+        "street": street,
+        "action": presentation_action,
+        "source": "bet_region_appeared",
+        "ts": event.get("ts")
+        or time.time(),
+    }
+
+    state[
+        "pending_live_commitments"
+    ] = pending
+
+    print(
+        "[LIVE_HERO_COMMITMENT_PRESENTED] "
+        f"street={street} "
+        f"seat={seat} "
+        f"action={presentation_action} "
+        "source=bet_region_appeared",
+        flush=True,
+    )
+
+    return refresh_live_presentation(
+        state
+,
+        publication_intent="action",
     )
 
 
@@ -532,11 +1206,14 @@ def record_physical_live_commitment(
     event,
 ):
     """
-    Record presentation-only opening-bet evidence from the fastest
-    trustworthy physical signal.
+    Process raw bet-region appearance without granting opponents durable
+    poker-action authority.
 
-    This must never mutate CanonicalHand, pot accounting, stack accounting,
-    betting price, response queues, or quantitative commitment ownership.
+    Opponent ROI activity remains provisional evidence for chronology
+    blocking and quantitative acquisition. Only independently corroborated
+    evidence may create/refine the opponent's ActionTimeline action.
+
+    Hero is delegated to its separate direct-evidence fast path.
     """
     if not event.get("commitment_visible"):
         print(
@@ -561,15 +1238,10 @@ def record_physical_live_commitment(
         )
         return state
 
-    if not state.get("canonical_snapshot_ready"):
-        print(
-            "[LIVE_COMMITMENT_SKIP] "
-            f"street={event.get('street')} "
-            f"seat={event.get('seat')} "
-            "reason=canonical_snapshot_not_ready",
-            flush=True,
-        )
-        return state
+    seat = str(
+        event.get("seat")
+        or ""
+    )
 
     street = str(
         event.get("street")
@@ -577,133 +1249,22 @@ def record_physical_live_commitment(
         or ""
     ).upper()
 
-    seat = str(
-        event.get("seat")
-        or ""
-    )
-
-    if (
-        street not in {"PREFLOP", "FLOP", "TURN", "RIVER"}
-        or not seat
-    ):
-        print(
-            "[LIVE_COMMITMENT_SKIP] "
-            f"street={street} "
-            f"seat={seat} "
-            "reason=street_or_seat_not_eligible",
-            flush=True,
+    if seat == "hero":
+        return record_hero_physical_live_commitment(
+            state,
+            event,
         )
-        return state
-
-    canonical = canonical_load()
-
-    if (
-        str(canonical.current_street or "").upper()
-        != street
-    ):
-        print(
-            "[LIVE_COMMITMENT_SKIP] "
-            f"street={street} "
-            f"seat={seat} "
-            f"canonical={canonical.current_street} "
-            "reason=canonical_street_mismatch",
-            flush=True,
-        )
-        return state
-
-    if seat not in canonical.players:
-        print(
-            "[LIVE_COMMITMENT_SKIP] "
-            f"street={street} "
-            f"seat={seat} "
-            "reason=unknown_seat",
-            flush=True,
-        )
-        return state
-
-    # The actor-observed chronology transaction has already run.
-    # The commitment seat must now be the legitimate head actor.
-    queue = list(
-        canonical.players_to_act
-        or []
-    )
-
-    if not queue or queue[0] != seat:
-        print(
-            "[LIVE_COMMITMENT_SKIP] "
-            f"street={street} "
-            f"seat={seat} "
-            f"queue_head={queue[0] if queue else None} "
-            "reason=not_head_actor",
-            flush=True,
-        )
-        return state
-
-    # Only an unopened postflop street is semantically safe to
-    # display as BET without sizing. Facing existing aggression,
-    # commitment could still resolve as CALL or RAISE.
-    existing_aggression = any(
-        action.street == street
-        and action.action.upper()
-        in {"BET", "RAISE", "BET_OR_RAISE"}
-        for action in canonical.actions
-    )
-
-    if existing_aggression:
-        presentation_action = "CALL_OR_RAISE"
-    elif street == "PREFLOP":
-        presentation_action = "BET_OR_RAISE"
-    else:
-        presentation_action = "BET"
-
-    # Existing voluntary canonical action supersedes presentation
-    # ownership. Forced blind posts do not: a blind may still make a
-    # later voluntary commitment on PREFLOP.
-    if any(
-        action.street == street
-        and action.seat == seat
-        and action.action.upper()
-        not in {
-            "POST_SMALL_BLIND",
-            "POST_BIG_BLIND",
-        }
-        for action in canonical.actions
-    ):
-        return state
-
-    pending = dict(
-        state.get("pending_live_commitments")
-        or {}
-    )
-
-    key = f"{street}:{seat}"
-
-    pending[key] = {
-        "seat": seat,
-        "street": street,
-        "action": presentation_action,
-        "source": "bet_region_appeared",
-        "ts": event.get("ts")
-        or time.time(),
-    }
-
-    state[
-        "pending_live_commitments"
-    ] = pending
 
     print(
-        "[LIVE_COMMITMENT_PRESENTED] "
+        "[OPPONENT_COMMITMENT_PROVISIONAL] "
         f"street={street} "
         f"seat={seat} "
-        f"action={presentation_action} "
-        "source=bet_region_appeared",
+        "source=bet_region_appeared "
+        "reason=awaiting_independent_corroboration",
         flush=True,
     )
 
-    return refresh_live_presentation(
-        state
-    )
-
+    return state
 
 def read_cursor():
     if CURSOR.exists():
@@ -767,6 +1328,7 @@ def default_state():
         # Preserve them until the blocking evidence settles.
         "pending_actor_observations": [],
         "pending_physical_actor_completions": [],
+        "pending_observer_acquisition_events": [],
         "pending_stack_baseline_observations": [],
         "pending_stack_updates": [],
         "unresolved_stack_candidates": {},
@@ -791,6 +1353,11 @@ def default_state():
         "preserved_inferred_actions": {},
         "winner_seat": None,
         "final_pot_bb": None,
+        # Single owner of observed action existence.
+        #
+        # Canonical/quantitative systems may refine these records,
+        # but independent enrichment failures may not erase them.
+        "action_timeline": [],
         "timeline": [],
     }
 
@@ -975,6 +1542,12 @@ def seed_forced_blinds(state, canonical):
     return True
 
 def handle_table_snapshot(state, event):
+    # v0.16 STARTUP PRESENTATION BOUNDARY
+    #
+    # table_context may already have established and published the fast
+    # canonical hand. table_snapshot is the deterministic completion boundary
+    # for passive startup roster/name enrichment.
+    state["table_snapshot_received"] = True
     players = event.get("players") or []
     prior_dealt_in_seats = list(
         state.get("dealt_in_seats") or []
@@ -1183,7 +1756,15 @@ def handle_table_snapshot(state, event):
             seed_forced_blinds(state, canonical)
 
         state["canonical_snapshot_ready"] = True
-        canonical_save(canonical, state=state)
+
+        # Snapshot-first bootstrap plus every event already buffered behind it
+        # is one live-presentation transaction.
+        state["suppress_live_presentation"] = True
+
+        canonical_save(
+            canonical,
+            state=state,
+        )
 
         pending_events = []
 
@@ -1255,7 +1836,19 @@ def handle_table_snapshot(state, event):
         )
 
         for event_type, pending_event in pending_events:
-            if event_type == "stack_baseline_observation":
+            if event_type == "observer_acquisition":
+                state = handle_observer_acquisition(
+                    state,
+                    pending_event,
+                )
+
+                print(
+                    "[STATE] replayed buffered "
+                    "observer_acquisition",
+                    flush=True,
+                )
+
+            elif event_type == "stack_baseline_observation":
                 state = handle_stack_baseline_observation(
                     state,
                     pending_event,
@@ -1339,6 +1932,22 @@ def handle_table_snapshot(state, event):
                     flush=True,
                 )
                 break
+
+        # All buffered canonical mutations are now durable. Publish their
+        # aggregate live state exactly once.
+        state["suppress_live_presentation"] = False
+
+        if not state.get("hand_complete"):
+            refresh_live_presentation(
+                state
+            )
+
+        print(
+            "[STARTUP_PRESENTATION_COMMIT] "
+            "owner=table_snapshot "
+            f"buffered_events={len(pending_events)}",
+            flush=True,
+        )
 
     print("[STATE] table_snapshot", hero_position, f"players={len(players)}")
     return state
@@ -1575,7 +2184,15 @@ def handle_table_context(state, event):
         seed_forced_blinds(state, canonical)
 
         state["canonical_snapshot_ready"] = True
-        canonical_save(canonical)
+
+        # Fast local bootstrap remains immediate; only its presentation is
+        # transactional across events that already raced ahead of bootstrap.
+        state["suppress_live_presentation"] = True
+
+        canonical_save(
+            canonical,
+            state=state,
+        )
 
         print(
             "[CANONICAL_FAST_BOOTSTRAP] "
@@ -1588,6 +2205,13 @@ def handle_table_context(state, event):
         # Events that raced ahead of the local bootstrap can now be consumed
         # chronologically. This should normally be a very small queue.
         pending_events = []
+
+        for pending_event in list(
+            state.get("pending_observer_acquisition_events") or []
+        ):
+            pending_events.append(
+                ("observer_acquisition", dict(pending_event))
+            )
 
         for pending_event in list(
             state.get("pending_stack_baseline_observations") or []
@@ -1624,6 +2248,7 @@ def handle_table_context(state, event):
                 ("inferred_action", dict(pending_event))
             )
 
+        state["pending_observer_acquisition_events"] = []
         state["pending_stack_baseline_observations"] = []
         state["pending_stack_updates"] = []
         state["pending_pot_updates"] = []
@@ -1637,7 +2262,18 @@ def handle_table_context(state, event):
         )
 
         for event_type, pending_event in pending_events:
-            if event_type == "stack_baseline_observation":
+            if event_type == "observer_acquisition":
+                state = handle_observer_acquisition(
+                    state,
+                    pending_event,
+                )
+
+                print(
+                    "[STATE] replayed buffered observer_acquisition",
+                    flush=True,
+                )
+
+            elif event_type == "stack_baseline_observation":
                 state = handle_stack_baseline_observation(
                     state,
                     pending_event,
@@ -1662,6 +2298,46 @@ def handle_table_context(state, event):
                     state,
                     pending_event,
                 )
+
+        # Every event that was already waiting behind fast bootstrap has now
+        # mutated canonical state. Expose only the aggregate result.
+        state["suppress_live_presentation"] = False
+
+        if not state.get("hand_complete"):
+            refresh_live_presentation(
+                state
+            )
+
+        # The fast bootstrap itself is now visible. Keep subsequent passive
+        # asynchronous startup enrichment (initial pot / stack baseline)
+        # presentation-coalesced until table_snapshot supplies the deterministic
+        # roster/name enrichment boundary.
+        #
+        # Poker actions are unaffected: their direct publication paths use
+        # publication_intent="action" and bypass this suppression.
+        if (
+            not state.get("hand_complete")
+            and not state.get(
+                "table_snapshot_received"
+            )
+        ):
+            state[
+                "suppress_live_presentation"
+            ] = True
+
+            print(
+                "[STARTUP_ENRICHMENT_COALESCE_BEGIN] "
+                "owner=table_context "
+                "release=table_snapshot",
+                flush=True,
+            )
+
+        print(
+            "[STARTUP_PRESENTATION_COMMIT] "
+            "owner=table_context "
+            f"buffered_events={len(pending_events)}",
+            flush=True,
+        )
 
     print(
         "[STATE] table_context "
@@ -2331,6 +3007,112 @@ def release_pending_board_if_ready(state):
     )
 
 
+def handle_physical_street_boundary(
+    state,
+    event,
+):
+    """
+    Record locally observed physical street onset without advancing
+    authoritative canonical poker state.
+
+    Board-card identity and canonical phase remain owned by the
+    asynchronous confirmed board event.
+    """
+    if not isinstance(state, dict):
+        return state
+
+    if str(
+        state.get("phase") or "WAITING"
+    ).upper() == "WAITING":
+        return state
+
+    street = str(
+        event.get("street") or ""
+    ).upper()
+
+    try:
+        board_count = int(
+            event.get("board_count") or 0
+        )
+    except (TypeError, ValueError):
+        return state
+
+    expected_count = {
+        "FLOP": 3,
+        "TURN": 4,
+        "RIVER": 5,
+    }.get(street)
+
+    if (
+        expected_count is None
+        or board_count != expected_count
+    ):
+        return state
+
+    rank = {
+        "PREFLOP": 0,
+        "FLOP": 1,
+        "TURN": 2,
+        "RIVER": 3,
+    }
+
+    current_physical = str(
+        state.get("physical_street")
+        or state.get("phase")
+        or "PREFLOP"
+    ).upper()
+
+    # Physical chronology is monotonic. Duplicate or stale events
+    # are harmless and cannot move the physical street backward.
+    if (
+        rank.get(street, -1)
+        <= rank.get(current_physical, -1)
+    ):
+        return state
+
+    state["physical_street"] = street
+
+    pending = list(
+        state.get(
+            "pending_physical_street_boundaries"
+        )
+        or []
+    )
+
+    candidate = {
+        "street": street,
+        "board_count": board_count,
+        "ts": event.get("ts"),
+        "source": (
+            event.get("source")
+            or "local_board_count"
+        ),
+    }
+
+    if not any(
+        str(item.get("street") or "").upper()
+        == street
+        for item in pending
+        if isinstance(item, dict)
+    ):
+        pending.append(candidate)
+
+    state[
+        "pending_physical_street_boundaries"
+    ] = pending
+
+    print(
+        "[PHYSICAL_STREET_BOUNDARY] "
+        f"canonical={state.get('phase')} "
+        f"physical={street} "
+        f"board_count={board_count} "
+        f"source={candidate['source']}",
+        flush=True,
+    )
+
+    return state
+
+
 def handle_board(state, event):
     board = normalize_cards(event.get("board") or [])
     n = len(board)
@@ -2611,39 +3393,103 @@ def handle_hero_fold(state, event):
         )
         return state
 
-    already_recorded = any(
-        action.seat == canonical.hero_seat
-        and str(action.street or "").upper() == event_street
-        and action.action == "FOLD"
-        for action in canonical.actions
+    from src.state.action_timeline import (
+        find_action,
+        observe_action,
+        project_action_to_canonical,
     )
 
-    if not already_recorded:
-        added = canonical.add_action(
-            seat=canonical.hero_seat,
-            action="FOLD",
-            confidence=1.0,
-            source="hero_card_disappearance",
-            evidence=[
-                "hero_action_complete",
-                "hero_cards_cleared",
-            ],
-            ts=event.get("ts") or time.time(),
-        )
-        canonical_save(canonical, state=state)
+    hand_token = str(
+        state.get("hand_token")
+        or canonical.hand_id
+        or ""
+    )
 
-        print(
-            f"[CANONICAL_ACTION] {added.street} "
-            f"{added.seat} FOLD confidence=1.0"
+    fold_ts = float(
+        event.get("ts") or time.time()
+    )
+
+    # v0.16 SINGLE ACTION OWNERSHIP
+    #
+    # Hero-card disappearance is terminal physical evidence for Hero's
+    # voluntary FOLD, but semantic existence belongs to ActionTimeline.
+    # CanonicalHand is only a projection of that durable owner.
+    existing_owner = find_action(
+        state,
+        hand_token=hand_token,
+        street=event_street,
+        seat=canonical.hero_seat,
+    )
+
+    if existing_owner is not None:
+        existing_semantic = str(
+            existing_owner.get("action") or ""
+        ).upper()
+
+        if existing_semantic != "FOLD":
+            raise AssertionError(
+                "hero fold conflicts with existing "
+                "ActionTimeline owner: "
+                f"street={event_street} "
+                f"seat={canonical.hero_seat} "
+                f"existing={existing_semantic}"
+            )
+
+    state = observe_action(
+        state,
+        hand_token=hand_token,
+        street=event_street,
+        seat=canonical.hero_seat,
+        action="FOLD",
+        ts=fold_ts,
+        source="hero_card_disappearance",
+        confidence=1.0,
+        evidence=[
+            "hero_action_complete",
+            "hero_cards_cleared",
+        ],
+    )
+
+    projected = project_action_to_canonical(
+        state,
+        hand=canonical,
+        hand_token=hand_token,
+        street=event_street,
+        seat=canonical.hero_seat,
+    )
+
+    if projected is None:
+        raise AssertionError(
+            "hero fold ActionTimeline owner failed "
+            "canonical projection: "
+            f"street={event_street} "
+            f"seat={canonical.hero_seat}"
         )
 
-    # The fold has survived state/canonical street ownership checks above.
+    if str(projected.action or "").upper() != "FOLD":
+        raise AssertionError(
+            "hero fold canonical projection conflicts "
+            "with ActionTimeline owner: "
+            f"street={event_street} "
+            f"seat={canonical.hero_seat} "
+            f"projected={projected.action}"
+        )
+
+    canonical_save(canonical, state=state)
+
+    print(
+        f"[CANONICAL_ACTION_OWNER] "
+        f"{projected.street} "
+        f"{projected.seat} FOLD "
+        "owner=ActionTimeline confidence=1.0"
+    )
+
+    # The fold has survived state/canonical street ownership checks and
+    # successfully projected from its durable ActionTimeline owner.
     # Record that causal fact so a subsequent fold-derived hand_complete
     # cannot bypass canonical action acceptance.
     state["accepted_hero_fold_street"] = event_street
-    state["accepted_hero_fold_ts"] = float(
-        event.get("ts") or time.time()
-    )
+    state["accepted_hero_fold_ts"] = fold_ts
 
     state["hero_to_act"] = False
     state = record_timeline(
@@ -2707,16 +3553,17 @@ def physical_completion_stack_blocked(
     seat,
 ):
     """
-    Return True only when an unresolved stack candidate contains
-    independent commitment evidence strong enough to veto direct
-    physical actor-completion evidence.
+    Return True only when the same-seat stack candidate has already
+    established independent quantitative commitment ownership.
 
-    stack_motion alone is a visual-change hypothesis. It must not
-    indefinitely block calibrated opponent-card disappearance for
-    the current chronological actor.
+    Raw stack motion and raw bet-region appearance are perception
+    hypotheses. Neither may veto calibrated card disappearance for the
+    current chronological actor.
 
-    Bet-region evidence remains a blocker because it independently
-    supports chip commitment by this seat.
+    Once a stack transition has been quantitatively validated, however,
+    the candidate remains alive with awaiting_action=True until the
+    corresponding semantic action is consumed. That independently
+    validated commitment must veto contradictory fold completion.
     """
     street = str(street or "").upper()
     seat = str(seat or "")
@@ -2731,34 +3578,33 @@ def physical_completion_stack_blocked(
     if not candidate:
         return False
 
-    sources = {
-        str(source)
-        for source in (
-            candidate.get("sources")
-            or []
-        )
-        if source
-    }
+    awaiting_action = bool(
+        candidate.get("awaiting_action")
+    )
 
-    commitment_sources = {
-        "bet_region_appeared",
-        "bet_region_occupied",
-    }
+    resolved_reason = str(
+        candidate.get("resolved_reason")
+        or ""
+    )
 
-    blocked = bool(
-        sources & commitment_sources
+    validated_commitment = bool(
+        awaiting_action
+        and resolved_reason
+        == "validated_stack_transition"
     )
 
     print(
         "[PHYSICAL_STACK_ARBITRATION] "
         f"street={street} "
         f"seat={seat} "
-        f"sources={sorted(sources)} "
-        f"blocked={blocked}",
+        f"sources={sorted(candidate.get('sources') or [])} "
+        f"awaiting_action={awaiting_action} "
+        f"resolved_reason={resolved_reason or None} "
+        f"blocked={validated_commitment}",
         flush=True,
     )
 
-    return blocked
+    return validated_commitment
 
 
 def preserve_pending_actor_observation(
@@ -2924,6 +3770,122 @@ def handle_stack_candidate_opened(state, event):
     print(
         "[STACK_CANDIDATE_STATE] "
         f"opened seat={seat} street={street}",
+        flush=True,
+    )
+
+    return state
+
+
+def handle_stack_candidate_street_promoted(
+    state,
+    event,
+):
+    """
+    Atomically migrate an already-existing physical candidate from its
+    emerging-hand WAITING owner to the live betting street.
+
+    This handler never invents a candidate. The old owner must already
+    exist.
+    """
+    seat = str(
+        event.get("seat")
+        or ""
+    )
+
+    from_street = str(
+        event.get("from_street")
+        or ""
+    ).upper()
+
+    to_street = str(
+        event.get("to_street")
+        or ""
+    ).upper()
+
+    event_token = str(
+        event.get("hand_token")
+        or ""
+    )
+
+    current_token = str(
+        state.get("hand_token")
+        or ""
+    )
+
+    if (
+        event_token
+        and current_token
+        and event_token != current_token
+    ):
+        return state
+
+    if (
+        not seat
+        or not from_street
+        or not to_street
+        or from_street == to_street
+    ):
+        return state
+
+    candidates = dict(
+        state.get("unresolved_stack_candidates")
+        or {}
+    )
+
+    old_key = (
+        f"{from_street}:{seat}"
+    )
+
+    new_key = (
+        f"{to_street}:{seat}"
+    )
+
+    candidate = candidates.get(
+        old_key
+    )
+
+    # Migration cannot manufacture commitment ownership.
+    if not candidate:
+        print(
+            "[STACK_CANDIDATE_STATE_PROMOTION_SKIP] "
+            f"seat={seat} "
+            f"from={from_street} "
+            f"to={to_street} "
+            "reason=old_owner_missing",
+            flush=True,
+        )
+        return state
+
+    candidate = dict(candidate)
+
+    candidates.pop(
+        old_key,
+        None,
+    )
+
+    candidate["street"] = (
+        to_street
+    )
+
+    # Preserve original sources and onset timestamp.
+    if event.get("sources"):
+        candidate["sources"] = list(
+            event.get("sources")
+            or candidate.get("sources")
+            or []
+        )
+
+    candidates[new_key] = candidate
+
+    state[
+        "unresolved_stack_candidates"
+    ] = candidates
+
+    print(
+        "[STACK_CANDIDATE_STATE_PROMOTED] "
+        f"seat={seat} "
+        f"from={from_street} "
+        f"to={to_street}",
         flush=True,
     )
 
@@ -3128,9 +4090,82 @@ def handle_provisional_bet_opened(state, event):
 
     state = refresh_live_presentation(
         state
+,
+        publication_intent="action",
     )
 
     return state
+
+
+
+def handle_action_observation_rejected(
+    state,
+    event,
+):
+    """
+    Explicit contradictory evidence about an observed action.
+
+    This path owns rejection of action existence.
+
+    Stack failure, OCR failure, API failure, sizing failure and
+    provisional lifecycle closure have no authority to erase an
+    observed action.
+    """
+    from src.state.action_timeline import (
+        presentation_overlay,
+        reject_action,
+    )
+
+    hand_token = (
+        event.get("hand_token")
+        or state.get("hand_token")
+    )
+
+    street = str(
+        event.get("street") or ""
+    ).upper()
+
+    seat = str(
+        event.get("seat") or ""
+    )
+
+    if (
+        not hand_token
+        or not street
+        or not seat
+    ):
+        return state
+
+    state = reject_action(
+        state,
+        hand_token=hand_token,
+        street=street,
+        seat=seat,
+        reason=(
+            event.get("reason")
+            or "contradictory_physical_evidence"
+        ),
+        contradictory_evidence=True,
+        ts=event.get("ts"),
+    )
+
+    state = sync_live_commitment_projection(
+        state
+    )
+
+    print(
+        "[ACTION_TIMELINE_REJECTED] "
+        f"street={street} "
+        f"seat={seat} "
+        f"reason={event.get('reason')}",
+        flush=True,
+    )
+
+    return refresh_live_presentation(
+        state
+,
+        publication_intent="action",
+    )
 
 
 def handle_provisional_bet_closed(state, event):
@@ -3167,35 +4202,35 @@ def handle_provisional_bet_closed(state, event):
         "unresolved_provisional_bets"
     ] = blockers
 
-    # The low-latency TXT presentation is the presentation-only shadow
-    # of this same physical commitment lifecycle. Once the provisional
-    # owner closes, stale presentation ownership must close with it.
-    #
-    # Canonical action ownership, when present, remains authoritative
-    # and is unaffected by this retirement.
-    live_commitments = dict(
-        state.get("pending_live_commitments")
-        or {}
+    from src.state.action_timeline import (
+        presentation_overlay,
     )
 
-    if key:
-        retired = live_commitments.pop(
-            key,
-            None,
-        )
+    close_reason = str(
+        event.get("reason") or "resolved"
+    )
 
-        state[
-            "pending_live_commitments"
-        ] = live_commitments
+    # v0.16 ownership rule:
+    #
+    # provisional_bet_closed owns only the provisional/enrichment
+    # lifecycle. It does NOT own whether the physical action existed.
+    #
+    # "resolved", "corroborated", timeout, unavailable baseline and
+    # similar transport outcomes therefore cannot reject the durable
+    # observation. Rejection must come through an explicit
+    # contradictory-action event/path.
+    print(
+        "[ACTION_TIMELINE_PRESERVED] "
+        f"seat={seat} "
+        f"street={street} "
+        f"enrichment_close={close_reason}",
+        flush=True,
+    )
 
-        if retired is not None:
-            print(
-                "[LIVE_COMMITMENT_RETIRED] "
-                f"seat={seat} "
-                f"street={street} "
-                "reason=provisional_bet_closed",
-                flush=True,
-            )
+    # Compatibility cache is now derived from the owner.
+    state = sync_live_commitment_projection(
+        state
+    )
 
     print(
         "[PROVISIONAL_BET_STATE] "
@@ -3215,6 +4250,191 @@ def handle_provisional_bet_closed(state, event):
 
     state = refresh_live_presentation(
         state
+,
+        publication_intent="action",
+    )
+
+    return state
+
+
+def handle_observer_acquisition(
+    state,
+    event,
+):
+    """
+    Admit neutral same-hand observer-acquisition evidence.
+
+    The coordinator supplies only physical visible seats plus Hero ownership.
+    BettingRoundTracker alone translates that neutral visibility into the
+    legal chronology frontier.
+
+    If canonical bootstrap is not ready yet, preserve the event durably.
+    """
+    if not isinstance(state, dict):
+        return state
+
+    event_token = str(
+        event.get("hand_token") or ""
+    )
+
+    current_token = str(
+        state.get("hand_token") or ""
+    )
+
+    if (
+        event_token
+        and current_token
+        and event_token != current_token
+    ):
+        print(
+            "[OBSERVER_ACQUISITION_SKIP] "
+            f"reason=hand_token_mismatch "
+            f"event={event_token[:8]} "
+            f"current={current_token[:8]}",
+            flush=True,
+        )
+        return state
+
+    street = str(
+        event.get("street")
+        or state.get("phase")
+        or ""
+    ).upper()
+
+    if not street or street == "WAITING":
+        return state
+
+    if not state.get("canonical_snapshot_ready"):
+        pending = list(
+            state.get(
+                "pending_observer_acquisition_events"
+            )
+            or []
+        )
+
+        candidate = dict(event)
+
+        key = (
+            str(candidate.get("hand_token") or ""),
+            str(candidate.get("street") or "").upper(),
+        )
+
+        existing = {
+            (
+                str(item.get("hand_token") or ""),
+                str(item.get("street") or "").upper(),
+            )
+            for item in pending
+            if isinstance(item, dict)
+        }
+
+        if key not in existing:
+            pending.append(candidate)
+
+        pending.sort(
+            key=lambda item: float(
+                item.get("ts") or 0.0
+            )
+        )
+
+        state[
+            "pending_observer_acquisition_events"
+        ] = pending
+
+        print(
+            "[OBSERVER_ACQUISITION_BUFFER] "
+            f"street={street} "
+            f"visible={list(event.get('visible_seats') or [])} "
+            f"hero_owned={bool(event.get('hero_owned'))}",
+            flush=True,
+        )
+
+        return state
+
+    # Acquisition ownership is immutable once established.
+    #
+    # A later neutral visibility event may contain useful physical
+    # evidence, but it cannot move the chronology frontier forward
+    # past an actor that was already positively observed.
+    existing_frontier = state.get(
+        "observer_acquisition_frontier"
+    )
+
+    if isinstance(existing_frontier, dict) and existing_frontier:
+        existing_street = str(
+            existing_frontier.get("street") or ""
+        ).upper()
+
+        if existing_street == street:
+            print(
+                "[OBSERVER_ACQUISITION_ALREADY_OWNED] "
+                f"street={street} "
+                f"first_owned={existing_frontier.get('first_owned_seat')} "
+                f"visible={list(event.get('visible_seats') or [])} "
+                "reason=earliest_owned_frontier_wins",
+                flush=True,
+            )
+
+            return state
+
+    canonical = canonical_load()
+
+    canonical_street = str(
+        canonical.current_street or ""
+    ).upper()
+
+    if canonical_street != street:
+        print(
+            "[OBSERVER_ACQUISITION_SKIP] "
+            f"reason=street_mismatch "
+            f"event={street} "
+            f"canonical={canonical_street}",
+            flush=True,
+        )
+        return state
+
+    tracker = tracker_for_hand(canonical)
+
+    frontier = (
+        tracker
+        .establish_observer_acquisition_from_visible_seats(
+            street=street,
+            visible_seats=list(
+                event.get("visible_seats") or []
+            ),
+            hero_owned=bool(
+                event.get("hero_owned")
+            ),
+            ts=event.get("ts"),
+        )
+    )
+
+    if frontier is None:
+        print(
+            "[OBSERVER_ACQUISITION_NOOP] "
+            f"street={street} "
+            f"visible={list(event.get('visible_seats') or [])} "
+            f"hero_owned={bool(event.get('hero_owned'))}",
+            flush=True,
+        )
+        return state
+
+    canonical_save(
+        canonical,
+        state=state,
+    )
+
+    state[
+        "observer_acquisition_frontier"
+    ] = dict(frontier)
+
+    print(
+        "[OBSERVER_ACQUISITION_ADMITTED] "
+        f"street={street} "
+        f"first_owned={frontier.get('first_owned_seat')} "
+        f"pre_acquisition={frontier.get('pre_acquisition_seats')} "
+        f"owned_queue={frontier.get('owned_queue')}",
+        flush=True,
     )
 
     return state
@@ -3397,6 +4617,95 @@ def handle_actor_observed(
 
     tracker = tracker_for_hand(canonical)
 
+    # The earliest trustworthy same-hand actor evidence establishes
+    # chronology ownership when no acquisition frontier exists yet.
+    #
+    # This does NOT assign FOLD/CHECK/CALL/RAISE to predecessors.
+    # It only classifies the exact legal prefix before this actor as
+    # pre-acquisition UNKNOWN history.
+    actor_frontier_street = str(
+        event.get("street")
+        or canonical.current_street
+        or state.get("phase")
+        or ""
+    ).upper()
+
+    existing_frontier = state.get(
+        "observer_acquisition_frontier"
+    )
+
+    if not existing_frontier:
+        queue = list(
+            canonical.players_to_act
+            or []
+        )
+
+        actor_seat = str(
+            event.get("seat") or ""
+        )
+
+        if actor_seat in queue:
+            actor_index = queue.index(
+                actor_seat
+            )
+
+            pre_acquisition_seats = queue[
+                :actor_index
+            ]
+
+            # A later actor may establish where observation began only
+            # across seats for which we own NO contrary same-hand evidence.
+            #
+            # An unresolved stack/provisional commitment belonging to an
+            # earlier seat proves that seat is already inside our observed
+            # chronology. It must never be reclassified as pre-acquisition
+            # merely because a later actor becomes visible.
+            owned_predecessor_blockers = [
+                predecessor
+                for predecessor in pre_acquisition_seats
+                if predecessor in blocked_seats
+            ]
+
+            if owned_predecessor_blockers:
+                print(
+                    "[OBSERVER_ACQUISITION_FROM_ACTOR_DEFER] "
+                    f"street={actor_frontier_street} "
+                    f"actor={actor_seat} "
+                    f"owned_predecessor_blockers="
+                    f"{owned_predecessor_blockers} "
+                    "reason=cannot_cross_owned_unresolved_evidence",
+                    flush=True,
+                )
+
+            else:
+                frontier = (
+                    tracker
+                    .establish_observer_acquisition_frontier(
+                        street=actor_frontier_street,
+                        first_owned_seat=actor_seat,
+                        pre_acquisition_seats=pre_acquisition_seats,
+                        ts=event.get("ts"),
+                    )
+                )
+
+                state[
+                    "observer_acquisition_frontier"
+                ] = dict(frontier)
+
+                canonical_save(
+                    canonical,
+                    state=state,
+                )
+
+                print(
+                    "[OBSERVER_ACQUISITION_FROM_ACTOR] "
+                    f"street={actor_frontier_street} "
+                    f"first_owned={actor_seat} "
+                    f"pre_acquisition={pre_acquisition_seats} "
+                    f"owned_queue={frontier.get('owned_queue')}",
+                    flush=True,
+                )
+
     queue_before = list(
         canonical.players_to_act or []
     )
@@ -3419,6 +4728,15 @@ def handle_actor_observed(
         if skipped_seat in blocked_seats
     ]
 
+    # v0.16 NO PREDECESSOR ACTION AUTHORING
+    #
+    # Observing a later actor establishes evidence only for that observed
+    # actor. It may not create CHECK/FOLD/CALL/BET/RAISE semantics for an
+    # earlier unresolved seat.
+    #
+    # Earlier obligations remain unresolved until evidence belonging to
+    # that same seat resolves them.
+
     added = tracker.advance_to_observed_actor(
         seat,
         ts=event.get("ts") or time.time(),
@@ -3427,9 +4745,57 @@ def handle_actor_observed(
 
     if (
         not added
-        and blocking_gap
+        and (blocking_gap or skipped_before)
         and preserve_if_blocked
     ):
+        # Chronology and physical action existence are separate concerns.
+        #
+        # A later actor may visibly commit chips while an earlier actor is
+        # still awaiting quantitative settlement. The unresolved predecessor
+        # must continue to block canonical chronology, but it must not erase
+        # directly observed physical action by this seat.
+        #
+        # Record only generic COMMITMENT here. Canonical betting context may
+        # still be stale while the predecessor is unresolved, so CALL/RAISE
+        # classification and sizing remain later refinement.
+        if (
+            event.get("commitment_visible")
+            and str(event.get("source") or "")
+            == "bet_region_appeared"
+        ):
+            if seat == "hero":
+                state = (
+                    record_blocked_hero_physical_commitment(
+                        state,
+                        event,
+                    )
+                )
+
+                print(
+                    "[BLOCKED_HERO_COMMITMENT_PRESENTED] "
+                    f"street={event_street} "
+                    f"seat={seat} "
+                    f"blocked={blocking_gap}",
+                    flush=True,
+                )
+            else:
+                state = (
+                    record_blocked_opponent_physical_commitment(
+                        state,
+                        event,
+                    )
+                )
+
+                print(
+                    "[BLOCKED_OPPONENT_COMMITMENT_PRESENTED] "
+                    f"street={event_street} "
+                    f"seat={seat} "
+                    f"blocked={blocking_gap} "
+                    "action=COMMITMENT "
+                    "owner=ActionTimeline",
+                    flush=True,
+                )
+
         state = preserve_pending_actor_observation(
             state,
             event,
@@ -3445,10 +4811,138 @@ def handle_actor_observed(
 
         return state
 
+    # v0.16 SINGLE ACTION / CHRONOLOGY OWNERSHIP
+    #
+    # advance_to_observed_actor() may legitimately move the canonical
+    # action cursor without manufacturing any predecessor actions.
+    #
+    # First live synchronization is the important case: the tracker
+    # changes canonical.players_to_act but deliberately returns [].
+    #
+    # Persist that chronology mutation before any downstream helper
+    # reloads CanonicalHand from storage. Otherwise the tracker sees the
+    # synchronized actor while record_physical_live_commitment() reloads
+    # the stale predecessor queue and rejects the real physical action.
+    queue_after = list(
+        canonical.players_to_act or []
+    )
+
+    chronology_changed = (
+        queue_after != queue_before
+    )
+
+    if chronology_changed and not added:
+        canonical_save(
+            canonical,
+            state=state,
+        )
+
+        write_betting_round_status(
+            tracker,
+            canonical,
+            state,
+        )
+
+        print(
+            "[ACTOR_CHRONOLOGY_SYNC_PERSISTED] "
+            f"street={event_street} "
+            f"actor={seat} "
+            f"before={queue_before} "
+            f"after={queue_after}",
+            flush=True,
+        )
+
+    # Physical presentation is owned by chronology admission, not by whether
+    # advance_to_observed_actor() happened to manufacture predecessor actions.
+    #
+    # The important first-live/future-street case legitimately advances the
+    # canonical cursor while returning added == []. Once that synchronization
+    # has been persisted, buffered independent quantitative evidence for this
+    # same opponent corroborates that the physical commitment is real.
+    #
+    # Refine the existing ActionTimeline COMMITMENT to an unsized BET and
+    # publish it before quantitative settlement adds sizing.
+    actor_admitted = bool(
+        queue_after
+        and queue_after[0] == seat
+    )
+
+    if (
+        actor_admitted
+        and seat != "hero"
+        and event.get("commitment_visible")
+        and str(event.get("source") or "")
+        == "bet_region_appeared"
+    ):
+        matching_quantitative = any(
+            str(item.get("street") or "").upper()
+            == event_street
+            and str(item.get("seat") or "") == seat
+            and str(item.get("action") or "").upper()
+            in {"BET", "BET_OR_RAISE", "RAISE"}
+            for item in (
+                state.get("pending_inferred_actions")
+                or []
+            )
+            if isinstance(item, dict)
+        )
+
+        if matching_quantitative:
+            from src.state.action_timeline import (
+                find_action,
+                refine_action,
+            )
+
+            owner = find_action(
+                state,
+                hand_token=state.get("hand_token"),
+                street=event_street,
+                seat=seat,
+            )
+
+            if owner is not None:
+                state = refine_action(
+                    state,
+                    hand_token=state.get("hand_token"),
+                    street=event_street,
+                    seat=seat,
+                    action="BET",
+                    ts=event.get("ts") or time.time(),
+                    source="physical_plus_buffered_quantitative",
+                    evidence=[
+                        "bet_region_appeared",
+                        "buffered_quantitative_action",
+                    ],
+                    confirmed=False,
+                )
+
+                state = sync_live_commitment_projection(
+                    state
+                )
+
+                state = refresh_live_presentation(
+                    state
+,
+                    publication_intent="action",
+                )
+
+                print(
+                    "[LIVE_CORROBORATED_COMMITMENT_PRESENTED] "
+                    f"street={event_street} "
+                    f"seat={seat} "
+                    "action=BET "
+                    "sizing=pending",
+                    flush=True,
+                )
+
     if added:
         canonical_save(canonical, state=state)
 
         for action in added:
+            state = refine_action_timeline_from_canonical(
+                state,
+                action,
+            )
             print(
                 "[CANONICAL_ACTION_ORDER] "
                 f"{action.street} "
@@ -3742,42 +5236,150 @@ def handle_physical_actor_completed(
         canonical
     )
 
-    added = (
-        tracker.resolve_physically_completed_actor(
-            seat,
-            ts=event.get("ts") or time.time(),
-        )
+    # v0.16 DIRECT PHYSICAL ACTION OWNERSHIP
+    #
+    # Reaching this point proves:
+    #   - this exact seat is the current canonical queue head;
+    #   - the calibrated same-seat cards physically disappeared;
+    #   - no independently validated quantitative commitment vetoes it.
+    #
+    # This is direct evidence about the current actor. It is fundamentally
+    # different from observing a later actor and trying to infer what skipped
+    # predecessors did.
+    #
+    # ActionTimeline owns action existence. The tracker owns only derived
+    # betting obligations, and CanonicalHand is a projection.
+    if event_street == "PREFLOP":
+        semantic_action = "FOLD"
+    elif (
+        tracker.has_open_bet
+        or float(canonical.current_bet_bb or 0.0) > 0.0
+    ):
+        semantic_action = "FOLD"
+    else:
+        semantic_action = "CHECK"
+
+    from src.state.action_timeline import (
+        find_action,
+        observe_action,
+        project_action_to_canonical,
     )
 
-    if not added:
-        if preserve_if_blocked:
-            state = preserve_physical_actor_completion(
-                state,
-                event,
+    hand_token = str(
+        state.get("hand_token")
+        or canonical.hand_id
+        or ""
+    )
+
+    existing_owner = find_action(
+        state,
+        hand_token=hand_token,
+        street=event_street,
+        seat=seat,
+    )
+
+    if existing_owner is not None:
+        existing_semantic = str(
+            existing_owner.get("action") or ""
+        ).upper()
+
+        if (
+            existing_owner.get("status")
+            in {"OBSERVED", "CONFIRMED", "REFINED"}
+            and existing_semantic
+            and existing_semantic != semantic_action
+        ):
+            # Contradictory durable action evidence already owns this seat.
+            # Do not overwrite it with physical completion.
+            if preserve_if_blocked:
+                state = preserve_physical_actor_completion(
+                    state,
+                    event,
+                )
+
+            print(
+                "[PHYSICAL_ACTOR_PENDING] "
+                f"street={event_street} "
+                f"seat={seat} "
+                f"existing={existing_semantic} "
+                "reason=conflicting_durable_action_owner",
+                flush=True,
             )
-        return state
+            return state
+
+    completion_ts = float(
+        event.get("ts") or time.time()
+    )
+
+    state = observe_action(
+        state,
+        hand_token=hand_token,
+        street=event_street,
+        seat=seat,
+        action=semantic_action,
+        ts=completion_ts,
+        source=(
+            event.get("source")
+            or "opponent_card_disappearance"
+        ),
+        confidence=1.0,
+        evidence=list(
+            event.get("evidence") or []
+        ) + [
+            "current_actor_physical_completion",
+        ],
+    )
+
+    projected = project_action_to_canonical(
+        state,
+        hand=canonical,
+        hand_token=hand_token,
+        street=event_street,
+        seat=seat,
+    )
+
+    if projected is None:
+        raise AssertionError(
+            "direct physical ActionTimeline owner failed "
+            "canonical projection: "
+            f"street={event_street} seat={seat}"
+        )
+
+    # Project the already-established action into chronology and betting
+    # obligations.
+    #
+    # ActionTimeline owns whether the action happened. CanonicalHand's
+    # players_to_act queue is only the derived chronological projection of
+    # that established action.
+    #
+    # This handler admitted physical completion only because this exact seat
+    # was the canonical queue head above. Therefore consume exactly that head;
+    # never skip or manufacture predecessor actions here.
+    tracker.consume_owned_action_obligation(
+        seat
+    )
 
     canonical_save(
         canonical,
         state=state,
     )
 
-    for action in added:
-        print(
-            "[CANONICAL_PHYSICAL_ACTION] "
-            f"{action.street} "
-            f"{action.seat} "
-            f"{action.action}",
-            flush=True,
-        )
+    print(
+        "[CANONICAL_PHYSICAL_ACTION_OWNER] "
+        f"{projected.street} "
+        f"{projected.seat} "
+        f"{projected.action} "
+        "owner=ActionTimeline",
+        flush=True,
+    )
 
-        state = record_timeline(
-            state,
-            "physical_action "
-            f"{action.street} "
-            f"{action.seat} "
-            f"{action.action}",
-        )
+    state = record_timeline(
+        state,
+        "physical_action "
+        f"{projected.street} "
+        f"{projected.seat} "
+        f"{projected.action}",
+    )
 
     write_betting_round_status(
         tracker,
@@ -4174,7 +5776,331 @@ def handle_inferred_action(state, event):
 
         return state
 
-    added = tracker.ingest(tracker_event)
+    # v0.16 SINGLE ACTION OWNERSHIP
+    #
+    # Quantitative evidence resolves semantics and sizing, but does
+    # not own whether the action exists. ActionTimeline is the durable
+    # owner. CanonicalHand and BettingRoundTracker are projections of
+    # that owner.
+    resolution = tracker.resolve_inferred_action(
+        tracker_event
+    )
+
+    if not resolution.get("resolved"):
+        reason = str(
+            resolution.get("reason")
+            or "unresolved inferred action"
+        )
+
+        print(
+            f"[CANONICAL_SKIP] {event.get('street')} "
+            f"{event.get('seat')} {event.get('action')} "
+            f"reason={reason}"
+        )
+
+        if (
+            reason
+            == "earlier actors remain unresolved"
+        ):
+            # Diagnostic only: persist the resolver's semantic candidate so
+            # replay validation can verify classification without granting
+            # ActionTimeline, canonical, or chronology authority.
+            diagnostics = list(
+                state.get(
+                    "deferred_quantitative_resolutions"
+                )
+                or []
+            )
+
+            diagnostics.append(
+                {
+                    "street": resolution.get(
+                        "street"
+                    ),
+                    "seat": resolution.get(
+                        "seat"
+                    ),
+                    "raw_action": resolution.get(
+                        "raw_action"
+                    ),
+                    "candidate_action": resolution.get(
+                        "action"
+                    ),
+                    "reason": resolution.get(
+                        "reason"
+                    ),
+                    "earlier_seats": list(
+                        resolution.get(
+                            "earlier_seats"
+                        )
+                        or []
+                    ),
+                    "event_delta_bb": (
+                        (
+                            event.get(
+                                "measurements"
+                            )
+                            or {}
+                        ).get(
+                            "stack_change"
+                        )
+                        or {}
+                    ).get(
+                        "delta_bb"
+                    ),
+                }
+            )
+
+            state[
+                "deferred_quantitative_resolutions"
+            ] = diagnostics[-100:]
+
+            # ActionTimeline already owns whether an observed physical
+            # action exists. A correctly priced quantitative resolution may
+            # enrich that SAME owner while canonical chronology remains
+            # blocked.
+            #
+            # This branch must never create a new owner or project to
+            # CanonicalHand.
+            from src.state.action_timeline import (
+                find_action,
+                refine_action,
+            )
+
+            semantic_street = str(
+                resolution.get("street")
+                or action_street
+                or ""
+            ).upper()
+
+            semantic_seat = str(
+                resolution.get("seat")
+                or seat
+                or ""
+            )
+
+            hand_token = str(
+                state.get("hand_token")
+                or canonical.hand_id
+                or ""
+            )
+
+            existing_owner = find_action(
+                state,
+                hand_token=hand_token,
+                street=semantic_street,
+                seat=semantic_seat,
+            )
+
+            if existing_owner is not None:
+                candidate_action = str(
+                    resolution.get("action")
+                    or ""
+                ).upper()
+
+                if candidate_action in {
+                    "BET",
+                    "RAISE",
+                    "CALL",
+                    "CHECK",
+                    "FOLD",
+                }:
+                    state = refine_action(
+                        state,
+                        hand_token=hand_token,
+                        street=semantic_street,
+                        seat=semantic_seat,
+                        action=candidate_action,
+                        amount_bb=resolution.get(
+                            "amount_bb"
+                        ),
+                        raise_to_bb=resolution.get(
+                            "raise_to_bb"
+                        ),
+                        ts=resolution.get("ts"),
+                        source="settled_stack_transition",
+                        confidence=resolution.get(
+                            "confidence"
+                        ),
+                        evidence=list(
+                            resolution.get(
+                                "evidence"
+                            )
+                            or []
+                        ) + [
+                            "quantitative_resolution",
+                            "chronology_pending",
+                        ],
+                        confirmed=True,
+                    )
+
+                    sync_live_commitment_projection(
+                        state
+                    )
+
+                    refresh_live_presentation(
+                        state
+,
+                        publication_intent="action",
+                    )
+
+                    print(
+                        "[DEFERRED_OWNER_REFINED] "
+                        f"street={semantic_street} "
+                        f"seat={semantic_seat} "
+                        f"action={candidate_action} "
+                        f"amount={resolution.get('amount_bb')} "
+                        f"raise_to={resolution.get('raise_to_bb')} "
+                        "canonical=no chronology=pending",
+                        flush=True,
+                    )
+
+            state = preserve_pending_inferred_action(
+                state,
+                event,
+            )
+
+            print(
+                "[BUFFER] deferred inferred_action "
+                f"seat={event.get('seat')} "
+                f"action={event.get('action')}",
+                flush=True,
+            )
+
+        status = write_betting_round_status(
+            tracker,
+            canonical,
+            state,
+        )
+
+        print(
+            f"[BETTING_STATUS] street={status['street']} "
+            f"complete={status['complete']} "
+            f"owing={status['players_owing_action']}",
+            flush=True,
+        )
+
+        return state
+
+    from src.state.action_timeline import (
+        find_action,
+        project_action_to_canonical,
+        refine_action,
+    )
+
+    hand_token = str(
+        state.get("hand_token")
+        or canonical.hand_id
+        or ""
+    )
+
+    resolution_street = str(
+        resolution.get("street")
+        or action_street
+        or ""
+    ).upper()
+
+    resolution_seat = str(
+        resolution.get("seat")
+        or seat
+        or ""
+    )
+
+    existing_owner = find_action(
+        state,
+        hand_token=hand_token,
+        street=resolution_street,
+        seat=resolution_seat,
+    )
+
+    # Quantitative settlement is enrichment only. It cannot create
+    # action existence when no physical/durable owner was observed.
+    if existing_owner is None:
+        state = preserve_pending_inferred_action(
+            state,
+            event,
+        )
+
+        print(
+            "[QUANTITATIVE_ACTION_DEFERRED] "
+            f"street={resolution_street} "
+            f"seat={resolution_seat} "
+            "reason=no_durable_action_owner",
+            flush=True,
+        )
+
+        status = write_betting_round_status(
+            tracker,
+            canonical,
+            state,
+        )
+
+        print(
+            f"[BETTING_STATUS] street={status['street']} "
+            f"complete={status['complete']} "
+            f"owing={status['players_owing_action']}",
+            flush=True,
+        )
+
+        return state
+
+    state = refine_action(
+        state,
+        hand_token=hand_token,
+        street=resolution_street,
+        seat=resolution_seat,
+        action=resolution.get("action"),
+        amount_bb=resolution.get("amount_bb"),
+        raise_to_bb=resolution.get("raise_to_bb"),
+        ts=resolution.get("ts"),
+        source="settled_stack_transition",
+        confidence=resolution.get("confidence"),
+        evidence=list(
+            resolution.get("evidence")
+            or []
+        ) + [
+            "quantitative_resolution",
+        ],
+        confirmed=True,
+    )
+
+    added = project_action_to_canonical(
+        state,
+        hand=canonical,
+        hand_token=hand_token,
+        street=resolution_street,
+        seat=resolution_seat,
+    )
+
+    if added is None:
+        raise AssertionError(
+            "quantitative ActionTimeline owner failed "
+            "canonical projection: "
+            f"street={resolution_street} "
+            f"seat={resolution_seat}"
+        )
+
+    if (
+        str(added.action or "").upper()
+        != str(
+            resolution.get("action")
+            or ""
+        ).upper()
+    ):
+        raise AssertionError(
+            "quantitative canonical projection conflicts "
+            "with ActionTimeline resolution: "
+            f"street={resolution_street} "
+            f"seat={resolution_seat} "
+            f"projected={added.action} "
+            f"resolved={resolution.get('action')}"
+        )
+
+    added = tracker.apply_resolved_action(
+        inferred_action=tracker_event,
+        resolution=resolution,
+        canonical=added,
+    )
 
     status = write_betting_round_status(
         tracker,
@@ -4188,32 +6114,6 @@ def handle_inferred_action(state, event):
         f"owing={status['players_owing_action']}",
         flush=True,
     )
-
-    decision = tracker.decisions[-1] if tracker.decisions else None
-
-    if added is None:
-        if decision is not None:
-            print(
-                f"[CANONICAL_SKIP] {event.get('street')} "
-                f"{event.get('seat')} {event.get('action')} "
-                f"reason={decision.reason}"
-            )
-
-            # Deferred actions remain pending for replay.
-            if "deferred" in decision.reason.lower():
-                state = preserve_pending_inferred_action(
-                    state,
-                    event,
-                )
-
-                print(
-                    "[BUFFER] deferred inferred_action "
-                    f"seat={event.get('seat')} "
-                    f"action={event.get('action')}",
-                    flush=True,
-                )
-
-        return state
 
     canonical_save(canonical, state=state)
 
@@ -4919,46 +6819,126 @@ def reconcile_preserved_inferred_actions(
         )
         return state, False
 
-    # Historical actions already present are never duplicated.
-    existing = {
-        (
-            str(action.street or "").upper(),
-            action.seat,
-            action.action,
-        )
-        for action in canonical.actions
-    }
+    # v0.16 SINGLE ACTION OWNERSHIP
+    #
+    # The pure preserved-action reconciler determines the historical
+    # semantic sequence. ActionTimeline owns existence/identity for every
+    # voluntary action; CanonicalHand is only a projection of those owners.
+    from src.state.action_timeline import (
+        find_action,
+        observe_action,
+        project_action_to_canonical,
+        refine_action,
+    )
 
     added = []
 
     for item in reconciliation.actions:
-        identity = (
-            street,
-            item["seat"],
-            item["action"],
+        seat = str(item.get("seat") or "")
+        semantic_action = str(
+            item.get("action") or ""
+        ).upper()
+
+        existing_owner = find_action(
+            state,
+            hand_token=hand_token,
+            street=street,
+            seat=seat,
         )
 
-        if identity in existing:
-            continue
+        if existing_owner is not None:
+            existing_semantic = str(
+                existing_owner.get("action") or ""
+            ).upper()
 
-        action = canonical.add_boundary_action(
+            if (
+                existing_owner.get("status")
+                in {
+                    "OBSERVED",
+                    "CONFIRMED",
+                    "REFINED",
+                }
+                and existing_semantic
+                and existing_semantic
+                != semantic_action
+            ):
+                raise AssertionError(
+                    "preserved reconciliation conflicts "
+                    "with existing ActionTimeline owner: "
+                    f"street={street} "
+                    f"seat={seat} "
+                    f"existing={existing_semantic} "
+                    f"resolved={semantic_action}"
+                )
+
+        state = observe_action(
+            state,
+            hand_token=hand_token,
             street=street,
-            seat=item["seat"],
-            action=item["action"],
+            seat=seat,
+            action=semantic_action,
+            ts=item.get("ts"),
+            source=(
+                item.get("source")
+                or "preserved_preflop_reconciliation"
+            ),
+            confidence=item.get("confidence"),
+            evidence=item.get("evidence"),
+        )
+
+        state = refine_action(
+            state,
+            hand_token=hand_token,
+            street=street,
+            seat=seat,
+            action=semantic_action,
             amount_bb=item.get("amount_bb"),
             raise_to_bb=item.get("raise_to_bb"),
-            confidence=item.get("confidence"),
-            source=item.get("source"),
-            evidence=item.get("evidence"),
             ts=item.get("ts"),
+            source=(
+                item.get("source")
+                or "preserved_preflop_reconciliation"
+            ),
+            confidence=item.get("confidence"),
+            evidence=item.get("evidence"),
+            confirmed=True,
         )
 
-        existing.add(identity)
+        projected_action = (
+            project_action_to_canonical(
+                state,
+                hand=canonical,
+                hand_token=hand_token,
+                street=street,
+                seat=seat,
+            )
+        )
+
+        if projected_action is None:
+            raise AssertionError(
+                "preserved action owner failed "
+                "canonical projection: "
+                f"street={street} "
+                f"seat={seat}"
+            )
+
+        if (
+            str(projected_action.action).upper()
+            != semantic_action
+        ):
+            raise AssertionError(
+                "canonical projection conflicts with "
+                "preserved action owner: "
+                f"street={street} "
+                f"seat={seat} "
+                f"projected={projected_action.action} "
+                f"owner={semantic_action}"
+            )
 
         added.append(
             (
-                action.seat,
-                action.action,
+                projected_action.seat,
+                projected_action.action,
             )
         )
 
@@ -5398,6 +7378,62 @@ def resolve_silent_boundary_obligations(
 
         seat = owing[0]
 
+        # v0.16 SINGLE ACTION OWNERSHIP
+        #
+        # ActionTimeline is the durable owner of whether this seat
+        # already performed a voluntary action on this street.
+        #
+        # Boundary recovery may infer a passive action only when no
+        # durable action owner exists. If an owner already exists,
+        # synchronize the legacy betting tracker from that fact rather
+        # than authoring a competing CHECK/FOLD in CanonicalHand.
+        from src.state.action_timeline import (
+            find_action,
+        )
+
+        owned_action = find_action(
+            state,
+            hand_token=state.get("hand_token"),
+            street=street,
+            seat=seat,
+        )
+
+        if (
+            owned_action is not None
+            and owned_action.get("status")
+            in {
+                "OBSERVED",
+                "CONFIRMED",
+                "REFINED",
+            }
+        ):
+            # Project the durable action owner into derived betting
+            # obligations through the single tracker gateway.
+            tracker.commitment_tracker.consume_observed_action(
+                street,
+                seat,
+            )
+
+            state = record_timeline(
+                state,
+                "boundary_action_owner_sync "
+                f"{street} {seat} "
+                f"{owned_action.get('action')}",
+            )
+
+            print(
+                "[BOUNDARY_ACTION_OWNER_SYNC] "
+                f"street={street} "
+                f"seat={seat} "
+                f"action={owned_action.get('action')} "
+                "reason=durable_action_already_exists",
+                flush=True,
+            )
+
+            # Continue because another seat may still legitimately
+            # require passive boundary recovery.
+            continue
+
         # An explicit boundary observation that failed to classify an action
         # remains authoritative ambiguity during the ordinary boundary pass.
         #
@@ -5451,9 +7487,9 @@ def resolve_silent_boundary_obligations(
         )
 
         if betting_open:
-            action = "FOLD"
+            semantic_action = "FOLD"
         elif street != "PREFLOP":
-            action = "CHECK"
+            semantic_action = "CHECK"
         else:
             print(
                 "[BOUNDARY_PASSIVE_BLOCK] "
@@ -5464,58 +7500,72 @@ def resolve_silent_boundary_obligations(
             )
             break
 
-        added = canonical.add_boundary_action(
+        from src.state.action_timeline import (
+            observe_action,
+            project_action_to_canonical,
+        )
+
+        # v0.16 SINGLE ACTION OWNERSHIP
+        #
+        # A confirmed next-street boundary may uniquely establish
+        # a previously silent CHECK/FOLD.  The inference creates
+        # semantic existence only through ActionTimeline; tracker
+        # and CanonicalHand are projections of that durable owner.
+        state = observe_action(
+            state,
+            hand_token=state.get("hand_token"),
             street=street,
             seat=seat,
-            action=action,
-            amount_bb=None,
-            raise_to_bb=None,
-            confidence=0.90,
+            action=semantic_action,
+            ts=None,
             source="board_boundary_action_order",
+            confidence=0.90,
             evidence=[
                 "confirmed_next_street",
                 "still_owed_action_at_boundary",
                 "no_conflicting_commitment_evidence",
             ],
-            ts=None,
         )
 
-        if betting_open:
-            tracker.commitment_tracker.record_response(
-                street,
-                seat,
-            )
-        else:
-            tracker.commitment_tracker.consume_pending_action(
-                street,
-                seat,
-            )
-
-        tracker.commitment_tracker.record_action(
+        tracker.commitment_tracker.consume_observed_action(
             street,
             seat,
         )
 
+        projected_action = project_action_to_canonical(
+            state,
+            hand=canonical,
+            hand_token=state.get("hand_token"),
+            street=street,
+            seat=seat,
+        )
+
+        if projected_action is None:
+            raise AssertionError(
+                "silent boundary action owner failed "
+                "canonical projection"
+            )
+
         resolved.append(
             {
                 "seat": seat,
-                "action": action,
-                "sequence": added.sequence,
+                "action": semantic_action,
+                "sequence": projected_action.sequence,
             }
         )
 
         state = record_timeline(
             state,
             "boundary_passive_action "
-            f"{street} {seat} {action}",
+            f"{street} {seat} {semantic_action}",
         )
 
         print(
             "[BOUNDARY_PASSIVE_ACTION] "
             f"street={street} "
             f"seat={seat} "
-            f"action={action} "
-            f"sequence={added.sequence}",
+            f"action={semantic_action} "
+            f"sequence={projected_action.sequence}",
             flush=True,
         )
 
@@ -5835,7 +7885,63 @@ def handle_boundary_stack_result(
 
             continue
 
-        promotion = promote_boundary_observation(
+        # v0.16 SINGLE ACTION OWNERSHIP
+        #
+        # Boundary stack evidence is retrospective enrichment/recovery.
+        # It may establish a missing action, but it may not author a
+        # competing semantic action when ActionTimeline already owns this
+        # (hand, street, seat).
+        from src.state.action_timeline import (
+            find_action,
+        )
+
+        owned_action = find_action(
+            state,
+            hand_token=state.get("hand_token"),
+            street=old_street,
+            seat=seat,
+        )
+
+        if (
+            owned_action is not None
+            and owned_action.get("status")
+            in {
+                "OBSERVED",
+                "CONFIRMED",
+                "REFINED",
+            }
+        ):
+            # Project the durable action owner into derived betting
+            # obligations through the single tracker gateway. Boundary
+            # evidence has no independent semantic-authoring authority.
+            tracker.commitment_tracker.consume_observed_action(
+                old_street,
+                seat,
+            )
+
+            state = record_timeline(
+                state,
+                "boundary_result_owner_sync "
+                f"{old_street} {seat} "
+                f"{owned_action.get('action')}",
+            )
+
+            print(
+                "[BOUNDARY_RESULT_OWNER_SYNC] "
+                f"street={old_street} "
+                f"seat={seat} "
+                f"action={owned_action.get('action')} "
+                "reason=durable_action_already_exists",
+                flush=True,
+            )
+
+            # The observation remains preserved by
+            # preserve_boundary_evidence() above. It may participate in
+            # later enrichment, but it has no independent action-authoring
+            # authority.
+            continue
+
+        resolution = resolve_boundary_observation(
             hand=canonical,
             commitment_tracker=(
                 tracker.commitment_tracker
@@ -5845,25 +7951,104 @@ def handle_boundary_stack_result(
             observation=observation,
         )
 
-        if promotion.resolved:
-            promoted.append(
-                promotion.to_dict()
+        if resolution.resolved:
+            from src.state.action_timeline import (
+                observe_action,
+                project_action_to_canonical,
+                refine_action,
             )
+
+            # Boundary evidence may establish a previously missing
+            # action owner, but semantic existence is created only
+            # through ActionTimeline.
+            state = observe_action(
+                state,
+                hand_token=state.get("hand_token"),
+                street=old_street,
+                seat=seat,
+                action=resolution.action,
+                ts=observation.get("frame_ts"),
+                source="boundary_stack_resolution",
+                confidence=resolution.confidence,
+                evidence=[
+                    "trusted_terminal_stack",
+                    "preserved_action_obligation",
+                    (
+                        observation.get("mode")
+                        or "unknown_stack_read"
+                    ),
+                ],
+            )
+
+            # Quantitative boundary resolution is authoritative
+            # enrichment of that same owner, never a second owner.
+            state = refine_action(
+                state,
+                hand_token=state.get("hand_token"),
+                street=old_street,
+                seat=seat,
+                action=resolution.action,
+                amount_bb=resolution.amount_bb,
+                raise_to_bb=resolution.raise_to_bb,
+                ts=observation.get("frame_ts"),
+                source="boundary_stack_resolution",
+                confidence=resolution.confidence,
+                evidence=[
+                    "trusted_terminal_stack",
+                    "preserved_action_obligation",
+                    (
+                        observation.get("mode")
+                        or "unknown_stack_read"
+                    ),
+                ],
+                confirmed=True,
+            )
+
+            # Tracker state is a projection of the durable owner.
+            tracker.commitment_tracker.consume_observed_action(
+                old_street,
+                seat,
+            )
+
+            # Canonical chronology is also a projection of that
+            # same durable owner.
+            action = project_action_to_canonical(
+                state,
+                hand=canonical,
+                hand_token=state.get("hand_token"),
+                street=old_street,
+                seat=seat,
+            )
+
+            if action is None:
+                raise AssertionError(
+                    "resolved boundary action owner failed "
+                    "canonical projection"
+                )
+
+            promoted.append({
+                "street": old_street,
+                "seat": seat,
+                "resolved": True,
+                "action": action.action,
+                "reason": resolution.reason,
+                "canonical_sequence": action.sequence,
+            })
 
             state = record_timeline(
                 state,
                 "boundary_action "
                 f"{old_street} "
                 f"{seat} "
-                f"{promotion.action}",
+                f"{action.action}",
             )
 
             print(
                 "[BOUNDARY_ACTION] "
                 f"street={old_street} "
                 f"seat={seat} "
-                f"action={promotion.action} "
-                f"sequence={promotion.canonical_sequence}",
+                f"action={action.action} "
+                f"sequence={action.sequence}",
                 flush=True,
             )
         else:
@@ -5873,7 +8058,7 @@ def handle_boundary_stack_result(
                 "[BOUNDARY_UNRESOLVED] "
                 f"street={old_street} "
                 f"seat={seat} "
-                f"reason={promotion.reason}",
+                f"reason={resolution.reason}",
                 flush=True,
             )
 
@@ -6021,6 +8206,12 @@ def handle_event(state, event):
             event,
         )
 
+    if t == "stack_candidate_street_promoted":
+        return handle_stack_candidate_street_promoted(
+            state,
+            event,
+        )
+
     if t == "stack_candidate_closed":
         return handle_stack_candidate_closed(
             state,
@@ -6029,6 +8220,12 @@ def handle_event(state, event):
 
     if t == "provisional_bet_opened":
         return handle_provisional_bet_opened(
+            state,
+            event,
+        )
+
+    if t == "action_observation_rejected":
+        return handle_action_observation_rejected(
             state,
             event,
         )
@@ -6057,6 +8254,12 @@ def handle_event(state, event):
     if t == "hero_cards":
         return handle_hero_cards(state, event)
 
+    if t == "physical_street_boundary":
+        return handle_physical_street_boundary(
+            state,
+            event,
+        )
+
     if t == "board":
         return handle_board(state, event)
 
@@ -6068,6 +8271,12 @@ def handle_event(state, event):
 
     if t == "hero_fold":
         return handle_hero_fold(state, event)
+
+    if t == "observer_acquisition":
+        return handle_observer_acquisition(
+            state,
+            event,
+        )
 
     if t == "actor_observed":
         return handle_actor_observed(state, event)

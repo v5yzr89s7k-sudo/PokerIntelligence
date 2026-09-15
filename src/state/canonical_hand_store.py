@@ -74,16 +74,24 @@ class CanonicalHandStore:
         )
 
     def save(self, hand: CanonicalHand):
+        """
+        Persist authoritative CanonicalHand state only.
+
+        current_hand.txt is a presentation product and must be published
+        separately through save_live_presentation(). Keeping persistence and
+        presentation separate prevents one semantic transaction from exposing
+        an intermediate canonical-only live hand before overlays are applied.
+        """
         json_text = json.dumps(
             hand.to_dict(),
             indent=2,
             sort_keys=False,
         ) + "\n"
 
-        rendered = render_canonical_hand(hand)
-
-        self._atomic_write(self.json_path, json_text)
-        self._atomic_write(self.text_path, rendered)
+        self._atomic_write(
+            self.json_path,
+            json_text,
+        )
 
     def archive(
         self,

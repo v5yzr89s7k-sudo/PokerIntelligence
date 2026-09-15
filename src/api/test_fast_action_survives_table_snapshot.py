@@ -75,7 +75,16 @@ def main():
             sm._ACTIVE_HAND_ID = None
 
             hand = build_hand()
+
+            # CanonicalHandStore.save() is persistence-only in v0.16.
+            # Establish the test's initial live presentation explicitly;
+            # subsequent action publication must use the production
+            # presentation gateway.
             store.save(hand)
+            store.save_live_presentation(
+                hand,
+                provisional_actions=None,
+            )
 
             state = sm.default_state()
 
@@ -114,20 +123,44 @@ def main():
 
             # ----------------------------------------------------
             # Stage 1:
-            # Fast physical commitment reaches TXT immediately.
+            # Establish one already-owned live opponent action.
+            #
+            # Raw opponent bet-region appearance is intentionally
+            # provisional in v0.16 and cannot author an action by itself.
+            # This regression is about presentation persistence across
+            # asynchronous table_snapshot enrichment, so seed the existing
+            # ActionTimeline owner explicitly and publish through the normal
+            # live-presentation gateway.
             # ----------------------------------------------------
 
-            state = sm.record_physical_live_commitment(
+            from src.state.action_timeline import (
+                observe_action,
+                presentation_overlay,
+            )
+
+            state = observe_action(
                 state,
-                {
-                    "type": "actor_observed",
-                    "hand_token": TOKEN,
-                    "street": "PREFLOP",
-                    "seat": UTG,
-                    "source": "bet_region_appeared",
-                    "commitment_visible": True,
-                    "ts": 2.0,
-                },
+                hand_token=TOKEN,
+                street="PREFLOP",
+                seat=UTG,
+                action="BET_OR_RAISE",
+                ts=2.0,
+                source="test_owned_action",
+                confidence=1.0,
+                evidence=[
+                    "test_owned_action",
+                ],
+            )
+
+            state[
+                "pending_live_commitments"
+            ] = presentation_overlay(
+                state
+            )
+
+            state = sm.refresh_live_presentation(
+                state,
+                publication_intent="action",
             )
 
             before = store.text_path.read_text()
@@ -154,7 +187,15 @@ def main():
                 pending_before,
             )
 
-            assert "PREFLOP:seat_utg" in pending_before
+            assert any(
+                str(item.get("street") or "").upper()
+                == "PREFLOP"
+                and item.get("seat") == UTG
+                for item in (
+                    state.get("action_timeline")
+                    or []
+                )
+            )
 
             # Canonical still intentionally does NOT own UTG action.
             canonical = store.load()
@@ -243,12 +284,17 @@ def main():
                 "already-published fast UTG action"
             )
 
-            assert (
-                "PREFLOP:seat_utg"
-                in pending_after
+            assert any(
+                str(item.get("street") or "").upper()
+                == "PREFLOP"
+                and item.get("seat") == UTG
+                for item in (
+                    state.get("action_timeline")
+                    or []
+                )
             ), (
                 "BUG: unrelated table snapshot retired "
-                "valid fast presentation ownership"
+                "valid ActionTimeline ownership"
             )
 
             canonical = store.load()

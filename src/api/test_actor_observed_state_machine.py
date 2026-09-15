@@ -60,7 +60,7 @@ def reset_tracker():
     sm._ACTIVE_HAND_ID = None
 
 
-def test_later_actor_resolves_prior_fold_only():
+def test_later_actor_synchronizes_without_predecessor_semantics():
     reset_tracker()
 
     hand = make_hand()
@@ -81,14 +81,18 @@ def test_later_actor_resolves_prior_fold_only():
 
     hand = sm.canonical_load()
 
-    assert hand.players["seat_top"].folded
+    # Seeing a later actor establishes live chronology but does not prove
+    # what an unseen predecessor did.
+    assert not hand.players["seat_top"].folded
 
-    assert any(
+    assert not any(
         action.seat == "seat_top"
         and action.action == "FOLD"
         for action in hand.actions
     )
 
+    # The observed actor is likewise not assigned betting semantics merely
+    # because its visual region changed.
     assert not any(
         action.seat == "seat_upper_right"
         and action.action in {
@@ -96,14 +100,23 @@ def test_later_actor_resolves_prior_fold_only():
             "CALL",
             "BET",
             "RAISE",
+            "BET_OR_RAISE",
+            "CALL_OR_RAISE",
         }
         for action in hand.actions
     )
 
+    # Chronology is synchronized to the first physically observed actor.
     assert hand.players_to_act == [
         "seat_upper_right",
         "hero",
     ]
+
+    print(
+        "PASS: later actor synchronizes chronology "
+        "without manufacturing predecessor semantics"
+    )
+
 
 
 def test_same_frame_blocker_prevents_false_fold():
@@ -192,11 +205,11 @@ def test_unresolved_prior_commitment_blocks_gap():
 
 
 if __name__ == "__main__":
-    test_later_actor_resolves_prior_fold_only()
+    test_later_actor_synchronizes_without_predecessor_semantics()
     test_same_frame_blocker_prevents_false_fold()
     test_unresolved_prior_commitment_blocks_gap()
 
     print(
         "PASS actor_observed state-machine contract: "
-        "later physical actor resolves only safe chronological predecessors"
+        "later physical actor synchronizes chronology without authoring predecessors"
     )

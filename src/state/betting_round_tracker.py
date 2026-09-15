@@ -78,6 +78,32 @@ class BettingRoundTracker:
         self.processed_episode_ids = set()
         self.decisions: List[BettingRoundDecision] = []
 
+        # The canonical action queue initially describes legal
+        # poker traversal, not necessarily observed live history.
+        # The first physical actor observation establishes where
+        # live chronology currently is without manufacturing
+        # predecessor folds/checks.
+        self.live_chronology_synchronized = False
+
+        # Explicit observer-acquisition ownership boundary.
+        #
+        # None means no pre-acquisition chronology has been declared.
+        # Once established, the exact legal prefix before first_owned_seat
+        # is classified as history that predates observer ownership.
+        #
+        # This grants NO poker semantics to those seats and creates NO
+        # canonical actions. It changes only which betting obligations are
+        # owned by the live observer.
+        self.observer_acquisition_frontier = None
+
+        # True only when this tracker itself spans a canonical street
+        # transition. Construction on an already-open street does not
+        # establish ownership of that street's unseen beginning.
+        #
+        # This is chronology evidence only. It grants no authority to
+        # materialize canonical actions.
+        self.observed_street_start_owned = False
+
         self.commitment_tracker.initialize_street_order(
             self.street,
             self.hand.players_to_act,
@@ -105,7 +131,23 @@ class BettingRoundTracker:
         if current == self.street:
             return
 
+        previous_street = self.street
+
         self.street = current
+
+        # The tracker existed before CanonicalHand moved to this street,
+        # therefore this observer owns the opening boundary of the new
+        # street. A tracker constructed after the transition never reaches
+        # this branch for that already-open street.
+        self.observed_street_start_owned = True
+
+        print(
+            "[OBSERVED_STREET_START_OWNED]",
+            f"previous={previous_street}",
+            f"street={current}",
+            flush=True,
+        )
+
         self.has_open_bet = False
         self.last_aggressor_seat = None
 
@@ -168,6 +210,31 @@ class BettingRoundTracker:
 
         actor_index = queue.index(seat)
 
+
+        if not self.live_chronology_synchronized:
+            self.live_chronology_synchronized = True
+
+            predecessors = queue[:actor_index]
+
+            # A later observed actor establishes only where live observation
+            # currently is. It does not establish that any predecessor took
+            # an action, so it has no authority to consume CanonicalHand or
+            # StreetCommitmentTracker betting obligations.
+            #
+            # ActionTimeline-owned resolution is the only gateway that may
+            # remove an unresolved predecessor from those authoritative
+            # obligations.
+            print(
+                "[LIVE_CHRONOLOGY_SYNC]",
+                f"street={self.hand.current_street}",
+                f"actor={seat}",
+                f"unresolved_predecessors={predecessors}",
+                f"remaining={self.hand.players_to_act}",
+                flush=True,
+            )
+
+            return []
+
         if actor_index <= 0:
             return []
 
@@ -191,45 +258,295 @@ class BettingRoundTracker:
             )
             return []
 
-        # Consume only the seats proven passive by the later actor.
-        # Leave the observed actor at the head of the queue so the normal
-        # inferred-action path still owns its semantic action and sizing.
-        self.hand.players_to_act = queue[actor_index:]
-
-        inferred = self._infer_skipped_actions(
+        # Generic later-actor chronology never resolves skipped seats.
+        #
+        # Seeing a later actor proves observation progress only. It does not
+        # establish FOLD/CHECK/CALL/RAISE semantics for predecessors and
+        # therefore cannot consume their betting obligations.
+        self._infer_skipped_actions(
             skipped_seats,
             ts=ts,
         )
 
-        for skipped_seat in skipped_seats:
-            self.commitment_tracker.consume_pending_action(
-                self.hand.current_street,
-                skipped_seat,
+        print(
+            "[ACTION_CURSOR_UNRESOLVED]",
+            f"street={self.hand.current_street}",
+            f"actor={seat}",
+            f"unresolved={skipped_seats}",
+            f"remaining={self.hand.players_to_act}",
+            flush=True,
+        )
+
+        return []
+
+    def establish_observer_acquisition_from_visible_seats(
+        self,
+        *,
+        street: str,
+        visible_seats,
+        hero_owned: bool = False,
+        ts=None,
+    ):
+        """
+        Translate neutral same-hand card visibility into chronology ownership.
+
+        Perception supplies only physical seats positively observed holding
+        cards on an owned frame. This tracker alone owns legal betting order.
+
+        The earliest owned seat in the current legal action queue becomes the
+        observer-acquisition frontier. Every legal predecessor is classified
+        only as pre-acquisition UNKNOWN history.
+
+        No FOLD/CHECK/CALL/RAISE semantics are manufactured here.
+        """
+        self._sync_street()
+
+        queue = list(
+            self.hand.players_to_act
+            or []
+        )
+
+        if not queue:
+            return None
+
+        owned = set()
+
+        for seat in visible_seats or []:
+            seat = str(seat or "")
+
+            if seat and seat in queue:
+                owned.add(seat)
+
+        if hero_owned and "hero" in queue:
+            owned.add("hero")
+
+        if not owned:
+            return None
+
+        first_owned_seat = next(
+            (
+                seat
+                for seat in queue
+                if seat in owned
+            ),
+            None,
+        )
+
+        if first_owned_seat is None:
+            return None
+
+        first_owned_index = queue.index(
+            first_owned_seat
+        )
+
+        pre_acquisition_seats = queue[
+            :first_owned_index
+        ]
+
+        return self.establish_observer_acquisition_frontier(
+            street=street,
+            first_owned_seat=first_owned_seat,
+            pre_acquisition_seats=pre_acquisition_seats,
+            ts=ts,
+        )
+
+
+    def establish_observer_acquisition_frontier(
+        self,
+        *,
+        street: str,
+        first_owned_seat: str,
+        pre_acquisition_seats,
+        ts=None,
+    ):
+        """
+        Establish the exact boundary between unknown pre-observation history
+        and chronology owned by this observer.
+
+        This operation is deliberately semantic-free:
+
+        - no FOLD/CHECK/CALL/RAISE action is created;
+        - no predecessor is marked folded or inactive;
+        - no ActionTimeline owner is created;
+        - only the exact legal queue prefix before first_owned_seat may be
+          released from live betting obligations.
+
+        A later actor therefore cannot arbitrarily erase predecessors. The
+        caller must explicitly identify the complete prefix that predates
+        observer ownership.
+        """
+        self._sync_street()
+
+        target_street = str(street or "").upper()
+        current_street = str(
+            self.hand.current_street or ""
+        ).upper()
+
+        first_owned_seat = str(
+            first_owned_seat or ""
+        )
+
+        requested_prefix = [
+            str(seat)
+            for seat in (pre_acquisition_seats or [])
+            if seat
+        ]
+
+        if target_street != current_street:
+            raise ValueError(
+                "acquisition_frontier_street_mismatch: "
+                f"requested={target_street} "
+                f"current={current_street}"
             )
 
-            self.commitment_tracker.record_action(
-                self.hand.current_street,
-                skipped_seat,
-                current_price=self.hand.current_bet_bb,
-                last_aggressor=self.hand.last_aggressor_seat,
-                betting_open=self.has_open_bet,
+        if not first_owned_seat:
+            raise ValueError(
+                "acquisition_frontier_missing_first_owned_seat"
             )
+
+        existing = self.observer_acquisition_frontier
+
+        if existing is not None:
+            same_frontier = (
+                str(existing.get("street") or "").upper()
+                == target_street
+                and str(
+                    existing.get("first_owned_seat") or ""
+                )
+                == first_owned_seat
+                and list(
+                    existing.get("pre_acquisition_seats")
+                    or []
+                )
+                == requested_prefix
+            )
+
+            if not same_frontier:
+                raise ValueError(
+                    "acquisition_frontier_already_established: "
+                    f"existing={existing}"
+                )
+
+            return dict(existing)
+
+        queue = list(
+            self.hand.players_to_act
+            or []
+        )
+
+        if first_owned_seat not in queue:
+            raise ValueError(
+                "acquisition_frontier_first_owned_not_in_queue: "
+                f"seat={first_owned_seat} "
+                f"queue={queue}"
+            )
+
+        first_owned_index = queue.index(
+            first_owned_seat
+        )
+
+        actual_prefix = queue[
+            :first_owned_index
+        ]
+
+        if requested_prefix != actual_prefix:
+            raise ValueError(
+                "acquisition_frontier_prefix_mismatch: "
+                f"requested={requested_prefix} "
+                f"actual={actual_prefix} "
+                f"first_owned={first_owned_seat}"
+            )
+
+        owned_queue = queue[
+            first_owned_index:
+        ]
+
+        # IMPORTANT:
+        #
+        # These seats are not "consumed actions." They are obligations whose
+        # history predates observation ownership. Do not call
+        # consume_observed_action(), record_action(), or any semantic inference
+        # helper here.
+        self.hand.players_to_act = list(
+            owned_queue
+        )
+
+        self.commitment_tracker.sync_queue(
+            target_street,
+            self.hand.players_to_act,
+        )
+
+        self.live_chronology_synchronized = True
+
+        frontier = {
+            "street": target_street,
+            "first_owned_seat": first_owned_seat,
+            "pre_acquisition_seats": list(
+                requested_prefix
+            ),
+            "owned_queue": list(
+                owned_queue
+            ),
+            "ts": ts,
+        }
+
+        self.observer_acquisition_frontier = dict(
+            frontier
+        )
+
+        print(
+            "[OBSERVER_ACQUISITION_FRONTIER] "
+            f"street={target_street} "
+            f"pre_acquisition={requested_prefix} "
+            f"first_owned={first_owned_seat} "
+            f"owned_queue={owned_queue}",
+            flush=True,
+        )
+
+        return dict(frontier)
+
+
+    def consume_owned_action_obligation(
+        self,
+        seat: str,
+    ) -> bool:
+        """
+        Consume exactly one already-owned action obligation.
+
+        Action existence must be established before this transaction.
+        This method owns only chronological/accounting consumption and
+        may never skip an unresolved predecessor.
+        """
+        self._sync_street()
+
+        seat = str(seat or "")
+        queue = list(self.hand.players_to_act or [])
+
+        if not seat or seat not in queue:
+            return False
+
+        if queue[0] != seat:
+            raise AssertionError(
+                "owned action cannot consume unresolved predecessor: "
+                f"street={self.hand.current_street} "
+                f"seat={seat} "
+                f"queue={queue}"
+            )
+
+        self.hand.players_to_act = queue[1:]
+
+        self.commitment_tracker.consume_observed_action(
+            self.hand.current_street,
+            seat,
+        )
 
         self.commitment_tracker.sync_queue(
             self.hand.current_street,
             self.hand.players_to_act,
         )
 
-        print(
-            "[ACTION_CURSOR_ADVANCE]",
-            f"street={self.hand.current_street}",
-            f"actor={seat}",
-            f"resolved={skipped_seats}",
-            f"remaining={self.hand.players_to_act}",
-            flush=True,
-        )
+        return True
 
-        return inferred
 
     def resolve_physically_completed_actor(
         self,
@@ -315,25 +632,28 @@ class BettingRoundTracker:
         ts=None,
     ) -> List[CanonicalAction]:
         """
-        Resolve seats skipped before an observed actor.
+        Legacy chronology diagnostic only.
 
-        Preflop skipped seats fold. Postflop skipped seats check when no
-        voluntary bet is open, otherwise they fold.
+        A later observed actor proves that live observation has advanced
+        past earlier seats. It does NOT prove whether any skipped seat
+        folded, checked, called, raised, timed out, disconnected, or was
+        otherwise resolved before observation began.
+
+        ActionTimeline is the sole owner of action existence. Therefore
+        skipped chronology has no authority to create canonical actions
+        or consume betting-response obligations.
         """
         if not skipped_seats:
             return []
 
         street = self.hand.current_street
-        passive_action = (
-            "CHECK"
-            if street != "PREFLOP" and not self.has_open_bet
-            else "FOLD"
-        )
 
-        inferred = []
+        unresolved = []
 
         for skipped_seat in skipped_seats:
-            player = self.hand.players.get(skipped_seat)
+            player = self.hand.players.get(
+                skipped_seat
+            )
 
             if (
                 player is None
@@ -343,40 +663,22 @@ class BettingRoundTracker:
             ):
                 continue
 
+            unresolved.append(
+                skipped_seat
+            )
+
+        if unresolved:
             print(
-                "[SKIPPED_ACTION]",
+                "[SKIPPED_CHRONOLOGY_UNRESOLVED]",
                 f"street={street}",
-                f"seat={skipped_seat}",
-                f"inferred={passive_action}",
-                f"open_bet={self.has_open_bet}",
-                f"trigger=observed_actor_skip",
+                f"seats={unresolved}",
+                "action=UNKNOWN",
+                "reason=later_actor_does_not_author_history",
                 flush=True,
             )
 
-            inferred.append(
-                self.hand.add_action(
-                    seat=skipped_seat,
-                    action=passive_action,
-                    confidence=0.90,
-                    source="action_order_inference",
-                    evidence=[
-                        "seat_skipped_before_observed_actor",
-                        (
-                            "no_open_postflop_bet"
-                            if passive_action == "CHECK"
-                            else "action_required_but_no_commitment_observed"
-                        ),
-                    ],
-                    ts=ts,
-                )
-            )
+        return []
 
-            self.commitment_tracker.record_response(
-                street,
-                skipped_seat,
-            )
-
-        return inferred
 
     def _response_eligible_seats(self) -> List[str]:
         """
@@ -617,82 +919,180 @@ class BettingRoundTracker:
 
         return canonical_action, reason
 
-    def ingest(self, inferred_action: Any) -> Optional[CanonicalAction]:
-        self._sync_street()
+    def resolve_inferred_action(
+        self,
+        inferred_action: Any,
+    ) -> Dict:
+        """
+        Resolve an inferred betting action without mutation.
+
+        Reads current hand/tracker state for classification, sizing,
+        and chronology admission, but does not claim episode ownership,
+        record decisions, mutate CanonicalHand, or mutate betting state.
+        """
         item = self._action_dict(inferred_action)
 
-        episode_id = int(item.get("episode_id") or 0)
+        episode_id = int(
+            item.get("episode_id") or 0
+        )
         seat = item.get("seat") or "unknown"
-        action = (item.get("action") or UNKNOWN).upper()
+        raw_action = (
+            item.get("action") or UNKNOWN
+        ).upper()
         action_street = (
             item.get("street")
             or self.hand.current_street
             or "unknown"
         ).upper()
 
+        def unresolved(
+            reason,
+            *,
+            action=None,
+            amount_bb=None,
+            raise_to_bb=None,
+            earlier_seats=None,
+        ):
+            return {
+                "resolved": False,
+                "reason": reason,
+                "episode_id": episode_id,
+                "street": action_street,
+                "seat": seat,
+                "raw_action": raw_action,
+                "action": action,
+                "amount_bb": amount_bb,
+                "raise_to_bb": raise_to_bb,
+                "earlier_seats": list(
+                    earlier_seats or []
+                ),
+                "confidence": item.get(
+                    "confidence"
+                ),
+                "evidence": list(
+                    item.get("evidence")
+                    or []
+                ),
+                "ts": item.get("ts"),
+            }
+
         if episode_id <= 0:
-            self._record_decision(
-                episode_id,
-                action_street,
-                seat,
-                action,
-                None,
-                False,
-                "missing or invalid episode id",
+            return unresolved(
+                "missing or invalid episode id"
             )
-            return None
 
-        if episode_id in self.processed_episode_ids:
-            return None
+        current_street = (
+            self.hand.current_street
+            or "unknown"
+        ).upper()
 
-        self.processed_episode_ids.add(episode_id)
-
-        if action_street != self.hand.current_street:
-            self._record_decision(
-                episode_id,
-                action_street,
-                seat,
-                action,
-                None,
-                False,
-                "action street does not match canonical hand street",
+        if action_street != current_street:
+            return unresolved(
+                "action street does not match "
+                "canonical hand street"
             )
-            return None
 
         if seat in ("", "unknown", "table"):
-            self._record_decision(
-                episode_id,
-                action_street,
-                seat,
-                action,
-                None,
-                False,
-                "action has no attributable player seat",
+            return unresolved(
+                "action has no attributable player seat"
             )
-            return None
 
-        classification = self._classify_inferred_action(
-            episode_id=episode_id,
-            action_street=action_street,
-            seat=seat,
-            action=action,
+        # Pure equivalent of _classify_inferred_action().
+        # Do not call that helper because its rejection paths
+        # currently record BettingDecision state.
+        if raw_action == POST_SMALL_BLIND:
+            if action_street != "PREFLOP":
+                return unresolved(
+                    "small blind post is only valid preflop"
+                )
+            canonical_action = (
+                CANONICAL_POST_SMALL_BLIND
+            )
+            reason = (
+                "forced small blind preserved "
+                "as canonical event"
+            )
+
+        elif raw_action == POST_BIG_BLIND:
+            if action_street != "PREFLOP":
+                return unresolved(
+                    "big blind post is only valid preflop"
+                )
+            canonical_action = (
+                CANONICAL_POST_BIG_BLIND
+            )
+            reason = (
+                "forced big blind preserved "
+                "as canonical event"
+            )
+
+        elif raw_action in {
+            BET_OR_RAISE,
+            CALL_OR_RAISE,
+        }:
+            canonical_action = raw_action
+            if raw_action == CALL_OR_RAISE:
+                reason = (
+                    "call versus raise remains unresolved; "
+                    "preserving inferred semantic"
+                )
+            else:
+                reason = (
+                    "bet versus raise remains unresolved; "
+                    "preserving inferred semantic"
+                )
+
+        elif raw_action == CALL:
+            canonical_action = CALL
+            reason = "call inference preserved"
+
+        elif raw_action == FOLD_OR_RESOLVED:
+            return unresolved(
+                "fold versus visual resolution "
+                "remains ambiguous"
+            )
+
+        elif raw_action == TABLE_EVENT:
+            return unresolved(
+                "table event is not a player action"
+            )
+
+        elif raw_action == UNKNOWN:
+            return unresolved(
+                "insufficient evidence; not added "
+                "to canonical hand"
+            )
+
+        else:
+            return unresolved(
+                "unsupported inferred action: "
+                f"{raw_action}"
+            )
+
+        measurements = (
+            item.get("measurements") or {}
         )
-
-        if classification is None:
-            return None
-
-        canonical_action, reason = classification
-
-        measurements = item.get("measurements") or {}
-        stack_change = measurements.get("stack_change") or {}
+        stack_change = (
+            measurements.get("stack_change")
+            or {}
+        )
 
         delta_bb = stack_change.get("delta_bb")
         amount_bb = None
         raise_to_bb = None
 
+        prior_committed = None
+        ante_committed = None
+        prior_live_committed = None
+        current_price = None
+        target_commitment = None
+
         if delta_bb is not None:
             try:
-                delta_bb = round(float(delta_bb), 2)
+                delta_bb = round(
+                    float(delta_bb),
+                    2,
+                )
             except (TypeError, ValueError):
                 delta_bb = None
 
@@ -709,30 +1109,47 @@ class BettingRoundTracker:
                     or 0.0
                 )
 
-            ante_committed = self.hand.ante_committed_bb(
-                seat,
-                self.hand.current_street,
+            ante_committed = (
+                self.hand.ante_committed_bb(
+                    seat,
+                    self.hand.current_street,
+                )
             )
 
-            # Total canonical commitment contains ante dead money. Calls and
-            # raises must instead be classified against the live commitment,
-            # which excludes the ante.
             prior_live_committed = round(
                 max(
                     0.0,
-                    prior_committed - ante_committed,
+                    prior_committed
+                    - ante_committed,
+                ),
+                2,
+            )
+
+            canonical_price = round(
+                float(
+                    self.hand.current_bet_bb
+                    or 0.0
                 ),
                 2,
             )
 
             current_price = round(
-                float(self.hand.current_bet_bb or 0.0),
+                float(
+                    self.commitment_tracker
+                    .effective_price_before(
+                        action_street,
+                        seat,
+                        canonical_price=canonical_price,
+                    )
+                ),
                 2,
             )
+
             target_commitment = round(
                 prior_live_committed + delta_bb,
                 2,
             )
+
             tolerance = 0.05
 
             stack_confidence = float(
@@ -741,7 +1158,6 @@ class BettingRoundTracker:
                 )
                 or 0.0
             )
-
             stack_mode = str(
                 stack_change.get(
                     "stack_read_mode"
@@ -751,8 +1167,7 @@ class BettingRoundTracker:
 
             trusted_stack_sizing = bool(
                 stack_confidence >= 0.95
-                and stack_mode
-                not in {
+                and stack_mode not in {
                     "",
                     "unknown",
                     "unresolved",
@@ -774,7 +1189,8 @@ class BettingRoundTracker:
                 )
                 if (
                     current_price > tolerance
-                    and last_full_increment > tolerance
+                    and last_full_increment
+                    > tolerance
                 )
                 else None
             )
@@ -787,36 +1203,27 @@ class BettingRoundTracker:
                     canonical_action = BET
                     amount_bb = delta_bb
                     reason = (
-                        "chip commitment opened betting with no live "
-                        "price; resolved as BET"
+                        "chip commitment opened betting "
+                        "with no live price; resolved as BET"
                     )
 
                 elif (
                     target_commitment
                     < current_price - tolerance
                 ):
-                    # A materially short commitment cannot be a raise.
-                    # Preserve the measured incremental amount; this covers
-                    # short/all-in-style calls where the player cannot reach
-                    # the full live price.
                     canonical_action = CALL
                     amount_bb = delta_bb
                     reason = (
-                        "stack-derived commitment remained materially "
-                        "below the live price; resolved as short CALL"
+                        "stack-derived commitment remained "
+                        "materially below the live price; "
+                        "resolved as short CALL"
                     )
 
-                elif (
-                    abs(target_commitment - current_price)
-                    <= tolerance
-                ):
+                elif abs(
+                    target_commitment
+                    - current_price
+                ) <= tolerance:
                     canonical_action = CALL
-
-                    # Stack delta is quantitative perception evidence.
-                    # Only an approximately exact-price commitment is
-                    # normalized to the established betting price. A
-                    # materially short commitment must preserve its measured
-                    # amount (for example, a short/all-in call).
                     amount_bb = round(
                         max(
                             0.0,
@@ -825,33 +1232,37 @@ class BettingRoundTracker:
                         ),
                         4,
                     )
-
                     reason = (
-                        "total street commitment matched the live "
-                        "price; resolved as CALL"
+                        "total street commitment matched "
+                        "the live price; resolved as CALL"
                     )
 
                 elif (
-                    canonical_action == CALL_OR_RAISE
+                    canonical_action
+                    == CALL_OR_RAISE
                     and trusted_stack_sizing
-                    and minimum_full_raise_to is not None
+                    and minimum_full_raise_to
+                    is not None
                     and target_commitment
-                    < minimum_full_raise_to - tolerance
+                    < minimum_full_raise_to
+                    - tolerance
                 ):
                     canonical_action = CALL
                     amount_bb = delta_bb
                     reason = (
-                        "trusted stack-derived commitment exceeded "
-                        "the live price but did not reach the minimum "
-                        "full raise-to amount; resolved as CALL"
+                        "trusted stack-derived commitment "
+                        "exceeded the live price but did not "
+                        "reach the minimum full raise-to "
+                        "amount; resolved as CALL"
                     )
 
                 else:
                     canonical_action = RAISE
                     raise_to_bb = target_commitment
                     reason = (
-                        "total street commitment established a "
-                        "raise-sized live commitment; resolved as RAISE"
+                        "total street commitment established "
+                        "a raise-sized live commitment; "
+                        "resolved as RAISE"
                     )
 
             elif canonical_action == RAISE:
@@ -863,14 +1274,6 @@ class BettingRoundTracker:
             }:
                 amount_bb = delta_bb
 
-        # Quantitative evidence for one actor does not independently prove
-        # the actions of earlier seats in the canonical traversal queue.
-        #
-        # If this actor is not currently at the head of the live queue,
-        # chronology is unresolved. Defer the episode without mutating the
-        # queue, fabricating passive actions, or marking the episode processed.
-        #
-        # Explicit chronology evidence owns skipped-seat resolution.
         forced_actions = {
             CANONICAL_POST_ANTE,
             CANONICAL_POST_SMALL_BLIND,
@@ -878,134 +1281,262 @@ class BettingRoundTracker:
         }
 
         if canonical_action not in forced_actions:
-            # StreetCommitmentTracker is the durable authority for outstanding
-            # betting obligations. CanonicalHand.players_to_act is a
-            # materialized traversal field and may temporarily lag after
-            # boundary or historical reconciliation.
-            #
-            # Quantitative evidence may therefore be admitted only against the
-            # durable obligation queue. It must never use a stale materialized
-            # predecessor as evidence that the predecessor acted.
             authoritative_queue = list(
-                self.commitment_tracker.players_owing_action(
+                self.commitment_tracker
+                .players_owing_action(
                     action_street
                 )
                 or []
             )
 
             if seat in authoritative_queue:
-                actor_index = authoritative_queue.index(seat)
+                actor_index = (
+                    authoritative_queue.index(seat)
+                )
 
                 if actor_index > 0:
-                    skipped_seats = authoritative_queue[:actor_index]
+                    # The action cannot yet enter canonical chronology, but
+                    # trusted quantitative evidence may still establish the
+                    # betting price faced by later actors.
+                    #
+                    # This records pricing evidence only. It does not consume
+                    # an obligation, establish aggression, or create an action.
+                    if (
+                        target_commitment is not None
+                        and trusted_stack_sizing
+                    ):
+                        self.commitment_tracker                            .record_pending_quantitative_commitment(
+                                action_street,
+                                seat,
+                                target_commitment,
+                            )
 
-                    self._record_decision(
-                        episode_id,
-                        action_street,
-                        seat,
-                        action,
-                        None,
-                        False,
-                        (
-                            "earlier actors remain unresolved; "
-                            "quantitative action deferred without "
-                            "queue mutation"
+                    return unresolved(
+                        "earlier actors remain unresolved",
+                        action=canonical_action,
+                        amount_bb=amount_bb,
+                        raise_to_bb=raise_to_bb,
+                        earlier_seats=(
+                            authoritative_queue[
+                                :actor_index
+                            ]
                         ),
                     )
 
-                    print(
-                        "[QUANTITATIVE_ACTION_DEFERRED]",
-                        f"street={action_street}",
-                        f"seat={seat}",
-                        f"earlier={skipped_seats}",
-                        f"raw_action={action}",
-                        f"canonical_candidate={canonical_action}",
-                        flush=True,
-                    )
-
-                    # Deferred is not processed. The state-machine replay
-                    # path may retry this episode after chronology advances.
-                    self.processed_episode_ids.discard(
-                        episode_id
-                    )
-
-                    return None
-
-            # Quantitative evidence owns only this actor. Remove exactly this
-            # seat from the materialized canonical queue if it is still
-            # present; never consume stale predecessors.
-            self.hand.players_to_act = [
-                pending_seat
-                for pending_seat in (
-                    self.hand.players_to_act
-                    or []
-                )
-                if pending_seat != seat
-            ]
-
-        # Mandatory blinds are seeded during hand initialization.
-        # Never duplicate them from later visual inference.
-        if canonical_action in {
-            CANONICAL_POST_ANTE,
-            CANONICAL_POST_SMALL_BLIND,
-            CANONICAL_POST_BIG_BLIND,
-        }:
+        if canonical_action in forced_actions:
             already_recorded = any(
                 existing.seat == seat
                 and existing.street == "PREFLOP"
-                and existing.action == canonical_action
+                and existing.action
+                == canonical_action
                 for existing in self.hand.actions
             )
 
             if already_recorded:
-                self._record_decision(
-                    episode_id,
-                    action_street,
-                    seat,
-                    action,
-                    None,
-                    False,
+                return unresolved(
                     "forced blind already present",
+                    action=canonical_action,
                 )
-                return None
 
-        print(
-            "[ACTION_ACCOUNTING] "
-            f"seat={seat} "
-            f"raw_action={action} "
-            f"canonical={canonical_action} "
-            f"delta={delta_bb} "
-            f"prior_total={prior_committed if delta_bb is not None else None} "
-            f"ante={ante_committed if delta_bb is not None else None} "
-            f"prior_live={prior_live_committed if delta_bb is not None else None} "
-            f"current_price={current_price if delta_bb is not None else None} "
-            f"target_live={target_commitment if delta_bb is not None else None} "
-            f"amount_bb={amount_bb} "
-            f"raise_to_bb={raise_to_bb}",
-            flush=True,
+        return {
+            "resolved": True,
+            "reason": reason,
+            "episode_id": episode_id,
+            "street": action_street,
+            "seat": seat,
+            "raw_action": raw_action,
+            "action": canonical_action,
+            "amount_bb": amount_bb,
+            "raise_to_bb": raise_to_bb,
+            "earlier_seats": [],
+            "delta_bb": delta_bb,
+            "prior_committed_bb": prior_committed,
+            "ante_committed_bb": ante_committed,
+            "prior_live_commitment_bb": (
+                prior_live_committed
+            ),
+            "current_price_bb": current_price,
+            "target_commitment_bb": (
+                target_commitment
+            ),
+            "confidence": item.get(
+                "confidence"
+            ),
+            "evidence": list(
+                item.get("evidence") or []
+            ),
+            "ts": item.get("ts"),
+        }
+
+
+    def ingest(
+        self,
+        inferred_action: Any,
+    ) -> Optional[CanonicalAction]:
+        """
+        Legacy compatibility facade.
+
+        Production quantitative orchestration does not use this API.
+        Canonical action ownership lives outside BettingRoundTracker.
+        """
+        from src.state.action_timeline import (
+            compat_ingest_betting_action,
         )
 
-        canonical = self.hand.add_action(
-            seat=seat,
-            action=canonical_action,
-            amount_bb=amount_bb,
-            raise_to_bb=raise_to_bb,
-            confidence=item.get("confidence"),
-            source="betting_round_tracker",
-            evidence=list(item.get("evidence") or []),
-            ts=item.get("ts"),
+        return compat_ingest_betting_action(
+            self,
+            inferred_action,
         )
+
+
+    def apply_resolved_action(
+        self,
+        *,
+        inferred_action: Any,
+        resolution: Dict,
+        canonical: CanonicalAction,
+    ) -> CanonicalAction:
+        """
+        Apply betting-round consequences for an already materialized
+        canonical action.
+
+        This method has no authority to create CanonicalHand actions.
+        ActionTimeline / canonical projection owns materialization.
+        """
+        item = self._action_dict(
+            inferred_action
+        )
+
+        episode_id = int(
+            resolution.get("episode_id")
+            or item.get("episode_id")
+            or 0
+        )
+
+        action_street = str(
+            resolution.get("street")
+            or item.get("street")
+            or self.hand.current_street
+            or "unknown"
+        ).upper()
+
+        seat = str(
+            resolution.get("seat")
+            or item.get("seat")
+            or "unknown"
+        )
+
+        raw_action = str(
+            resolution.get("raw_action")
+            or item.get("action")
+            or UNKNOWN
+        ).upper()
+
+        canonical_action = str(
+            resolution.get("action")
+            or ""
+        ).upper()
+
+        reason = str(
+            resolution.get("reason")
+            or "resolved action applied"
+        )
+
+        if not resolution.get("resolved"):
+            raise ValueError(
+                "cannot apply unresolved betting action"
+            )
+
+        if canonical is None:
+            raise ValueError(
+                "canonical action is required"
+            )
+
+        if (
+            str(canonical.street or "").upper()
+            != action_street
+        ):
+            raise ValueError(
+                "canonical street conflicts with "
+                "resolved action"
+            )
+
+        if str(canonical.seat or "") != seat:
+            raise ValueError(
+                "canonical seat conflicts with "
+                "resolved action"
+            )
+
+        if (
+            str(canonical.action or "").upper()
+            != canonical_action
+        ):
+            raise ValueError(
+                "canonical action conflicts with "
+                "resolved action"
+            )
+
+        expected_amount = resolution.get(
+            "amount_bb"
+        )
+
+        expected_raise_to = resolution.get(
+            "raise_to_bb"
+        )
+
+        if canonical.amount_bb != expected_amount:
+            raise ValueError(
+                "canonical amount conflicts with "
+                "resolved action"
+            )
+
+        if (
+            canonical.raise_to_bb
+            != expected_raise_to
+        ):
+            raise ValueError(
+                "canonical raise-to conflicts with "
+                "resolved action"
+            )
+
+        # Successful application owns acceptance/deduplication.
+        # This remains idempotent for callers that already claimed
+        # the episode before entering the legacy ingest() transaction.
+        if episode_id > 0:
+            self.processed_episode_ids.add(
+                episode_id
+            )
 
         self.commitment_tracker.ingest(
             canonical
         )
 
-        # Forced blinds and unresolved voluntary commitments are not
-        # sufficient evidence of aggression. Only resolved BET or RAISE
-        # events may establish the last aggressor.
+        self.commitment_tracker            .clear_pending_quantitative_commitment(
+                action_street,
+                seat,
+            )
+
+        # The action now has an authoritative ActionTimeline owner,
+        # has been projected to CanonicalHand, and has passed this
+        # resolved-action transaction. Only at this point may its
+        # canonical betting obligation be consumed.
+        #
+        # This is deliberately different from later-actor chronology:
+        # observation progress alone has no authority to remove an
+        # unresolved predecessor from players_to_act.
+        if seat in self.hand.players_to_act:
+            self.consume_owned_action_obligation(
+                seat
+            )
+
+        # Only resolved BET / RAISE semantics establish aggression.
         if canonical_action in (BET, RAISE):
             self.has_open_bet = True
             self.last_aggressor_seat = seat
+
+            # CanonicalHand.add_action() already establishes the
+            # canonical aggressor. Assigning the same authoritative
+            # value here preserves tracker/hand synchronization.
             self.hand.last_aggressor_seat = seat
 
             self.commitment_tracker.open_response_queue(
@@ -1032,8 +1563,12 @@ class BettingRoundTracker:
         self.commitment_tracker.record_action(
             self.hand.current_street,
             seat,
-            current_price=self.hand.current_bet_bb,
-            last_aggressor=self.hand.last_aggressor_seat,
+            current_price=(
+                self.hand.current_bet_bb
+            ),
+            last_aggressor=(
+                self.hand.last_aggressor_seat
+            ),
             betting_open=self.has_open_bet,
         )
 
@@ -1041,13 +1576,14 @@ class BettingRoundTracker:
             episode_id,
             action_street,
             seat,
-            action,
+            raw_action,
             canonical_action,
             True,
             reason,
         )
 
         return canonical
+
 
     def has_prior_commitment(
         self,

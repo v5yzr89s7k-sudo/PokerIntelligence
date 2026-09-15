@@ -22,7 +22,7 @@ class BoundaryPromotionResult:
         return asdict(self)
 
 
-def promote_boundary_observation(
+def resolve_boundary_observation(
     *,
     hand,
     commitment_tracker,
@@ -31,90 +31,117 @@ def promote_boundary_observation(
     observation,
 ):
     """
-    Promote one trusted retrospective stack observation.
+    Resolve one trusted retrospective stack observation without mutation.
 
-    This function owns no OCR and performs no guessing.
-
-    Safety contract:
-    - seat must still owe action on the preserved old street;
-    - first integration supports resolved aggression only;
-    - resolver must uniquely establish FOLD/CALL/CHECK;
-    - canonical promotion uses the explicit historical-street primitive;
-    - old-street response obligation is consumed only after promotion.
+    This adapter prepares preserved betting/canonical context for the pure
+    boundary-action resolver. It does not mutate CanonicalHand or
+    StreetCommitmentTracker and has no action-authoring authority.
     """
     street = str(street or "").upper()
     seat = str(seat or "")
 
     if not street or not seat:
-        return BoundaryPromotionResult(
+        from src.state.boundary_action_resolver import (
+            BoundaryActionResolution,
+        )
+
+        return BoundaryActionResolution(
             street=street,
             seat=seat,
-            resolved=False,
             action=None,
+            resolved=False,
             reason="missing street or seat",
         )
 
-    status = commitment_tracker.round_status(street)
+    status = commitment_tracker.round_status(
+        street
+    )
 
     owing = list(
-        status.get("players_owing_action") or []
+        status.get("players_owing_action")
+        or []
     )
 
     if seat not in owing:
-        return BoundaryPromotionResult(
-            street=street,
-            seat=seat,
-            resolved=False,
-            action=None,
-            reason="player does not owe action on preserved street state",
+        from src.state.boundary_action_resolver import (
+            BoundaryActionResolution,
         )
 
-    # Unopened PREFLOP reconciliation remains intentionally unsupported
-    # because blind-specific semantics cannot be resolved from an unchanged
-    # boundary stack alone. Postflop unopened streets may proceed to the
-    # existing boundary resolver, which can resolve an owing player with a
-    # trusted unchanged stack as CHECK.
+        return BoundaryActionResolution(
+            street=street,
+            seat=seat,
+            action=None,
+            resolved=False,
+            reason=(
+                "player does not owe action on "
+                "preserved street state"
+            ),
+        )
+
+    # Preserve the existing boundary policy:
+    # unchanged PREFLOP evidence without open aggression cannot uniquely
+    # establish blind-specific semantics. Postflop unopened traversal may
+    # still resolve CHECK through the pure resolver.
     if (
         not status.get("betting_open")
         and street == "PREFLOP"
     ):
-        return BoundaryPromotionResult(
+        from src.state.boundary_action_resolver import (
+            BoundaryActionResolution,
+        )
+
+        return BoundaryActionResolution(
             street=street,
             seat=seat,
-            resolved=False,
             action=None,
-            reason="unopened preflop boundary promotion not supported",
+            resolved=False,
+            reason=(
+                "unopened preflop boundary "
+                "promotion not supported"
+            ),
         )
 
     player = hand.players.get(seat)
 
     if player is None:
-        return BoundaryPromotionResult(
+        from src.state.boundary_action_resolver import (
+            BoundaryActionResolution,
+        )
+
+        return BoundaryActionResolution(
             street=street,
             seat=seat,
-            resolved=False,
             action=None,
+            resolved=False,
             reason="unknown canonical player",
         )
 
-    observed_stack = observation.get("stack_bb")
+    observed_stack = observation.get(
+        "stack_bb"
+    )
 
     boundary = BoundaryStackObservation(
         street=street,
         seat=seat,
-        previous_stack_bb=player.last_confirmed_stack_bb,
+        previous_stack_bb=(
+            player.last_confirmed_stack_bb
+        ),
         observed_stack_bb=observed_stack,
         confidence=float(
-            observation.get("confidence") or 0.0
+            observation.get("confidence")
+            or 0.0
         ),
         votes=int(
-            observation.get("votes") or 0
+            observation.get("votes")
+            or 0
         ),
         mode=str(
-            observation.get("mode") or ""
+            observation.get("mode")
+            or ""
         ),
         frame_path=str(
-            observation.get("frame_path") or ""
+            observation.get("frame_path")
+            or ""
         ),
         ts=observation.get("frame_ts"),
     )
@@ -133,68 +160,24 @@ def promote_boundary_observation(
     )
 
     prior_live = round(
-        max(0.0, prior_total - ante),
+        max(
+            0.0,
+            prior_total - ante,
+        ),
         4,
     )
 
-    resolution = resolve_boundary_action(
+    return resolve_boundary_action(
         boundary,
         owes_action=True,
         betting_open=bool(
             status.get("betting_open")
         ),
         current_price_bb=float(
-            status.get("current_price") or 0.0
+            status.get("current_price")
+            or 0.0
         ),
-        prior_live_commitment_bb=prior_live,
-    )
-
-    if not resolution.resolved:
-        return BoundaryPromotionResult(
-            street=street,
-            seat=seat,
-            resolved=False,
-            action=None,
-            reason=resolution.reason,
-        )
-
-    action = hand.add_boundary_action(
-        street=street,
-        seat=seat,
-        action=resolution.action,
-        amount_bb=resolution.amount_bb,
-        raise_to_bb=resolution.raise_to_bb,
-        confidence=resolution.confidence,
-        source="boundary_stack_resolution",
-        evidence=[
-            "trusted_terminal_stack",
-            "preserved_action_obligation",
-            observation.get("mode") or "unknown_stack_read",
-        ],
-        ts=observation.get("frame_ts"),
-    )
-
-    if status.get("betting_open"):
-        commitment_tracker.record_response(
-            street,
-            seat,
-        )
-    else:
-        commitment_tracker.consume_pending_action(
-            street,
-            seat,
-        )
-
-    commitment_tracker.record_action(
-        street,
-        seat,
-    )
-
-    return BoundaryPromotionResult(
-        street=street,
-        seat=seat,
-        resolved=True,
-        action=action.action,
-        reason=resolution.reason,
-        canonical_sequence=action.sequence,
+        prior_live_commitment_bb=(
+            prior_live
+        ),
     )
