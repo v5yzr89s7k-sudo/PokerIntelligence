@@ -69,7 +69,9 @@ class HandEngine:
         }
 
         self.action_order = list(action_order)
-        self.actor_index = 0
+        self.pending_to_act = list(
+            self.action_order
+        )
 
         self.current_price_bb = float(
             big_blind_bb
@@ -91,14 +93,10 @@ class HandEngine:
 
     @property
     def next_actor(self):
-        if self.actor_index >= len(
-            self.action_order
-        ):
+        if not self.pending_to_act:
             return None
 
-        return self.action_order[
-            self.actor_index
-        ]
+        return self.pending_to_act[0]
 
     def _append_action(
         self,
@@ -151,7 +149,35 @@ class HandEngine:
             )
 
     def _advance_actor(self):
-        self.actor_index += 1
+        if self.pending_to_act:
+            self.pending_to_act.pop(0)
+
+    def _reset_pending_after_aggression(
+        self,
+        aggressor,
+    ):
+        if aggressor not in self.action_order:
+            raise ValueError(
+                f"aggressor outside action order: {aggressor}"
+            )
+
+        index = self.action_order.index(
+            aggressor
+        )
+
+        order = (
+            self.action_order[index + 1:]
+            + self.action_order[:index]
+        )
+
+        self.pending_to_act = [
+            seat
+            for seat in order
+            if (
+                seat != aggressor
+                and not self.players[seat].folded
+            )
+        ]
 
     def observe_cards_disappeared(
         self,
@@ -174,6 +200,47 @@ class HandEngine:
         )
 
         self._advance_actor()
+
+        return "FOLD"
+
+    def observe_no_commitment(
+        self,
+        seat,
+    ):
+        """
+        Objective observation that the current actor completed
+        action without committing additional chips.
+
+        HandEngine alone determines whether that can mean CHECK.
+        """
+        self._require_actor(seat)
+
+        player = self.players[seat]
+
+        prior = float(
+            player.street_commitment_bb
+        )
+
+        price = float(
+            self.current_price_bb
+        )
+
+        if abs(prior - price) > EPSILON:
+            raise ValueError(
+                "cannot check while facing a bet: "
+                f"seat={seat} "
+                f"committed={prior} "
+                f"price={price}"
+            )
+
+        self._append_action(
+            seat,
+            "CHECK",
+        )
+
+        self._advance_actor()
+
+        return "CHECK"
 
     def observe_stack_commitment(
         self,
@@ -209,7 +276,13 @@ class HandEngine:
         )
 
         if target > price + EPSILON:
-            action = "RAISE"
+            if (
+                self.street != "PREFLOP"
+                and price <= EPSILON
+            ):
+                action = "BET"
+            else:
+                action = "RAISE"
 
             player.street_commitment_bb = (
                 target
@@ -217,11 +290,18 @@ class HandEngine:
 
             self.current_price_bb = target
 
-            self._append_action(
-                seat,
-                action,
-                raise_to_bb=target,
-            )
+            if action == "BET":
+                self._append_action(
+                    seat,
+                    action,
+                    amount_bb=delta_bb,
+                )
+            else:
+                self._append_action(
+                    seat,
+                    action,
+                    raise_to_bb=target,
+                )
 
         elif abs(
             target - price
@@ -252,9 +332,80 @@ class HandEngine:
                 f"price={price}"
             )
 
-        self._advance_actor()
+        if action in {
+            "BET",
+            "RAISE",
+        }:
+            self._reset_pending_after_aggression(
+                seat
+            )
+        else:
+            self._advance_actor()
 
         return action
+
+    def start_street(
+        self,
+        street,
+        action_order,
+    ):
+        """
+        Advance the single authoritative hand state to a new street.
+
+        The board transition determines the street boundary.
+        Folded state and prior chronology survive.
+        Street-local betting state does not.
+        """
+        street = str(street).upper()
+
+        allowed = {
+            "FLOP",
+            "TURN",
+            "RIVER",
+        }
+
+        if street not in allowed:
+            raise ValueError(
+                f"invalid postflop street: {street}"
+            )
+
+        progression = {
+            "PREFLOP": "FLOP",
+            "FLOP": "TURN",
+            "TURN": "RIVER",
+        }
+
+        expected = progression.get(self.street)
+
+        if street != expected:
+            raise ValueError(
+                "street chronology violation: "
+                f"current={self.street} "
+                f"observed={street} "
+                f"expected={expected}"
+            )
+
+        order = list(action_order)
+
+        for seat in order:
+            if seat not in self.players:
+                raise ValueError(
+                    f"unknown seat in action order: {seat}"
+                )
+
+            if self.players[seat].folded:
+                raise ValueError(
+                    "folded seat cannot enter new street "
+                    f"action order: {seat}"
+                )
+
+        self.street = street
+        self.action_order = order
+        self.pending_to_act = list(order)
+        self.current_price_bb = 0.0
+
+        for player in self.players.values():
+            player.street_commitment_bb = 0.0
 
     def semantic_actions(self):
         return [
