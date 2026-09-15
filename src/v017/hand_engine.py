@@ -12,6 +12,7 @@ class PlayerState:
     name: str
     starting_stack_bb: float
 
+    dealt_in: bool = True
     folded: bool = False
     street_commitment_bb: float = 0.0
 
@@ -78,6 +79,13 @@ class HandEngine:
         )
 
         self.actions: List[HandAction] = []
+
+        # Objective card observations.
+        #
+        # HandEngine stores validated card identity but never
+        # performs card recognition or card inference.
+        self.hero_cards = []
+        self.board = []
 
         self._post_blind(
             small_blind_seat,
@@ -367,10 +375,53 @@ class HandEngine:
 
         return action
 
+    def observe_hero_cards(
+        self,
+        cards,
+    ):
+        """
+        Store an already-observed two-card Hero hand.
+
+        Recognition belongs to perception. HandEngine validates and
+        owns the accepted objective identity only.
+        """
+        cards = list(cards)
+
+        if len(cards) != 2:
+            raise ValueError(
+                "hero cards must contain exactly two cards"
+            )
+
+        if len(set(cards)) != 2:
+            raise ValueError(
+                "hero cards must be distinct"
+            )
+
+        if self.hero_cards:
+            if cards == self.hero_cards:
+                return list(self.hero_cards)
+
+            raise ValueError(
+                "hero cards cannot change within a hand"
+            )
+
+        if any(
+            card in self.board
+            for card in cards
+        ):
+            raise ValueError(
+                "hero card duplicates board card"
+            )
+
+        self.hero_cards = list(cards)
+
+        return list(self.hero_cards)
+
     def start_street(
         self,
         street,
         action_order,
+        board=None,
     ):
         """
         Advance the single authoritative hand state to a new street.
@@ -429,10 +480,56 @@ class HandEngine:
                     f"action order: {seat}"
                 )
 
+        expected_board_length = {
+            "FLOP": 3,
+            "TURN": 4,
+            "RIVER": 5,
+        }[street]
+
+        if board is None:
+            # Existing semantic tests may advance streets without
+            # card identity. This preserves that contract while
+            # ensuring any supplied board is strictly validated.
+            next_board = list(self.board)
+        else:
+            next_board = list(board)
+
+            if len(next_board) != expected_board_length:
+                raise ValueError(
+                    "board length does not match street: "
+                    f"street={street} "
+                    f"cards={len(next_board)}"
+                )
+
+            if len(set(next_board)) != len(next_board):
+                raise ValueError(
+                    "board cards must be distinct"
+                )
+
+            if any(
+                card in self.hero_cards
+                for card in next_board
+            ):
+                raise ValueError(
+                    "board duplicates Hero card"
+                )
+
+            if (
+                self.board
+                and next_board[:len(self.board)]
+                != self.board
+            ):
+                raise ValueError(
+                    "board history cannot change"
+                )
+
         self.street = street
         self.action_order = order
         self.pending_to_act = list(order)
         self.current_price_bb = 0.0
+
+        if board is not None:
+            self.board = next_board
 
         for player in self.players.values():
             player.street_commitment_bb = 0.0
