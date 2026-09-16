@@ -30,6 +30,8 @@ def main():
         hand = result["hand"]
         events = result["events"]
 
+        # The shared replay now continues through the complete
+        # hand. This test owns PREFLOP + FLOP only.
         observed = [
             (
                 row["action"],
@@ -39,6 +41,10 @@ def main():
             )
             for row
             in hand.semantic_actions()
+            if row["street"] in (
+                "PREFLOP",
+                "FLOP",
+            )
         ]
 
         print(
@@ -62,9 +68,25 @@ def main():
             observed
         )
 
-        # We stop at physical TURN boundary before starting TURN.
-        assert hand.street == "FLOP"
-        assert hand.next_actor is None
+        # The shared replay now advances beyond FLOP.
+        # FLOP lifecycle is proven by the TURN boundary event,
+        # not by the replay's eventual final street.
+
+        turn_boundary = [
+            event
+            for event in events
+            if event.get("type")
+            == "TURN_BOUNDARY"
+        ]
+
+        assert len(turn_boundary) == 1
+        assert turn_boundary[0]["frame"] == 103
+        assert (
+            turn_boundary[0][
+                "next_actor_before"
+            ]
+            is None
+        )
 
         # Critical chronology proof:
         # Hero CHECK must have been emitted when later BB physical
@@ -77,6 +99,8 @@ def main():
                 == "CHRONOLOGY_COMPLETION"
                 and event.get("seat")
                 == "hero"
+                and event.get("frame")
+                == 90
                 and event.get(
                     "semantic_action"
                 )

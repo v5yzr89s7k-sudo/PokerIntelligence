@@ -32,6 +32,8 @@ def main():
         hand = result["hand"]
         events = result["events"]
 
+        # The shared replay now continues through RIVER.
+        # This test owns PREFLOP + FLOP + TURN only.
         observed = [
             (
                 row["action"],
@@ -40,6 +42,7 @@ def main():
                 row["raise_to_bb"],
             )
             for row in hand.semantic_actions()
+            if row["street"] != "RIVER"
         ]
 
         print("===== TURN / RIVER BOUNDARY EVENTS =====")
@@ -60,11 +63,9 @@ def main():
 
         assert observed == EXPECTED, observed
 
-        # F5 deliberately stops at the RIVER boundary.
-        # RIVER has been physically observed but has not yet
-        # become the active HandEngine street.
-        assert hand.street == "TURN"
-        assert hand.next_actor is None
+        # The shared replay now advances through RIVER.
+        # TURN completion is owned by the objective RIVER
+        # boundary assertions below, not final replay state.
 
         turn_start = [
             row

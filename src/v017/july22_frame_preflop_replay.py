@@ -25,6 +25,7 @@ import cv2
 from src.events.detectors.card_presence import (
     opponent_cards_visible,
     count_board_cards,
+    hero_cards_visible,
 )
 from src.vision.stack_reader import (
     read_stack,
@@ -273,6 +274,7 @@ def replay(
 
     previous_frame = None
     previous_text = None
+    previous_hero_cards_visible = None
 
     if progression_dir is not None:
         progression_dir = Path(
@@ -286,7 +288,7 @@ def replay(
 
     for number in range(
         1,
-        116,
+        136,
     ):
         frame_started = (
             time.perf_counter()
@@ -867,6 +869,67 @@ def replay(
                 }
             )
 
+            hand.start_street(
+                "RIVER",
+                [
+                    "hero",
+                    "seat_lower_left",
+                ],
+                board=observed_board,
+            )
+
+            events.append(
+                {
+                    "frame": number,
+                    "type": "STREET_STARTED",
+                    "street": "RIVER",
+                    "next_actor":
+                        hand.next_actor,
+                }
+            )
+
+        # ----------------------------------------------------
+        # RIVER physical chronology.
+        # ----------------------------------------------------
+
+        hero_visible_now = bool(
+            hero_cards_visible(
+                frame,
+                GEOMETRY,
+            )
+        )
+
+        if hand.street == "RIVER":
+            # Quantitative action chronology is owned exclusively
+            # by the generic stack-motion lane above.
+            #
+            # River-specific handling is limited to direct Hero
+            # card-disappearance evidence for a fold.
+
+            # Hero's cards disappearing while Hero is the pending
+            # actor is direct physical fold evidence.
+            if (
+                previous_hero_cards_visible
+                is True
+                and hero_visible_now is False
+                and hand.next_actor == "hero"
+            ):
+                action = hand.observe_fold(
+                    "hero"
+                )
+
+                events.append(
+                    {
+                        "frame": number,
+                        "type":
+                            "HERO_CARDS_DISAPPEARED",
+                        "street": "RIVER",
+                        "seat": "hero",
+                        "semantic_action":
+                            action,
+                    }
+                )
+
         # ----------------------------------------------------
         # Product publication.
         # ----------------------------------------------------
@@ -916,9 +979,16 @@ def replay(
             previous_text = text
 
         previous_frame = frame
+        previous_hero_cards_visible = (
+            hero_visible_now
+        )
 
-        if board_count >= 5:
+        if (
+            hand.street == "RIVER"
+            and hand.next_actor is None
+        ):
             break
+
 
     return {
         "hand": hand,
