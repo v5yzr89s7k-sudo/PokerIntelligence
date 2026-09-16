@@ -39,6 +39,16 @@ from src.v017.stack_motion_gate import (
 from src.v017.fast_stack_resolver import (
     resolve_fast_stack,
 )
+from src.v017.chronology_completion import (
+    predecessors_before_actor,
+)
+from src.v017.commitment_normalizer import (
+    normalize_commitment_delta,
+)
+from src.v017.card_observation import (
+    board_after_from_transition,
+    normalize_cards,
+)
 from src.v017.current_hand_renderer import (
     render_current_hand,
 )
@@ -51,6 +61,62 @@ ROOT = Path(
 GEOMETRY = json.loads(
     Path("config/geometry.json").read_text()
 )
+
+BOARD_OBSERVATION_PATH = (
+    ROOT
+    / "v017_direct_board_transition_reads.json"
+)
+
+
+def load_board_observations():
+    if not BOARD_OBSERVATION_PATH.exists():
+        raise RuntimeError(
+            "missing independent board perception artifact: "
+            f"{BOARD_OBSERVATION_PATH}"
+        )
+
+    rows = json.loads(
+        BOARD_OBSERVATION_PATH.read_text()
+    )
+
+    observations = {}
+
+    for row in rows:
+        after_frame = int(
+            row["after"]
+        )
+
+        observation = (
+            row.get("observation")
+            or {}
+        )
+
+        board = (
+            board_after_from_transition(
+                observation
+            )
+        )
+
+        hero_cards = normalize_cards(
+            observation.get(
+                "hero_cards_after"
+            )
+            or []
+        )
+
+        observations[
+            after_frame
+        ] = {
+            "board": board,
+            "hero_cards":
+                hero_cards,
+            "source_before":
+                int(row["before"]),
+            "source_after":
+                after_frame,
+        }
+
+    return observations
 
 
 # Initial table facts only.
@@ -182,6 +248,10 @@ def replay(
 ):
     hand = build_engine()
 
+    board_observations = (
+        load_board_observations()
+    )
+
     trusted_stacks = dict(
         TRACKED_STACKS
     )
@@ -215,7 +285,7 @@ def replay(
 
     for number in range(
         1,
-        53,
+        104,
     ):
         frame_started = (
             time.perf_counter()
@@ -307,28 +377,35 @@ def replay(
         # animates, it cannot create an out-of-order action.
         # ----------------------------------------------------
 
-        if (
-            previous_frame is not None
-            and hand.next_actor
-            in trusted_stacks
-        ):
-            seat = hand.next_actor
+        if previous_frame is not None:
+            # Only physical motion from a seat still present in
+            # authoritative chronology may advance semantics.
+            #
+            # We inspect tracked quantitative seats, but a wake
+            # remains merely permission to OCR.
+            for seat in (
+                "seat_lower_right",
+                "hero",
+                "seat_lower_left",
+            ):
+                if seat not in trusted_stacks:
+                    continue
 
-            motion = (
-                measure_stack_motion(
-                    previous_frame,
-                    frame,
-                    GEOMETRY,
-                    seat,
+                motion = (
+                    measure_stack_motion(
+                        previous_frame,
+                        frame,
+                        GEOMETRY,
+                        seat,
+                    )
                 )
-            )
 
-            if motion.wake:
-                prior = (
-                    trusted_stacks[
-                        seat
-                    ]
-                )
+                if not motion.wake:
+                    continue
+
+                prior = trusted_stacks[
+                    seat
+                ]
 
                 ocr_started = (
                     time.perf_counter()
@@ -374,7 +451,6 @@ def replay(
                         ),
                 }
 
-                # A wake or unchanged read is not an action.
                 if (
                     resolution.resolved
                     and resolution.value
@@ -384,52 +460,282 @@ def replay(
                         resolution.value
                     )
 
-                    delta = round(
+                    physical_delta = round(
                         prior - value,
                         2,
                     )
 
-                    if delta > 0.02:
-                        action = (
-                            hand
-                            .observe_stack_commitment(
-                                seat,
-                                delta,
+                    event[
+                        "physical_delta_bb"
+                    ] = physical_delta
+
+                    if physical_delta > 0.02:
+                        # A later physical actor proves all
+                        # authoritative predecessors completed first.
+                        if (
+                            hand.next_actor is not None
+                            and seat != hand.next_actor
+                            and seat in hand.pending_to_act
+                        ):
+                            predecessors = (
+                                predecessors_before_actor(
+                                    hand.pending_to_act,
+                                    seat,
+                                )
                             )
-                        )
 
-                        trusted_stacks[
-                            seat
-                        ] = value
+                            for predecessor in predecessors:
+                                action = (
+                                    hand.observe_no_commitment(
+                                        predecessor
+                                    )
+                                )
 
-                        event[
-                            "delta_bb"
-                        ] = delta
+                                events.append(
+                                    {
+                                        "frame": number,
+                                        "type":
+                                            "CHRONOLOGY_COMPLETION",
+                                        "seat":
+                                            predecessor,
+                                        "proved_by":
+                                            seat,
+                                        "semantic_action":
+                                            action,
+                                    }
+                                )
 
-                        event[
-                            "semantic_action"
-                        ] = action
+                        # The physical seat must now be authoritative.
+                        if hand.next_actor == seat:
+                            player = (
+                                hand.players[
+                                    seat
+                                ]
+                            )
+
+                            measurement = (
+                                normalize_commitment_delta(
+                                    observed_delta_bb=(
+                                        physical_delta
+                                    ),
+                                    prior_street_commitment_bb=(
+                                        player
+                                        .street_commitment_bb
+                                    ),
+                                    current_price_bb=(
+                                        hand
+                                        .current_price_bb
+                                    ),
+                                )
+                            )
+
+                            action = (
+                                hand.observe_stack_commitment(
+                                    seat,
+                                    measurement
+                                    .normalized_delta_bb,
+                                )
+                            )
+
+                            trusted_stacks[
+                                seat
+                            ] = value
+
+                            event[
+                                "normalized_delta_bb"
+                            ] = (
+                                measurement
+                                .normalized_delta_bb
+                            )
+
+                            event[
+                                "snapped_to_call_price"
+                            ] = (
+                                measurement
+                                .snapped_to_call_price
+                            )
+
+                            event[
+                                "semantic_action"
+                            ] = action
 
                 events.append(
                     event
                 )
 
         # ----------------------------------------------------
-        # FLOP boundary.
-        #
-        # For this preflop slice, reaching three board cards
-        # proves preflop is over. It may not fabricate any
-        # missing quantitative action.
+        # Objective street boundaries.
         # ----------------------------------------------------
 
-        if board_count >= 3:
+        if (
+            board_count >= 3
+            and hand.street == "PREFLOP"
+        ):
+            events.append(
+                {
+                    "frame": number,
+                    "type": "FLOP_BOUNDARY",
+                    "next_actor_before":
+                        hand.next_actor,
+                }
+            )
+
+            if hand.next_actor is not None:
+                raise ValueError(
+                    "FLOP appeared before PREFLOP "
+                    "chronology closed: "
+                    f"next_actor={hand.next_actor}"
+                )
+
+            card_observation = (
+                board_observations.get(
+                    number
+                )
+            )
+
+            if card_observation is None:
+                raise ValueError(
+                    "FLOP boundary has no independent "
+                    "board identity observation: "
+                    f"frame={number}"
+                )
+
+            observed_board = list(
+                card_observation[
+                    "board"
+                ]
+            )
+
+            if len(observed_board) != 3:
+                raise ValueError(
+                    "invalid observed FLOP board: "
+                    f"{observed_board}"
+                )
+
+            observed_hero_cards = list(
+                card_observation[
+                    "hero_cards"
+                ]
+            )
+
+            if observed_hero_cards:
+                hand.observe_hero_cards(
+                    observed_hero_cards
+                )
+
+            hand.start_street(
+                "FLOP",
+                [
+                    "hero",
+                    "seat_lower_left",
+                    "seat_lower_right",
+                ],
+                board=observed_board,
+            )
+
             events.append(
                 {
                     "frame": number,
                     "type":
-                        "FLOP_BOUNDARY",
+                        "BOARD_IDENTITY_OBSERVED",
+                    "street": "FLOP",
+                    "board":
+                        observed_board,
+                    "hero_cards":
+                        observed_hero_cards,
+                    "source_frames": [
+                        card_observation[
+                            "source_before"
+                        ],
+                        card_observation[
+                            "source_after"
+                        ],
+                    ],
+                }
+            )
+
+            events.append(
+                {
+                    "frame": number,
+                    "type": "STREET_STARTED",
+                    "street": "FLOP",
                     "next_actor":
                         hand.next_actor,
+                }
+            )
+
+        elif (
+            board_count >= 4
+            and hand.street == "FLOP"
+        ):
+            events.append(
+                {
+                    "frame": number,
+                    "type": "TURN_BOUNDARY",
+                    "next_actor_before":
+                        hand.next_actor,
+                }
+            )
+
+            if hand.next_actor is not None:
+                raise ValueError(
+                    "TURN appeared before FLOP "
+                    "chronology closed: "
+                    f"next_actor={hand.next_actor}"
+                )
+
+            card_observation = (
+                board_observations.get(
+                    number
+                )
+            )
+
+            if card_observation is None:
+                raise ValueError(
+                    "TURN boundary has no independent "
+                    "board identity observation: "
+                    f"frame={number}"
+                )
+
+            observed_board = list(
+                card_observation[
+                    "board"
+                ]
+            )
+
+            if len(observed_board) != 4:
+                raise ValueError(
+                    "invalid observed TURN board: "
+                    f"{observed_board}"
+                )
+
+            if (
+                observed_board[:3]
+                != list(hand.board)
+            ):
+                raise ValueError(
+                    "TURN board does not extend "
+                    "authoritative FLOP board: "
+                    f"current={hand.board} "
+                    f"observed={observed_board}"
+                )
+
+            events.append(
+                {
+                    "frame": number,
+                    "type":
+                        "BOARD_IDENTITY_OBSERVED",
+                    "street": "TURN",
+                    "board":
+                        observed_board,
+                    "source_frames": [
+                        card_observation[
+                            "source_before"
+                        ],
+                        card_observation[
+                            "source_after"
+                        ],
+                    ],
                 }
             )
 
@@ -483,7 +789,7 @@ def replay(
 
         previous_frame = frame
 
-        if board_count >= 3:
+        if board_count >= 4:
             break
 
     return {
