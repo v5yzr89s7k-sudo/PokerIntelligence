@@ -46,6 +46,10 @@ from src.v017.commitment_normalizer import (
 from src.v017.hand_engine import (
     HandEngine,
 )
+from src.v017.current_hand_renderer import (
+    render_current_hand,
+)
+
 from src.v017.stack_motion_gate import (
     measure_stack_motion,
 )
@@ -162,6 +166,42 @@ class FrameHandObserver:
             None
         )
 
+    def _publish_if_changed(
+        self,
+        frame_id,
+    ):
+        """
+        Publish a read-only projection of authoritative HandEngine state.
+
+        This method has no semantic authority. It runs only after a
+        successful admission has already mutated HandEngine.
+        """
+        text = render_current_hand(
+            self.hand,
+            hand_id=self.hand_id,
+        )
+
+        if text == self.previous_text:
+            return None
+
+        publication = {
+            "frame": frame_id,
+            "action_count":
+                len(self.hand.actions),
+            "next_actor":
+                self.hand.next_actor,
+            "street":
+                self.hand.street,
+            "text": text,
+        }
+
+        self.publications.append(
+            publication
+        )
+        self.previous_text = text
+
+        return publication
+
     def _stack_crop(
         self,
         frame,
@@ -245,6 +285,10 @@ class FrameHandObserver:
         }
 
         self.events.append(event)
+
+        self._publish_if_changed(
+            frame_id
+        )
 
         return action
 
@@ -396,6 +440,10 @@ class FrameHandObserver:
 
         self.events.append(event)
         emitted.append(event)
+
+        self._publish_if_changed(
+            observation.get("frame")
+        )
 
         return tuple(emitted)
 
@@ -566,6 +614,10 @@ class FrameHandObserver:
 
         self.events.append(admitted)
         emitted.append(admitted)
+
+        self._publish_if_changed(
+            observation.get("frame")
+        )
 
         return tuple(emitted)
 
