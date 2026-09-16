@@ -223,10 +223,14 @@ def render_current_hand(
             if action["street"] == street
         ]
 
-        # Do not render streets that have not occurred.
+        # A street has occurred once HandEngine says it is active,
+        # even before that street has an action.
+        #
+        # Suppress only future/inactive streets with no actions.
         if (
             street != "PREFLOP"
             and not street_actions
+            and street != hand.street
         ):
             continue
 

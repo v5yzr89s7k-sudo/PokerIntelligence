@@ -41,6 +41,7 @@ from src.v017.fast_stack_resolver import (
 )
 from src.v017.chronology_completion import (
     predecessors_before_actor,
+    remaining_before_street_boundary,
 )
 from src.v017.commitment_normalizer import (
     normalize_commitment_delta,
@@ -285,7 +286,7 @@ def replay(
 
     for number in range(
         1,
-        104,
+        116,
     ):
         frame_started = (
             time.perf_counter()
@@ -739,6 +740,133 @@ def replay(
                 }
             )
 
+            hand.start_street(
+                "TURN",
+                [
+                    "hero",
+                    "seat_lower_left",
+                ],
+                board=observed_board,
+            )
+
+            events.append(
+                {
+                    "frame": number,
+                    "type": "STREET_STARTED",
+                    "street": "TURN",
+                    "next_actor":
+                        hand.next_actor,
+                }
+            )
+
+        # ----------------------------------------------------
+        # RIVER boundary closes remaining TURN chronology.
+        # ----------------------------------------------------
+
+        if (
+            board_count >= 5
+            and hand.street == "TURN"
+        ):
+            events.append(
+                {
+                    "frame": number,
+                    "type": "RIVER_BOUNDARY",
+                    "pending_before":
+                        list(
+                            hand.pending_to_act
+                        ),
+                }
+            )
+
+            remaining = (
+                remaining_before_street_boundary(
+                    hand.pending_to_act
+                )
+            )
+
+            for seat in remaining:
+                action = (
+                    hand.observe_no_commitment(
+                        seat
+                    )
+                )
+
+                events.append(
+                    {
+                        "frame": number,
+                        "type":
+                            "STREET_BOUNDARY_COMPLETION",
+                        "street": "TURN",
+                        "seat": seat,
+                        "proved_by":
+                            "RIVER_BOUNDARY",
+                        "semantic_action":
+                            action,
+                    }
+                )
+
+            if hand.next_actor is not None:
+                raise ValueError(
+                    "TURN chronology did not close "
+                    "at RIVER boundary: "
+                    f"next_actor={hand.next_actor}"
+                )
+
+            card_observation = (
+                board_observations.get(
+                    number
+                )
+            )
+
+            if card_observation is None:
+                raise ValueError(
+                    "RIVER boundary has no independent "
+                    "board identity observation: "
+                    f"frame={number}"
+                )
+
+            observed_board = list(
+                card_observation[
+                    "board"
+                ]
+            )
+
+            if len(observed_board) != 5:
+                raise ValueError(
+                    "invalid observed RIVER board: "
+                    f"{observed_board}"
+                )
+
+            if (
+                observed_board[:4]
+                != list(hand.board)
+            ):
+                raise ValueError(
+                    "RIVER board does not extend "
+                    "authoritative TURN board: "
+                    f"current={hand.board} "
+                    f"observed={observed_board}"
+                )
+
+            events.append(
+                {
+                    "frame": number,
+                    "type":
+                        "BOARD_IDENTITY_OBSERVED",
+                    "street": "RIVER",
+                    "board":
+                        observed_board,
+                    "source_frames": [
+                        card_observation[
+                            "source_before"
+                        ],
+                        card_observation[
+                            "source_after"
+                        ],
+                    ],
+                }
+            )
+
         # ----------------------------------------------------
         # Product publication.
         # ----------------------------------------------------
@@ -789,7 +917,7 @@ def replay(
 
         previous_frame = frame
 
-        if board_count >= 4:
+        if board_count >= 5:
             break
 
     return {
