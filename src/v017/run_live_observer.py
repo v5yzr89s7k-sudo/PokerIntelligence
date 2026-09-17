@@ -59,6 +59,7 @@ from src.v017.stack_settlement_gate import (
 
 from src.v017.frame_hand_observer import (
     FrameHandObserver,
+    common_mode_stack_shift_seats,
 )
 from src.v017.live_product_sink import (
     publish_current_hand_text,
@@ -808,6 +809,43 @@ def bootstrap_observer(
     return observer
 
 
+def filter_common_mode_quantitative_events(
+    events,
+):
+    """
+    Split one complete physical frame into quantitative observations
+    eligible for settlement and correlated common-mode observations
+    that must remain evidence-only.
+
+    This function owns no poker semantics and creates no settlement
+    ownership.
+    """
+    quantitative = [
+        event
+        for event in events
+        if event.get("type")
+        == "STACK_QUANTITATIVE_OBSERVATION"
+    ]
+
+    rejected_seats = common_mode_stack_shift_seats(
+        quantitative
+    )
+
+    eligible = tuple(
+        event
+        for event in quantitative
+        if event.get("seat") not in rejected_seats
+    )
+
+    rejected = tuple(
+        event
+        for event in quantitative
+        if event.get("seat") in rejected_seats
+    )
+
+    return eligible, rejected
+
+
 def run_hand(
     window,
     observer,
@@ -847,6 +885,18 @@ def run_hand(
             sensor_frame=sensor_image,
             sensor_geometry=SENSOR_GEOMETRY,
         )
+
+        (
+            quantitative_settlement_events,
+            common_mode_quantitative_events,
+        ) = filter_common_mode_quantitative_events(
+            result.events
+        )
+
+        common_mode_seats = {
+            event.get("seat")
+            for event in common_mode_quantitative_events
+        }
 
         for event in result.events:
             typ = event["type"]
@@ -932,6 +982,17 @@ def run_hand(
                 typ
                 == "STACK_QUANTITATIVE_OBSERVATION"
             ):
+                if event.get("seat") in common_mode_seats:
+                    print(
+                        "[COMMON_MODE_STACK_SHIFT_REJECTED]",
+                        f"frame={frame_id}",
+                        f"seat={event.get('seat')}",
+                        f"prior={event.get('prior')}",
+                        f"value={event.get('resolved_value')}",
+                        flush=True,
+                    )
+                    continue
+
                 # Raw OCR never mutates HandEngine directly.
                 #
                 # StackSettlementGate requires independent temporal

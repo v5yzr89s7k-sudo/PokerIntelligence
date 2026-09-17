@@ -67,6 +67,68 @@ from src.v017.stack_motion_gate import (
 )
 
 
+def common_mode_stack_shift_seats(
+    observations,
+    *,
+    minimum_seats=3,
+    delta_tolerance_bb=0.02,
+):
+    """
+    Identify correlated same-frame stack displacement.
+
+    A real poker action is seat-local. When at least three seats
+    independently report effectively the same positive stack decrease
+    in one physical frame, that shared displacement is common-mode
+    measurement evidence and must not receive quantitative authority.
+
+    This function owns no poker semantics.
+    """
+    groups = []
+
+    for observation in observations:
+        prior = observation.get("prior")
+        value = observation.get("resolved_value")
+
+        if prior is None or value is None:
+            continue
+
+        delta = round(
+            float(prior) - float(value),
+            2,
+        )
+
+        if delta <= 0.02:
+            continue
+
+        matched = None
+
+        for group in groups:
+            if abs(
+                delta - group["delta"]
+            ) <= delta_tolerance_bb:
+                matched = group
+                break
+
+        if matched is None:
+            matched = {
+                "delta": delta,
+                "seats": set(),
+            }
+            groups.append(matched)
+
+        matched["seats"].add(
+            str(observation.get("seat"))
+        )
+
+    rejected = set()
+
+    for group in groups:
+        if len(group["seats"]) >= minimum_seats:
+            rejected.update(group["seats"])
+
+    return rejected
+
+
 @dataclass(frozen=True)
 class FrameObservationResult:
     """
