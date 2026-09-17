@@ -10,7 +10,7 @@ class PlayerState:
     seat: str
     position: str
     name: str
-    starting_stack_bb: float
+    starting_stack_bb: Optional[float]
 
     dealt_in: bool = True
     folded: bool = False
@@ -62,8 +62,12 @@ class HandEngine:
                 seat=item["seat"],
                 position=item["position"],
                 name=item["name"],
-                starting_stack_bb=float(
-                    item["stack_bb"]
+                starting_stack_bb=(
+                    None
+                    if item.get("stack_bb") is None
+                    else float(
+                        item["stack_bb"]
+                    )
                 ),
             )
             for item in players
@@ -217,6 +221,20 @@ class HandEngine:
         )
 
         self._advance_actor()
+
+        # A fold leaving one dealt-in, non-folded player is
+        # terminal. No player retains a betting obligation.
+        remaining_after_fold = [
+            candidate.seat
+            for candidate in self.players.values()
+            if (
+                candidate.dealt_in
+                and not candidate.folded
+            )
+        ]
+
+        if len(remaining_after_fold) == 1:
+            self.pending_to_act = []
 
         return "FOLD"
 

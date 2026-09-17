@@ -1,0 +1,467 @@
+{
+  "action_buttons": {
+    "primary": {
+      "height": 224,
+      "width": 533,
+      "x": 1526,
+      "y": 1535
+    }
+  },
+  "bet_regions": {
+    "hero": {
+      "height": 139,
+      "width": 333,
+      "x": 1584,
+      "y": 1373
+    },
+    "seat_lower_left": {
+      "height": 179,
+      "width": 319,
+      "x": 1159,
+      "y": 1401
+    },
+    "seat_lower_right": {
+      "height": 169,
+      "width": 261,
+      "x": 2026,
+      "y": 1377
+    },
+    "seat_mid_left": {
+      "height": 173,
+      "width": 294,
+      "x": 839,
+      "y": 971
+    },
+    "seat_mid_right": {
+      "height": 183,
+      "width": 328,
+      "x": 2301,
+      "y": 958
+    },
+    "seat_top": {
+      "height": 143,
+      "width": 420,
+      "x": 1520,
+      "y": 598
+    },
+    "seat_upper_left": {
+      "height": 153,
+      "width": 289,
+      "x": 969,
+      "y": 567
+    },
+    "seat_upper_right": {
+      "height": 192,
+      "width": 332,
+      "x": 2152,
+      "y": 537
+    }
+  },
+  "board": {
+    "flop_1": {
+      "height": 324,
+      "width": 240,
+      "x": 1095,
+      "y": 876
+    },
+    "flop_2": {
+      "height": 323,
+      "width": 247,
+      "x": 1341,
+      "y": 880
+    },
+    "flop_3": {
+      "height": 324,
+      "width": 241,
+      "x": 1599,
+      "y": 873
+    },
+    "river": {
+      "height": 293,
+      "width": 233,
+      "x": 2088,
+      "y": 879
+    },
+    "turn": {
+      "height": 300,
+      "width": 241,
+      "x": 1843,
+      "y": 879
+    }
+  },
+  "board_api_crop": {
+    "height": 500,
+    "width": 1482,
+    "x": 986,
+    "y": 628
+  },
+  "dealer_button_centers": {
+    "hero": {
+      "x": 1972,
+      "y": 1495
+    },
+    "seat_lower_left": {
+      "x": 1238,
+      "y": 1482
+    },
+    "seat_lower_right": {
+      "x": 2213,
+      "y": 1482
+    },
+    "seat_mid_left": {
+      "x": 887,
+      "y": 1152
+    },
+    "seat_mid_right": {
+      "x": 2552,
+      "y": 1150
+    },
+    "seat_top": {
+      "x": 1962,
+      "y": 567
+    },
+    "seat_upper_left": {
+      "x": 866,
+      "y": 726
+    },
+    "seat_upper_right": {
+      "x": 2621,
+      "y": 724
+    }
+  },
+  "dealer_button_zones": {
+    "hero": [
+      {
+        "height": 167,
+        "width": 209,
+        "x": 1877,
+        "y": 1421
+      },
+      {
+        "height": 166,
+        "width": 208,
+        "x": 1512,
+        "y": 1421
+      }
+    ],
+    "seat_lower_left": [
+      {
+        "height": 166,
+        "width": 208,
+        "x": 1493,
+        "y": 1421
+      },
+      {
+        "height": 166,
+        "width": 209,
+        "x": 1133,
+        "y": 1398
+      }
+    ],
+    "seat_lower_right": [
+      {
+        "height": 167,
+        "width": 209,
+        "x": 2124,
+        "y": 1409
+      },
+      {
+        "height": 167,
+        "width": 209,
+        "x": 2260,
+        "y": 1196
+      }
+    ],
+    "seat_mid_left": [
+      {
+        "height": 164,
+        "width": 208,
+        "x": 786,
+        "y": 1111
+      },
+      {
+        "height": 165,
+        "width": 208,
+        "x": 988,
+        "y": 1202
+      }
+    ],
+    "seat_mid_right": [
+      {
+        "height": 165,
+        "width": 209,
+        "x": 2457,
+        "y": 1108
+      }
+    ],
+    "seat_top": [
+      {
+        "height": 165,
+        "width": 207,
+        "x": 1373,
+        "y": 501
+      },
+      {
+        "height": 166,
+        "width": 208,
+        "x": 1855,
+        "y": 500
+      }
+    ],
+    "seat_upper_left": [
+      {
+        "height": 166,
+        "width": 208,
+        "x": 747,
+        "y": 656
+      }
+    ],
+    "seat_upper_right": [
+      {
+        "height": 166,
+        "width": 209,
+        "x": 2495,
+        "y": 654
+      }
+    ]
+  },
+  "geometry_version": "v017-maximized-native-final",
+  "hero_cards": {
+    "card_1": {
+      "height": 159,
+      "width": 183,
+      "x": 1603,
+      "y": 1568
+    },
+    "card_2": {
+      "height": 169,
+      "width": 187,
+      "x": 1792,
+      "y": 1558
+    }
+  },
+  "hole_cards": {
+    "hero": {
+      "card_1": {
+        "height": 159,
+        "width": 183,
+        "x": 1603,
+        "y": 1568
+      },
+      "card_2": {
+        "height": 169,
+        "width": 187,
+        "x": 1792,
+        "y": 1558
+      }
+    },
+    "seat_lower_left": {
+      "card_1": {
+        "height": 147,
+        "width": 184,
+        "x": 755,
+        "y": 1417
+      },
+      "card_2": {
+        "height": 142,
+        "width": 181,
+        "x": 959,
+        "y": 1418
+      }
+    },
+    "seat_lower_right": {
+      "card_1": {
+        "height": 136,
+        "width": 189,
+        "x": 2311,
+        "y": 1420
+      },
+      "card_2": {
+        "height": 138,
+        "width": 183,
+        "x": 2511,
+        "y": 1419
+      }
+    },
+    "seat_mid_left": {
+      "card_1": {
+        "height": 131,
+        "width": 187,
+        "x": 350,
+        "y": 965
+      },
+      "card_2": {
+        "height": 136,
+        "width": 178,
+        "x": 556,
+        "y": 965
+      }
+    },
+    "seat_mid_right": {
+      "card_1": {
+        "height": 131,
+        "width": 190,
+        "x": 2706,
+        "y": 962
+      },
+      "card_2": {
+        "height": 134,
+        "width": 194,
+        "x": 2906,
+        "y": 959
+      }
+    },
+    "seat_top": {
+      "card_1": {
+        "height": 134,
+        "width": 186,
+        "x": 1515,
+        "y": 227
+      },
+      "card_2": {
+        "height": 134,
+        "width": 165,
+        "x": 1726,
+        "y": 217
+      }
+    },
+    "seat_upper_left": {
+      "card_1": {
+        "height": 126,
+        "width": 180,
+        "x": 510,
+        "y": 368
+      },
+      "card_2": {
+        "height": 146,
+        "width": 179,
+        "x": 712,
+        "y": 351
+      }
+    },
+    "seat_upper_right": {
+      "card_1": {
+        "height": 118,
+        "width": 181,
+        "x": 2536,
+        "y": 376
+      },
+      "card_2": {
+        "height": 138,
+        "width": 170,
+        "x": 2737,
+        "y": 356
+      }
+    }
+  },
+  "pot_region": {
+    "height": 53,
+    "width": 408,
+    "x": 1545,
+    "y": 828
+  },
+  "seat_regions": {
+    "hero": {
+      "height": 224,
+      "width": 390,
+      "x": 1611,
+      "y": 1698
+    },
+    "seat_lower_left": {
+      "height": 224,
+      "width": 387,
+      "x": 759,
+      "y": 1518
+    },
+    "seat_lower_right": {
+      "height": 224,
+      "width": 390,
+      "x": 2304,
+      "y": 1566
+    },
+    "seat_mid_left": {
+      "height": 223,
+      "width": 399,
+      "x": 360,
+      "y": 1084
+    },
+    "seat_mid_right": {
+      "height": 226,
+      "width": 411,
+      "x": 2705,
+      "y": 1078
+    },
+    "seat_top": {
+      "height": 224,
+      "width": 401,
+      "x": 1510,
+      "y": 323
+    },
+    "seat_upper_left": {
+      "height": 223,
+      "width": 386,
+      "x": 510,
+      "y": 486
+    },
+    "seat_upper_right": {
+      "height": 224,
+      "width": 448,
+      "x": 2502,
+      "y": 492
+    }
+  },
+  "stack_regions": {
+    "hero": {
+      "height": 174,
+      "width": 432,
+      "x": 1581,
+      "y": 1782
+    },
+    "seat_lower_left": {
+      "height": 174,
+      "width": 432,
+      "x": 734,
+      "y": 1614
+    },
+    "seat_lower_right": {
+      "height": 174,
+      "width": 432,
+      "x": 2303,
+      "y": 1621
+    },
+    "seat_mid_left": {
+      "height": 174,
+      "width": 432,
+      "x": 350,
+      "y": 1152
+    },
+    "seat_mid_right": {
+      "height": 174,
+      "width": 432,
+      "x": 2686,
+      "y": 1153
+    },
+    "seat_top": {
+      "height": 174,
+      "width": 432,
+      "x": 1505,
+      "y": 403
+    },
+    "seat_upper_left": {
+      "height": 174,
+      "width": 432,
+      "x": 517,
+      "y": 562
+    },
+    "seat_upper_right": {
+      "height": 174,
+      "width": 432,
+      "x": 2514,
+      "y": 557
+    }
+  },
+  "table_size": {
+    "height": 2168,
+    "width": 3456
+  }
+}

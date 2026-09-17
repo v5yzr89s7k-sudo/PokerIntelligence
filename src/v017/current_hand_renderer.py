@@ -189,7 +189,7 @@ def render_current_hand(
         lines.append(
             f"{player.position:<8} "
             f"{player.name:<24} "
-            f"{_bb(player.starting_stack_bb):>10}"
+            f"{(_bb(player.starting_stack_bb) if player.starting_stack_bb is not None else 'unknown'):>10}"
             f"{marker}"
         )
 

@@ -141,7 +141,23 @@ def main():
     )
 
     assert action == "FOLD"
-    assert observer.next_actor == "bb"
+
+    # First and Hero have now folded, leaving BB as the sole
+    # dealt-in non-folded player. The hand is terminal; BB does
+    # not retain a betting obligation.
+    assert observer.next_actor is None
+    assert observer.hand.pending_to_act == []
+
+    remaining = [
+        player.seat
+        for player in observer.hand.players.values()
+        if (
+            player.dealt_in
+            and not player.folded
+        )
+    ]
+
+    assert remaining == ["bb"]
     assert len(observer.hand.actions) == 4
 
     assert (

@@ -110,10 +110,20 @@ class BetRegionStateTracker:
             self.initialized = True
             return transitions
 
-        seats = (
-            set(self.confirmed.keys())
-            | set(occupancy.keys())
-        )
+        # Preserve the deterministic physical detector order.
+        #
+        # occupancy inherits geometry insertion order. Tracker-owned
+        # seats absent from the current observation are appended in
+        # their existing deterministic insertion order.
+        #
+        # Do not use a set union here: its iteration order varies with
+        # Python hash seed and makes same-frame transition processing
+        # nondeterministic.
+        seats = list(occupancy.keys())
+
+        for seat in self.confirmed.keys():
+            if seat not in occupancy:
+                seats.append(seat)
 
         for seat in seats:
             info = dict(occupancy.get(seat, {}) or {})
