@@ -45,6 +45,7 @@ def main():
         "flop_bet_call",
         "flop_raise_call",
         "turn_river_vertical",
+        "hero_river_fold_terminal",
     )
 
     expected_preflop = expected_registry[:5]
