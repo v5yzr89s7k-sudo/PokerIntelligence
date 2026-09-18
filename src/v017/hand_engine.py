@@ -14,6 +14,7 @@ class PlayerState:
 
     dealt_in: bool = True
     folded: bool = False
+    all_in: bool = False
     street_commitment_bb: float = 0.0
 
 
@@ -164,6 +165,14 @@ class HandEngine:
         if self.pending_to_act:
             self.pending_to_act.pop(0)
 
+    def _is_actionable(self, seat):
+        player = self.players[seat]
+        return (
+            player.dealt_in
+            and not player.folded
+            and not player.all_in
+        )
+
     def _reset_pending_after_aggression(
         self,
         aggressor,
@@ -187,7 +196,7 @@ class HandEngine:
             for seat in order
             if (
                 seat != aggressor
-                and not self.players[seat].folded
+                and self._is_actionable(seat)
             )
         ]
 
@@ -397,6 +406,9 @@ class HandEngine:
                 amount_bb=delta_bb,
             )
 
+        if all_in_confirmed:
+            player.all_in = True
+
         if action in {
             "BET",
             "RAISE",
@@ -559,7 +571,11 @@ class HandEngine:
 
         self.street = street
         self.action_order = order
-        self.pending_to_act = list(order)
+        self.pending_to_act = [
+            seat
+            for seat in order
+            if self._is_actionable(seat)
+        ]
         self.current_price_bb = 0.0
 
         if board is not None:

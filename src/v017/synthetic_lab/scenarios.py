@@ -2305,6 +2305,206 @@ HERO_RIVER_FOLD_TERMINAL = validate_scenario(
 )
 
 
+
+
+# ------------------------------------------------------------
+# Scenario 012
+#
+# Heads-up preflop all-in followed by automatic board runout.
+#
+# Both commitments require explicit independent physical all-in
+# authority. Once HandEngine accepts that authority, persistent
+# all-in state owns future non-actionability.
+#
+# The factory deliberately continues supplying both dealt-in,
+# non-folded seats at every street boundary. HandEngine must
+# filter them from pending_to_act.
+#
+# FLOP / TURN / RIVER therefore advance with no fabricated
+# CHECK or other semantic betting action.
+# ------------------------------------------------------------
+
+ALLIN_AUTOMATIC_RUNOUT = validate_scenario(
+    FactoryScenario(
+        name="allin_automatic_runout",
+        players=(
+            ScenarioPlayer(
+                seat="hero",
+                position="SB",
+                name="Hero",
+                # Visible stack remaining behind after
+                # the forced 0.5 BB small blind.
+                stack_bb=4.5,
+                is_hero=True,
+            ),
+            ScenarioPlayer(
+                seat="bb",
+                position="BB",
+                name="BB",
+                # Visible stack remaining behind after
+                # the forced 1 BB big blind.
+                stack_bb=4.0,
+            ),
+        ),
+        action_order=(
+            "hero",
+            "bb",
+        ),
+        small_blind_seat="hero",
+        big_blind_seat="bb",
+        hero_seat="hero",
+        evidence=(
+            PhysicalEvidence(
+                frame=10,
+                type="STACK",
+                seat="hero",
+                prior=4.5,
+                value=0.0,
+                all_in_physical=True,
+            ),
+            PhysicalEvidence(
+                frame=11,
+                type="STACK",
+                seat="hero",
+                prior=4.5,
+                value=0.0,
+                all_in_physical=True,
+            ),
+            PhysicalEvidence(
+                frame=20,
+                type="STACK",
+                seat="bb",
+                prior=4.0,
+                value=0.0,
+                all_in_physical=True,
+            ),
+            PhysicalEvidence(
+                frame=21,
+                type="STACK",
+                seat="bb",
+                prior=4.0,
+                value=0.0,
+                all_in_physical=True,
+            ),
+            PhysicalEvidence(
+                frame=30,
+                type="STREET_BOUNDARY",
+                street="FLOP",
+                board=("As", "7d", "2c"),
+            ),
+            PhysicalEvidence(
+                frame=40,
+                type="STREET_BOUNDARY",
+                street="TURN",
+                board=("As", "7d", "2c", "Kh"),
+            ),
+            PhysicalEvidence(
+                frame=50,
+                type="STREET_BOUNDARY",
+                street="RIVER",
+                board=("As", "7d", "2c", "Kh", "9s"),
+            ),
+        ),
+        expected_actions=(
+            ExpectedAction(
+                "PREFLOP",
+                "hero",
+                "POST_SMALL_BLIND",
+                amount_bb=0.5,
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "bb",
+                "POST_BIG_BLIND",
+                amount_bb=1.0,
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "hero",
+                "RAISE",
+                raise_to_bb=5.0,
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "bb",
+                "CALL",
+                amount_bb=4.0,
+            ),
+        ),
+        expected_publications=(
+            ExpectedPublication(
+                frame=11,
+                street="PREFLOP",
+                action_count=3,
+                next_actor="bb",
+                required_text=(
+                    "SB (Hero) raises to 5 BB",
+                ),
+            ),
+            ExpectedPublication(
+                frame=21,
+                street="PREFLOP",
+                action_count=4,
+                next_actor=None,
+                required_text=(
+                    "BB calls 4 BB",
+                ),
+            ),
+            ExpectedPublication(
+                frame=30,
+                street="FLOP",
+                action_count=4,
+                next_actor=None,
+                required_text=(
+                    "FLOP: As 7d 2c",
+                ),
+                forbidden_text_after=(
+                    ("FLOP: As 7d 2c", "checks"),
+                    ("FLOP: As 7d 2c", "bets"),
+                    ("FLOP: As 7d 2c", "calls"),
+                    ("FLOP: As 7d 2c", "raises"),
+                    ("FLOP: As 7d 2c", "folds"),
+                ),
+            ),
+            ExpectedPublication(
+                frame=40,
+                street="TURN",
+                action_count=4,
+                next_actor=None,
+                required_text=(
+                    "TURN: Kh",
+                ),
+                forbidden_text_after=(
+                    ("TURN: Kh", "checks"),
+                    ("TURN: Kh", "bets"),
+                    ("TURN: Kh", "calls"),
+                    ("TURN: Kh", "raises"),
+                    ("TURN: Kh", "folds"),
+                ),
+            ),
+            ExpectedPublication(
+                frame=50,
+                street="RIVER",
+                action_count=4,
+                next_actor=None,
+                required_text=(
+                    "RIVER: 9s",
+                    "Betting round complete",
+                ),
+                forbidden_text_after=(
+                    ("RIVER: 9s", "checks"),
+                    ("RIVER: 9s", "bets"),
+                    ("RIVER: 9s", "calls"),
+                    ("RIVER: 9s", "raises"),
+                    ("RIVER: 9s", "folds"),
+                ),
+            ),
+        ),
+        expected_final_street="RIVER",
+    )
+)
+
+
 POSTFLOP_SCENARIOS = (
     FLOP_CHECK_CHECK,
     FLOP_BET_FOLD,
@@ -2312,6 +2512,7 @@ POSTFLOP_SCENARIOS = (
     FLOP_RAISE_CALL,
     TURN_RIVER_VERTICAL,
     HERO_RIVER_FOLD_TERMINAL,
+    ALLIN_AUTOMATIC_RUNOUT,
 )
 
 SCENARIOS = (
