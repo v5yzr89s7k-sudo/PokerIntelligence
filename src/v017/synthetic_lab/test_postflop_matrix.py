@@ -7,7 +7,7 @@ from src.v017.synthetic_lab.factory_runner import (
     run_factory_scenario,
 )
 from src.v017.synthetic_lab.scenarios import (
-    PREFLOP_SCENARIOS,
+    POSTFLOP_SCENARIOS,
 )
 
 
@@ -36,13 +36,13 @@ def digest(run):
 def run_matrix_once(run_number):
     print()
     print(
-        f"===== PREFLOP MATRIX RUN "
+        f"===== POSTFLOP MATRIX RUN "
         f"{run_number} ====="
     )
 
     results = []
 
-    for scenario in PREFLOP_SCENARIOS:
+    for scenario in POSTFLOP_SCENARIOS:
         run = run_factory_scenario(scenario)
         comparison = compare_factory_run(
             scenario,
@@ -98,12 +98,12 @@ def main():
     )
 
     assert runs[0] == runs[1] == runs[2], (
-        "preflop matrix is nondeterministic"
+        "postflop matrix is nondeterministic"
     )
 
     print()
     print(
-        "V0.17 SYNTHETIC LAB PREFLOP "
+        "V0.17 SYNTHETIC LAB POSTFLOP "
         "MATRIX 3/3: PASS"
     )
 

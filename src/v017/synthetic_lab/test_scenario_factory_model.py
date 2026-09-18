@@ -5,6 +5,8 @@ from src.v017.synthetic_lab.scenario_factory import (
 )
 from src.v017.synthetic_lab.scenarios import (
     PREFLOP_OPEN_FOLDS,
+    PREFLOP_SCENARIOS,
+    POSTFLOP_SCENARIOS,
     SCENARIOS,
 )
 
@@ -38,6 +40,29 @@ def main():
         "preflop_three_bet_call",
         "preflop_sb_complete",
         "preflop_short_allin",
+        "flop_check_check",
+        "flop_bet_fold",
+        "flop_bet_call",
+        "flop_raise_call",
+    )
+
+    expected_preflop = expected_registry[:5]
+    expected_postflop = expected_registry[5:]
+
+    assert tuple(
+        item.name
+        for item in PREFLOP_SCENARIOS
+    ) == expected_preflop
+
+    assert tuple(
+        item.name
+        for item in POSTFLOP_SCENARIOS
+    ) == expected_postflop
+
+    assert (
+        SCENARIOS
+        == PREFLOP_SCENARIOS
+        + POSTFLOP_SCENARIOS
     )
 
     assert tuple(

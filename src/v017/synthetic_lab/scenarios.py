@@ -876,10 +876,881 @@ PREFLOP_SB_COMPLETE = validate_scenario(
 )
 
 
-SCENARIOS = (
+
+
+# ------------------------------------------------------------
+# L4.4 Scenario 006
+#
+# Heads-up postflop check/check.
+#
+# Preflop:
+# Hero UTG folds
+# BTN folds
+# SB completes to 1 BB
+# FLOP boundary proves BB check
+#
+# Flop:
+# SB checks
+# BB checks
+# TURN boundary is the objective downstream proof that both
+# zero-chip FLOP actions completed.
+# ------------------------------------------------------------
+
+FLOP_CHECK_CHECK = validate_scenario(
+    FactoryScenario(
+        name="flop_check_check",
+        players=(
+            ScenarioPlayer(
+                seat="hero",
+                position="UTG",
+                name="Hero",
+                stack_bb=50.0,
+                is_hero=True,
+            ),
+            ScenarioPlayer(
+                seat="btn",
+                position="BTN",
+                name="BTN",
+                stack_bb=50.0,
+            ),
+            ScenarioPlayer(
+                seat="sb",
+                position="SB",
+                name="SB",
+                stack_bb=50.0,
+            ),
+            ScenarioPlayer(
+                seat="bb",
+                position="BB",
+                name="BB",
+                stack_bb=50.0,
+            ),
+        ),
+        action_order=(
+            "hero",
+            "btn",
+            "sb",
+            "bb",
+        ),
+        small_blind_seat="sb",
+        big_blind_seat="bb",
+        hero_seat="hero",
+        evidence=(
+            PhysicalEvidence(
+                frame=10,
+                type="CARD_DISAPPEARANCE",
+                seat="hero",
+            ),
+            PhysicalEvidence(
+                frame=20,
+                type="CARD_DISAPPEARANCE",
+                seat="btn",
+            ),
+            PhysicalEvidence(
+                frame=30,
+                type="STACK",
+                seat="sb",
+                prior=50.0,
+                value=49.5,
+            ),
+            PhysicalEvidence(
+                frame=31,
+                type="STACK",
+                seat="sb",
+                prior=50.0,
+                value=49.5,
+            ),
+            PhysicalEvidence(
+                frame=40,
+                type="STREET_BOUNDARY",
+                street="FLOP",
+                board=("As", "7d", "2c"),
+            ),
+            PhysicalEvidence(
+                frame=50,
+                type="STREET_BOUNDARY",
+                street="TURN",
+                board=("As", "7d", "2c", "Kh"),
+            ),
+        ),
+        expected_actions=(
+            ExpectedAction(
+                "PREFLOP",
+                "sb",
+                "POST_SMALL_BLIND",
+                amount_bb=0.5,
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "bb",
+                "POST_BIG_BLIND",
+                amount_bb=1.0,
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "hero",
+                "FOLD",
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "btn",
+                "FOLD",
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "sb",
+                "CALL",
+                amount_bb=0.5,
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "bb",
+                "CHECK",
+            ),
+            ExpectedAction(
+                "FLOP",
+                "sb",
+                "CHECK",
+            ),
+            ExpectedAction(
+                "FLOP",
+                "bb",
+                "CHECK",
+            ),
+        ),
+        expected_publications=(
+            ExpectedPublication(
+                frame=10,
+                street="PREFLOP",
+                action_count=3,
+                next_actor="btn",
+                required_text=("UTG (Hero) folds",),
+            ),
+            ExpectedPublication(
+                frame=20,
+                street="PREFLOP",
+                action_count=4,
+                next_actor="sb",
+                required_text=("BTN folds",),
+            ),
+            ExpectedPublication(
+                frame=31,
+                street="PREFLOP",
+                action_count=5,
+                next_actor="bb",
+                required_text=("SB calls 0.5 BB",),
+            ),
+            ExpectedPublication(
+                frame=40,
+                street="FLOP",
+                action_count=6,
+                next_actor="sb",
+                required_text=(
+                    "BB checks",
+                    "As 7d 2c",
+                ),
+                forbidden_text=(
+                    "SB checks",
+                ),
+            ),
+            ExpectedPublication(
+                frame=50,
+                street="TURN",
+                action_count=8,
+                next_actor="sb",
+                required_text=(
+                    "SB checks",
+                    "BB checks",
+                    "FLOP: As 7d 2c",
+                    "TURN: Kh",
+                ),
+            ),
+        ),
+        expected_final_street="TURN",
+    )
+)
+
+
+PREFLOP_SCENARIOS = (
     PREFLOP_OPEN_FOLDS,
     PREFLOP_OPEN_CALL,
     PREFLOP_THREE_BET_CALL,
     PREFLOP_SB_COMPLETE,
     PREFLOP_SHORT_ALLIN,
+)
+
+
+
+# ------------------------------------------------------------
+# L4.4 Scenario 007
+#
+# Heads-up FLOP bet/fold.
+#
+# Preflop reaches the same authoritative heads-up FLOP as
+# Scenario 006.
+#
+# Flop:
+# SB bets 3 BB through settled quantitative stack evidence.
+# BB folds through physical card disappearance.
+# ------------------------------------------------------------
+
+FLOP_BET_FOLD = validate_scenario(
+    FactoryScenario(
+        name="flop_bet_fold",
+        players=(
+            ScenarioPlayer(
+                seat="hero",
+                position="UTG",
+                name="Hero",
+                stack_bb=50.0,
+                is_hero=True,
+            ),
+            ScenarioPlayer(
+                seat="btn",
+                position="BTN",
+                name="BTN",
+                stack_bb=50.0,
+            ),
+            ScenarioPlayer(
+                seat="sb",
+                position="SB",
+                name="SB",
+                stack_bb=50.0,
+            ),
+            ScenarioPlayer(
+                seat="bb",
+                position="BB",
+                name="BB",
+                stack_bb=50.0,
+            ),
+        ),
+        action_order=(
+            "hero",
+            "btn",
+            "sb",
+            "bb",
+        ),
+        small_blind_seat="sb",
+        big_blind_seat="bb",
+        hero_seat="hero",
+        evidence=(
+            PhysicalEvidence(
+                frame=10,
+                type="CARD_DISAPPEARANCE",
+                seat="hero",
+            ),
+            PhysicalEvidence(
+                frame=20,
+                type="CARD_DISAPPEARANCE",
+                seat="btn",
+            ),
+            PhysicalEvidence(
+                frame=30,
+                type="STACK",
+                seat="sb",
+                prior=50.0,
+                value=49.5,
+            ),
+            PhysicalEvidence(
+                frame=31,
+                type="STACK",
+                seat="sb",
+                prior=50.0,
+                value=49.5,
+            ),
+            PhysicalEvidence(
+                frame=40,
+                type="STREET_BOUNDARY",
+                street="FLOP",
+                board=("As", "7d", "2c"),
+            ),
+            PhysicalEvidence(
+                frame=50,
+                type="STACK",
+                seat="sb",
+                prior=49.5,
+                value=46.5,
+            ),
+            PhysicalEvidence(
+                frame=51,
+                type="STACK",
+                seat="sb",
+                prior=49.5,
+                value=46.5,
+            ),
+            PhysicalEvidence(
+                frame=60,
+                type="CARD_DISAPPEARANCE",
+                seat="bb",
+            ),
+        ),
+        expected_actions=(
+            ExpectedAction(
+                "PREFLOP",
+                "sb",
+                "POST_SMALL_BLIND",
+                amount_bb=0.5,
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "bb",
+                "POST_BIG_BLIND",
+                amount_bb=1.0,
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "hero",
+                "FOLD",
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "btn",
+                "FOLD",
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "sb",
+                "CALL",
+                amount_bb=0.5,
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "bb",
+                "CHECK",
+            ),
+            ExpectedAction(
+                "FLOP",
+                "sb",
+                "BET",
+                amount_bb=3.0,
+            ),
+            ExpectedAction(
+                "FLOP",
+                "bb",
+                "FOLD",
+            ),
+        ),
+        expected_publications=(
+            ExpectedPublication(
+                frame=10,
+                street="PREFLOP",
+                action_count=3,
+                next_actor="btn",
+                required_text=("UTG (Hero) folds",),
+            ),
+            ExpectedPublication(
+                frame=20,
+                street="PREFLOP",
+                action_count=4,
+                next_actor="sb",
+                required_text=("BTN folds",),
+            ),
+            ExpectedPublication(
+                frame=31,
+                street="PREFLOP",
+                action_count=5,
+                next_actor="bb",
+                required_text=("SB calls 0.5 BB",),
+            ),
+            ExpectedPublication(
+                frame=40,
+                street="FLOP",
+                action_count=6,
+                next_actor="sb",
+                required_text=("FLOP: As 7d 2c",),
+                forbidden_text=("SB bets",),
+            ),
+            ExpectedPublication(
+                frame=51,
+                street="FLOP",
+                action_count=7,
+                next_actor="bb",
+                required_text=("SB bets 3 BB",),
+                forbidden_text=("BB folds",),
+            ),
+            ExpectedPublication(
+                frame=60,
+                street="FLOP",
+                action_count=8,
+                next_actor=None,
+                required_text=(
+                    "SB bets 3 BB",
+                    "BB folds",
+                ),
+            ),
+        ),
+        expected_final_street="FLOP",
+    )
+)
+
+
+
+
+# ------------------------------------------------------------
+# L4.4 Scenario 008
+#
+# Heads-up FLOP bet/call.
+#
+# Preflop reaches the same authoritative heads-up FLOP.
+#
+# Flop:
+# SB bets 3 BB through settled quantitative evidence.
+# BB calls 3 BB through independent settled quantitative evidence.
+# ------------------------------------------------------------
+
+FLOP_BET_CALL = validate_scenario(
+    FactoryScenario(
+        name="flop_bet_call",
+        players=(
+            ScenarioPlayer(
+                seat="hero",
+                position="UTG",
+                name="Hero",
+                stack_bb=50.0,
+                is_hero=True,
+            ),
+            ScenarioPlayer(
+                seat="btn",
+                position="BTN",
+                name="BTN",
+                stack_bb=50.0,
+            ),
+            ScenarioPlayer(
+                seat="sb",
+                position="SB",
+                name="SB",
+                stack_bb=50.0,
+            ),
+            ScenarioPlayer(
+                seat="bb",
+                position="BB",
+                name="BB",
+                stack_bb=50.0,
+            ),
+        ),
+        action_order=(
+            "hero",
+            "btn",
+            "sb",
+            "bb",
+        ),
+        small_blind_seat="sb",
+        big_blind_seat="bb",
+        hero_seat="hero",
+        evidence=(
+            PhysicalEvidence(
+                frame=10,
+                type="CARD_DISAPPEARANCE",
+                seat="hero",
+            ),
+            PhysicalEvidence(
+                frame=20,
+                type="CARD_DISAPPEARANCE",
+                seat="btn",
+            ),
+            PhysicalEvidence(
+                frame=30,
+                type="STACK",
+                seat="sb",
+                prior=50.0,
+                value=49.5,
+            ),
+            PhysicalEvidence(
+                frame=31,
+                type="STACK",
+                seat="sb",
+                prior=50.0,
+                value=49.5,
+            ),
+            PhysicalEvidence(
+                frame=40,
+                type="STREET_BOUNDARY",
+                street="FLOP",
+                board=("As", "7d", "2c"),
+            ),
+            PhysicalEvidence(
+                frame=50,
+                type="STACK",
+                seat="sb",
+                prior=49.5,
+                value=46.5,
+            ),
+            PhysicalEvidence(
+                frame=51,
+                type="STACK",
+                seat="sb",
+                prior=49.5,
+                value=46.5,
+            ),
+            PhysicalEvidence(
+                frame=60,
+                type="STACK",
+                seat="bb",
+                prior=50.0,
+                value=47.0,
+            ),
+            PhysicalEvidence(
+                frame=61,
+                type="STACK",
+                seat="bb",
+                prior=50.0,
+                value=47.0,
+            ),
+        ),
+        expected_actions=(
+            ExpectedAction(
+                "PREFLOP",
+                "sb",
+                "POST_SMALL_BLIND",
+                amount_bb=0.5,
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "bb",
+                "POST_BIG_BLIND",
+                amount_bb=1.0,
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "hero",
+                "FOLD",
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "btn",
+                "FOLD",
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "sb",
+                "CALL",
+                amount_bb=0.5,
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "bb",
+                "CHECK",
+            ),
+            ExpectedAction(
+                "FLOP",
+                "sb",
+                "BET",
+                amount_bb=3.0,
+            ),
+            ExpectedAction(
+                "FLOP",
+                "bb",
+                "CALL",
+                amount_bb=3.0,
+            ),
+        ),
+        expected_publications=(
+            ExpectedPublication(
+                frame=10,
+                street="PREFLOP",
+                action_count=3,
+                next_actor="btn",
+                required_text=("UTG (Hero) folds",),
+            ),
+            ExpectedPublication(
+                frame=20,
+                street="PREFLOP",
+                action_count=4,
+                next_actor="sb",
+                required_text=("BTN folds",),
+            ),
+            ExpectedPublication(
+                frame=31,
+                street="PREFLOP",
+                action_count=5,
+                next_actor="bb",
+                required_text=("SB calls 0.5 BB",),
+            ),
+            ExpectedPublication(
+                frame=40,
+                street="FLOP",
+                action_count=6,
+                next_actor="sb",
+                required_text=("FLOP: As 7d 2c",),
+                forbidden_text=("SB bets",),
+            ),
+            ExpectedPublication(
+                frame=51,
+                street="FLOP",
+                action_count=7,
+                next_actor="bb",
+                required_text=("SB bets 3 BB",),
+                forbidden_text=("BB calls",),
+            ),
+            ExpectedPublication(
+                frame=61,
+                street="FLOP",
+                action_count=8,
+                next_actor=None,
+                required_text=(
+                    "SB bets 3 BB",
+                    "BB calls 3 BB",
+                ),
+            ),
+        ),
+        expected_final_street="FLOP",
+    )
+)
+
+
+
+
+# ------------------------------------------------------------
+# L4.4 Scenario 009
+#
+# Heads-up FLOP bet/raise/call.
+#
+# Flop:
+# SB bets 3 BB.
+# BB raises to 9 BB.
+# Aggression must reopen SB's obligation.
+# SB calls the additional 6 BB.
+# ------------------------------------------------------------
+
+FLOP_RAISE_CALL = validate_scenario(
+    FactoryScenario(
+        name="flop_raise_call",
+        players=(
+            ScenarioPlayer(
+                seat="hero",
+                position="UTG",
+                name="Hero",
+                stack_bb=50.0,
+                is_hero=True,
+            ),
+            ScenarioPlayer(
+                seat="btn",
+                position="BTN",
+                name="BTN",
+                stack_bb=50.0,
+            ),
+            ScenarioPlayer(
+                seat="sb",
+                position="SB",
+                name="SB",
+                stack_bb=50.0,
+            ),
+            ScenarioPlayer(
+                seat="bb",
+                position="BB",
+                name="BB",
+                stack_bb=50.0,
+            ),
+        ),
+        action_order=(
+            "hero",
+            "btn",
+            "sb",
+            "bb",
+        ),
+        small_blind_seat="sb",
+        big_blind_seat="bb",
+        hero_seat="hero",
+        evidence=(
+            PhysicalEvidence(
+                frame=10,
+                type="CARD_DISAPPEARANCE",
+                seat="hero",
+            ),
+            PhysicalEvidence(
+                frame=20,
+                type="CARD_DISAPPEARANCE",
+                seat="btn",
+            ),
+            PhysicalEvidence(
+                frame=30,
+                type="STACK",
+                seat="sb",
+                prior=50.0,
+                value=49.5,
+            ),
+            PhysicalEvidence(
+                frame=31,
+                type="STACK",
+                seat="sb",
+                prior=50.0,
+                value=49.5,
+            ),
+            PhysicalEvidence(
+                frame=40,
+                type="STREET_BOUNDARY",
+                street="FLOP",
+                board=("As", "7d", "2c"),
+            ),
+            PhysicalEvidence(
+                frame=50,
+                type="STACK",
+                seat="sb",
+                prior=49.5,
+                value=46.5,
+            ),
+            PhysicalEvidence(
+                frame=51,
+                type="STACK",
+                seat="sb",
+                prior=49.5,
+                value=46.5,
+            ),
+            PhysicalEvidence(
+                frame=60,
+                type="STACK",
+                seat="bb",
+                prior=50.0,
+                value=41.0,
+            ),
+            PhysicalEvidence(
+                frame=61,
+                type="STACK",
+                seat="bb",
+                prior=50.0,
+                value=41.0,
+            ),
+            PhysicalEvidence(
+                frame=70,
+                type="STACK",
+                seat="sb",
+                prior=46.5,
+                value=40.5,
+            ),
+            PhysicalEvidence(
+                frame=71,
+                type="STACK",
+                seat="sb",
+                prior=46.5,
+                value=40.5,
+            ),
+        ),
+        expected_actions=(
+            ExpectedAction(
+                "PREFLOP",
+                "sb",
+                "POST_SMALL_BLIND",
+                amount_bb=0.5,
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "bb",
+                "POST_BIG_BLIND",
+                amount_bb=1.0,
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "hero",
+                "FOLD",
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "btn",
+                "FOLD",
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "sb",
+                "CALL",
+                amount_bb=0.5,
+            ),
+            ExpectedAction(
+                "PREFLOP",
+                "bb",
+                "CHECK",
+            ),
+            ExpectedAction(
+                "FLOP",
+                "sb",
+                "BET",
+                amount_bb=3.0,
+            ),
+            ExpectedAction(
+                "FLOP",
+                "bb",
+                "RAISE",
+                raise_to_bb=9.0,
+            ),
+            ExpectedAction(
+                "FLOP",
+                "sb",
+                "CALL",
+                amount_bb=6.0,
+            ),
+        ),
+        expected_publications=(
+            ExpectedPublication(
+                frame=10,
+                street="PREFLOP",
+                action_count=3,
+                next_actor="btn",
+                required_text=("UTG (Hero) folds",),
+            ),
+            ExpectedPublication(
+                frame=20,
+                street="PREFLOP",
+                action_count=4,
+                next_actor="sb",
+                required_text=("BTN folds",),
+            ),
+            ExpectedPublication(
+                frame=31,
+                street="PREFLOP",
+                action_count=5,
+                next_actor="bb",
+                required_text=("SB calls 0.5 BB",),
+            ),
+            ExpectedPublication(
+                frame=40,
+                street="FLOP",
+                action_count=6,
+                next_actor="sb",
+                required_text=("FLOP: As 7d 2c",),
+                forbidden_text=("SB bets",),
+            ),
+            ExpectedPublication(
+                frame=51,
+                street="FLOP",
+                action_count=7,
+                next_actor="bb",
+                required_text=("SB bets 3 BB",),
+                forbidden_text=("BB raises",),
+            ),
+            ExpectedPublication(
+                frame=61,
+                street="FLOP",
+                action_count=8,
+                next_actor="sb",
+                required_text=(
+                    "SB bets 3 BB",
+                    "BB raises to 9 BB",
+                ),
+                forbidden_text=("SB calls 6 BB",),
+            ),
+            ExpectedPublication(
+                frame=71,
+                street="FLOP",
+                action_count=9,
+                next_actor=None,
+                required_text=(
+                    "BB raises to 9 BB",
+                    "SB calls 6 BB",
+                ),
+            ),
+        ),
+        expected_final_street="FLOP",
+    )
+)
+
+
+POSTFLOP_SCENARIOS = (
+    FLOP_CHECK_CHECK,
+    FLOP_BET_FOLD,
+    FLOP_BET_CALL,
+    FLOP_RAISE_CALL,
+)
+
+SCENARIOS = (
+    PREFLOP_SCENARIOS
+    + POSTFLOP_SCENARIOS
 )
