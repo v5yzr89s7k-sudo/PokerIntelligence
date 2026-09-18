@@ -840,9 +840,82 @@ class FrameHandObserver:
                 flush=True,
             )
 
+    def _quantitative_commitment_preflight(
+        self,
+        *,
+        seat,
+        normalized_delta_bb,
+        all_in_confirmed=False,
+    ):
+        """
+        Validate a settled physical commitment against the current
+        authoritative betting state before it may reach HandEngine.
+
+        Temporal settlement establishes measurement credibility only.
+        It does not establish that the measurement represents a legal
+        poker commitment.
+
+        HandEngine remains the strict semantic authority.
+        """
+
+        player = self.hand.players[seat]
+
+        prior_commitment = float(
+            player.street_commitment_bb
+        )
+
+        delta = float(
+            normalized_delta_bb
+        )
+
+        price = float(
+            self.hand.current_price_bb
+        )
+
+        target = (
+            prior_commitment
+            + delta
+        )
+
+        if (
+            target + 0.02 < price
+            and not all_in_confirmed
+        ):
+            return {
+                "allowed": False,
+                "reason": "below_current_price",
+                "prior_commitment_bb":
+                    prior_commitment,
+                "normalized_delta_bb":
+                    delta,
+                "target_commitment_bb":
+                    target,
+                "current_price_bb":
+                    price,
+                "all_in_confirmed":
+                    bool(all_in_confirmed),
+            }
+
+        return {
+            "allowed": True,
+            "reason": None,
+            "prior_commitment_bb":
+                prior_commitment,
+            "normalized_delta_bb":
+                delta,
+            "target_commitment_bb":
+                target,
+            "current_price_bb":
+                price,
+            "all_in_confirmed":
+                bool(all_in_confirmed),
+        }
+
     def admit_quantitative_observation(
         self,
         observation: Dict[str, Any],
+        *,
+        all_in_confirmed=False,
     ):
         """
         Admit one resolved physical stack observation.
@@ -1037,11 +1110,53 @@ class FrameHandObserver:
             )
         )
 
+        preflight = (
+            self._quantitative_commitment_preflight(
+                seat=seat,
+                normalized_delta_bb=(
+                    measurement.normalized_delta_bb
+                ),
+                all_in_confirmed=all_in_confirmed,
+            )
+        )
+
+        if not preflight["allowed"]:
+            print(
+                "[QUANTITATIVE_REJECT]",
+                f"frame={observation.get('frame')}",
+                f"seat={seat}",
+                "reason=below_current_price",
+                (
+                    "prior_commitment="
+                    f"{preflight['prior_commitment_bb']}"
+                ),
+                (
+                    "delta="
+                    f"{preflight['normalized_delta_bb']}"
+                ),
+                (
+                    "target="
+                    f"{preflight['target_commitment_bb']}"
+                ),
+                (
+                    "price="
+                    f"{preflight['current_price_bb']}"
+                ),
+                (
+                    "all_in_confirmed="
+                    f"{bool(all_in_confirmed)}"
+                ),
+                flush=True,
+            )
+
+            return tuple(emitted)
+
         action = (
             self.hand
             .observe_stack_commitment(
                 seat,
                 measurement.normalized_delta_bb,
+                all_in_confirmed=all_in_confirmed,
             )
         )
 

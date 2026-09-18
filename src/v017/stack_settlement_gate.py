@@ -143,10 +143,27 @@ class StackSettlementGate:
             == ((0.0, 1),)
         )
 
+        # A resolved physical read with weak within-frame OCR
+        # consensus may enter a temporal candidate epoch.
+        #
+        # It receives no semantic authority from that first frame.
+        # Authority is established only if an independent later frame
+        # resolves to the same value within VALUE_TOLERANCE_BB.
+        #
+        # Unresolved arbitrary OCR remains ineligible. The special
+        # physically-confirmed zero path remains independently guarded.
+        weak_resolved_temporal_candidate = bool(
+            observation.get("resolved")
+            and value is not None
+            and observation.get("mode")
+            == "segmentation_disagreement"
+        )
+
         if not (
             consensus_authority
             or native_fast_authority
             or physically_confirmed_zero_authority
+            or weak_resolved_temporal_candidate
         ):
             return None
 
@@ -202,9 +219,18 @@ class StackSettlementGate:
         validation_confidence = confidence
         validation_votes = votes
 
+        temporal_consensus_authority = bool(
+            candidate is not None
+            and frame != candidate.first_frame
+            and abs(
+                value - candidate.value
+            ) <= VALUE_TOLERANCE_BB
+        )
+
         if (
             native_fast_authority
             or physically_confirmed_zero_authority
+            or temporal_consensus_authority
         ):
             validation_confidence = max(
                 validation_confidence,

@@ -295,6 +295,8 @@ class HandEngine:
         self,
         seat,
         delta_bb,
+        *,
+        all_in_confirmed=False,
     ):
         """
         delta_bb is the newly observed chip decrease attributable
@@ -368,17 +370,31 @@ class HandEngine:
             )
 
         else:
-            # Short commitment is only legal here as an all-in.
-            # Milestone A deliberately does not infer all-in status
-            # without explicit evidence.
-            raise ValueError(
-                "commitment below current price "
-                "without all-in evidence: "
-                f"seat={seat} "
-                f"prior={prior} "
-                f"delta={delta_bb} "
-                f"target={target} "
-                f"price={price}"
+            # A below-price commitment is legal only with explicit
+            # independently confirmed all-in evidence.
+            #
+            # HandEngine never infers all-in status from stack size.
+            if not all_in_confirmed:
+                raise ValueError(
+                    "commitment below current price "
+                    "without all-in evidence: "
+                    f"seat={seat} "
+                    f"prior={prior} "
+                    f"delta={delta_bb} "
+                    f"target={target} "
+                    f"price={price}"
+                )
+
+            action = "CALL"
+
+            player.street_commitment_bb = (
+                target
+            )
+
+            self._append_action(
+                seat,
+                action,
+                amount_bb=delta_bb,
             )
 
         if action in {
