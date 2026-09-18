@@ -49,6 +49,10 @@ class ExpectedPublication:
 
     required_text: Tuple[str, ...] = ()
     forbidden_text: Tuple[str, ...] = ()
+    forbidden_text_after: Tuple[
+        Tuple[str, str],
+        ...
+    ] = ()
 
 
 @dataclass(frozen=True)

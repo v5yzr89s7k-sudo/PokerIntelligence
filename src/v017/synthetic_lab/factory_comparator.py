@@ -88,6 +88,28 @@ def compare_factory_run(
                     f"contains forbidden text: {token}"
                 )
 
+        for marker, token in (
+            expected.forbidden_text_after
+        ):
+            if marker not in observed.text:
+                errors.append(
+                    f"publication {index + 1} "
+                    f"missing scoped marker: {marker}"
+                )
+                continue
+
+            suffix = observed.text.split(
+                marker,
+                1,
+            )[1]
+
+            if token in suffix:
+                errors.append(
+                    f"publication {index + 1} "
+                    f"contains forbidden text after "
+                    f"{marker}: {token}"
+                )
+
     return FactoryComparison(
         passed=not errors,
         errors=tuple(errors),
