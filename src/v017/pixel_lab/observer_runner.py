@@ -23,6 +23,9 @@ import json
 
 import cv2
 
+from src.v017.action_order import (
+    postflop_action_order,
+)
 from src.v017.frame_hand_observer import (
     FrameHandObserver,
 )
@@ -332,27 +335,11 @@ def run():
                     expected_count=board_count,
                 )
 
-                # Postflop order is derived solely from bootstrap
-                # positions plus the observer's own folded state.
-                #
-                # Heads-up here is BB then Hero/CO.
-                postflop_order = [
-                    seat
-                    for seat in (
-                        "seat_top",
-                        "seat_upper_right",
-                        "seat_mid_right",
-                        "seat_lower_right",
-                        "hero",
-                        "seat_upper_left",
-                    )
-                    if (
-                        seat in observer.hand.players
-                        and not observer.hand.players[
-                            seat
-                        ].folded
-                    )
-                ]
+                # Postflop order is derived solely from immutable
+                # bootstrap positions plus observer-owned folded state.
+                postflop_order = postflop_action_order(
+                    observer
+                )
 
                 rows = observer.admit_street_boundary(
                     event,

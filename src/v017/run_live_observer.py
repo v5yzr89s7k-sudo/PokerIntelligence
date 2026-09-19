@@ -57,6 +57,11 @@ from src.v017.stack_settlement_gate import (
     StackSettlementGate,
 )
 
+from src.v017.action_order import (
+    build_action_order,
+    postflop_action_order,
+)
+
 from src.v017.frame_hand_observer import (
     FrameHandObserver,
     common_mode_stack_shift_seats,
@@ -157,83 +162,6 @@ def canonical_sensor_frame(
         interpolation=cv2.INTER_AREA,
     )
 
-
-def build_action_order(
-    positions,
-):
-    preflop_order = [
-        "UTG",
-        "UTG+1",
-        "UTG+2",
-        "LJ",
-        "HJ",
-        "CO",
-        "BTN",
-        "SB",
-        "BB",
-    ]
-
-    rank = {
-        position: index
-        for index, position
-        in enumerate(preflop_order)
-    }
-
-    return sorted(
-        positions,
-        key=lambda seat: (
-            rank.get(
-                positions.get(seat),
-                999,
-            ),
-            seat,
-        ),
-    )
-
-
-def postflop_action_order(
-    observer,
-):
-    position_order = [
-        "SB",
-        "BB",
-        "UTG",
-        "UTG+1",
-        "UTG+2",
-        "LJ",
-        "HJ",
-        "CO",
-        "BTN",
-    ]
-
-    rank = {
-        position: index
-        for index, position
-        in enumerate(position_order)
-    }
-
-    seats = [
-        seat
-        for seat, player
-        in observer.hand.players.items()
-        if (
-            player.dealt_in
-            and not player.folded
-        )
-    ]
-
-    return sorted(
-        seats,
-        key=lambda seat: (
-            rank.get(
-                observer.hand.players[
-                    seat
-                ].position,
-                999,
-            ),
-            seat,
-        ),
-    )
 
 
 def player_records(
