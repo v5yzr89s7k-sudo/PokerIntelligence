@@ -571,19 +571,18 @@ def publish_new(
         )
 
 
-def bootstrap_observer(
-    window,
-    hand_number,
-    *,
-    clear_confirmed=False,
-):
-    image, frame_path = (
-        wait_for_hand(
-            window,
-            clear_confirmed=clear_confirmed,
-        )
-    )
 
+def build_observer_from_frame(
+    image,
+    frame_path,
+    hand_id,
+):
+    """
+    Build one V0.17 observer from physical acquisition evidence only.
+
+    This function owns no live-window acquisition and no publication.
+    It may therefore be reused by deterministic PNG simulation.
+    """
     seats = native_occupied_seats(
         image,
         GEOMETRY,
@@ -690,21 +689,17 @@ def bootstrap_observer(
         small_blind_seat=small_blind,
         big_blind_seat=big_blind,
         geometry=GEOMETRY,
-        trusted_stacks=
-            trusted_stacks,
+        trusted_stacks=trusted_stacks,
         opponent_seats=[
             seat
             for seat in seats
             if seat != "hero"
         ],
-        quantitative_seats=
-            list(
-                trusted_stacks.keys()
-            ),
-        hero_seat="hero",
-        hand_id=(
-            f"live-v017-{hand_number}"
+        quantitative_seats=list(
+            trusted_stacks.keys()
         ),
+        hero_seat="hero",
+        hand_id=str(hand_id),
         stack_reader=read_stack_native_fast,
     )
 
@@ -712,15 +707,20 @@ def bootstrap_observer(
         hero_cards
     )
 
-    # Publish initial authoritative hand,
-    # including forced blinds and Hero cards.
-    observer._publish_if_changed(
-        "bootstrap"
+    # The acquisition frame is physical baseline evidence, not an
+    # action frame. Establish transition sensors without emitting
+    # events or granting semantic authority.
+    sensor_image = canonical_sensor_frame(
+        image
     )
 
-    publish_new(
-        observer,
-        0,
+    observer.establish_physical_transition_baseline(
+        sensor_image,
+        physical_geometry=SENSOR_GEOMETRY,
+    )
+
+    observer._publish_if_changed(
+        "bootstrap"
     )
 
     print()
@@ -732,6 +732,36 @@ def bootstrap_observer(
         f"{positions.get('hero')}",
         f"hero_cards={hero_cards}",
         flush=True,
+    )
+
+    return observer
+
+
+def bootstrap_observer(
+    window,
+    hand_number,
+    *,
+    clear_confirmed=False,
+):
+    image, frame_path = (
+        wait_for_hand(
+            window,
+            clear_confirmed=clear_confirmed,
+        )
+    )
+
+    observer = build_observer_from_frame(
+        image,
+        frame_path,
+        hand_id=f"live-v017-{hand_number}",
+    )
+
+    if observer is None:
+        return None
+
+    publish_new(
+        observer,
+        0,
     )
 
     return observer
@@ -833,22 +863,449 @@ def reconcile_frame_evidence(
     )
 
 
+class FrameTransactionState:
+    """Persistent semantic state for one physical hand."""
+
+    def __init__(self):
+        self.settlement_gate = StackSettlementGate()
+        self.hero_buttons_active = False
+        self.hero_completion_pending_frame = None
+
+
+class FrameTransactionResult:
+    """Observable result of one production frame transaction."""
+
+    def __init__(self, outcome, events):
+        self.outcome = str(outcome)
+        self.events = tuple(
+            dict(event)
+            for event in events
+        )
+
+
+def process_frame_transaction(
+    observer,
+    image,
+    frame_path,
+    frame_id,
+    state,
+):
+    """
+    Execute one authoritative physical-frame semantic transaction.
+
+    Live capture and deterministic PNG simulation must use this same
+    function. Frame acquisition is deliberately outside this boundary.
+    """
+    before_publications = len(
+        observer.publications
+    )
+
+    sensor_image = canonical_sensor_frame(
+        image
+    )
+
+    result = observer.process_frame(
+        image,
+        frame_id=frame_id,
+        sensor_frame=sensor_image,
+        sensor_geometry=SENSOR_GEOMETRY,
+    )
+
+    (
+        quantitative_settlement_events,
+        common_mode_quantitative_events,
+    ) = filter_common_mode_quantitative_events(
+        result.events
+    )
+
+    common_mode_seats = {
+        event.get("seat")
+        for event in common_mode_quantitative_events
+    }
+
+    frame_card_events = (
+        retain_frame_card_disappearances(
+            observer,
+            result.events,
+            frame_id=frame_id,
+        )
+    )
+
+    hero_cards_disappeared_this_frame = any(
+        event.get("type")
+        == "HERO_CARDS_DISAPPEARED_PHYSICAL"
+        for event in frame_card_events
+    )
+
+    for event in result.events:
+        typ = event["type"]
+
+        if typ in {
+            "OPPONENT_CARDS_DISAPPEARED",
+            "HERO_CARDS_DISAPPEARED_PHYSICAL",
+        }:
+            # Already retained before this frame's semantic loop.
+            # Preserve Hero physical lifecycle bookkeeping, but
+            # defer semantic authority until frame reconciliation.
+            if (
+                typ
+                == "HERO_CARDS_DISAPPEARED_PHYSICAL"
+            ):
+                state.hero_completion_pending_frame = None
+                state.hero_buttons_active = False
+
+            continue
+
+        elif (
+            typ
+            == "HERO_ACTION_BUTTONS_APPEARED"
+        ):
+            state.hero_buttons_active = True
+            state.hero_completion_pending_frame = None
+
+            print(
+                "[HERO_TURN_PHYSICAL]",
+                f"frame={frame_id}",
+                "buttons=visible",
+                f"next_actor={observer.hand.next_actor}",
+                flush=True,
+            )
+
+        elif (
+            typ
+            == "HERO_ACTION_BUTTONS_DISAPPEARED"
+        ):
+            if (
+                state.hero_buttons_active
+                and observer.hand.next_actor
+                == observer.hero_seat
+            ):
+                state.hero_completion_pending_frame = frame_id
+
+                print(
+                    "[HERO_COMPLETION_PENDING]",
+                    f"frame={frame_id}",
+                    "buttons=disappeared",
+                    flush=True,
+                )
+
+            state.hero_buttons_active = False
+
+        elif (
+            typ
+            == "STACK_QUANTITATIVE_OBSERVATION"
+        ):
+            if event.get("seat") in common_mode_seats:
+                print(
+                    "[COMMON_MODE_STACK_SHIFT_REJECTED]",
+                    f"frame={frame_id}",
+                    f"seat={event.get('seat')}",
+                    f"prior={event.get('prior')}",
+                    f"value={event.get('resolved_value')}",
+                    flush=True,
+                )
+                continue
+
+            # Terminal accounting is a separate authority lane
+            # from wager commitment.
+            #
+            # After authoritative UNCONTESTED completion,
+            # HandEngine may expose one exact unmatched commitment.
+            # A physical winner-stack increase may confirm that
+            # predetermined accounting value. If consumed here,
+            # never offer the same observation to wager settlement.
+            terminal_rows = (
+                observer
+                .admit_terminal_stack_return(
+                    event
+                )
+            )
+
+            if terminal_rows:
+                for terminal_event in terminal_rows:
+                    print(
+                        "[TERMINAL_STACK_RETURN]",
+                        f"frame={frame_id}",
+                        f"seat={terminal_event.get('seat')}",
+                        f"prior={terminal_event.get('prior')}",
+                        f"value={terminal_event.get('resolved_value')}",
+                        f"amount={terminal_event.get('amount_bb')}",
+                        flush=True,
+                    )
+
+                observer.clear_quantitative_ownership(
+                    event.get("seat")
+                )
+                state.settlement_gate.clear_seat(
+                    event.get("seat")
+                )
+
+                if (
+                    event.get("seat")
+                    == observer.hero_seat
+                ):
+                    state.hero_completion_pending_frame = None
+                    state.hero_buttons_active = False
+
+                continue
+
+            # Raw OCR never mutates HandEngine directly.
+            #
+            # StackSettlementGate requires independent temporal
+            # confirmation before a quantitative observation may
+            # enter semantic chronology.
+            seat = event.get("seat")
+
+            has_commitment_evidence = bool(
+                seat
+                and seat
+                in observer.confirmed_bet_regions
+            )
+
+            resolved_value = event.get(
+                "resolved_value"
+            )
+
+            all_in_confirmed = bool(
+                has_commitment_evidence
+                and resolved_value is not None
+                and abs(
+                    float(resolved_value)
+                ) <= 0.02
+            )
+
+            settled = state.settlement_gate.observe(
+                event,
+                phase=observer.hand.street,
+                has_commitment_evidence=(
+                    has_commitment_evidence
+                ),
+                all_in_confirmed=(
+                    all_in_confirmed
+                ),
+            )
+
+            if settled is None:
+                print(
+                    "[QUANTITATIVE_DEFERRED]",
+                    f"frame={frame_id}",
+                    f"seat={event.get('seat')}",
+                    f"resolved={event.get('resolved')}",
+                    f"value={event.get('resolved_value')}",
+                    flush=True,
+                )
+            else:
+                # Preserve the original physical observation as
+                # semantic input. The gate authorizes it; it does
+                # not rewrite its OCR metadata.
+                admitted = (
+                    observer
+                    .admit_quantitative_observation(
+                        event
+                    )
+                )
+
+                if admitted:
+                    # Semantic admission consumed this physical
+                    # action. Remove only current quantitative
+                    # work; future transitions for the same seat
+                    # remain eligible normally.
+                    observer.clear_quantitative_ownership(
+                        settled.seat
+                    )
+                    state.settlement_gate.clear_seat(
+                        settled.seat
+                    )
+
+                if (
+                    settled.seat == observer.hero_seat
+                    and admitted
+                ):
+                    state.hero_completion_pending_frame = None
+                    state.hero_buttons_active = False
+
+                    print(
+                        "[HERO_ACTION_COMPLETE]",
+                        f"frame={frame_id}",
+                        "source=quantitative",
+                        flush=True,
+                    )
+
+                print(
+                    "[STACK_SETTLED]",
+                    f"frame={frame_id}",
+                    f"seat={settled.seat}",
+                    f"prior={settled.prior}",
+                    f"value={settled.value}",
+                    f"delta={settled.delta_bb}",
+                    f"admitted={len(admitted)}",
+                    flush=True,
+                )
+
+        elif typ in {
+            "FLOP_BOUNDARY_PHYSICAL",
+            "TURN_BOUNDARY_PHYSICAL",
+            "RIVER_BOUNDARY_PHYSICAL",
+        }:
+            expected_count = {
+                "FLOP_BOUNDARY_PHYSICAL":
+                    3,
+                "TURN_BOUNDARY_PHYSICAL":
+                    4,
+                "RIVER_BOUNDARY_PHYSICAL":
+                    5,
+            }[typ]
+
+            board = read_board_identity(
+                frame_path,
+                expected_count,
+            )
+
+            admit_board_catchup(
+                observer,
+                frame_id=frame_id,
+                board=board,
+            )
+
+    reconciled_cards, reconciled_quantitative = (
+        reconcile_frame_evidence(
+            observer
+        )
+    )
+
+    hero_card_action_reconciled = False
+
+    for reconciled_event in reconciled_cards:
+        print(
+            "[FRAME_CARD_RECONCILED]",
+            f"frame={reconciled_event.get('frame')}",
+            f"seat={reconciled_event.get('seat')}",
+            f"action={reconciled_event.get('semantic_action')}",
+            flush=True,
+        )
+
+        if (
+            reconciled_event.get("seat")
+            == observer.hero_seat
+        ):
+            hero_card_action_reconciled = True
+            state.hero_completion_pending_frame = None
+            state.hero_buttons_active = False
+
+            print(
+                "[HERO_ACTION_COMPLETE]",
+                f"frame={frame_id}",
+                f"action={reconciled_event.get('semantic_action')}",
+                "source=hero_cards_disappeared",
+                flush=True,
+            )
+
+    for reconciled_event in reconciled_quantitative:
+        print(
+            "[FRAME_QUANTITATIVE_RECONCILED]",
+            f"frame={reconciled_event.get('frame')}",
+            f"seat={reconciled_event.get('seat')}",
+            f"action={reconciled_event.get('semantic_action')}",
+            flush=True,
+        )
+
+    if (
+        hero_cards_disappeared_this_frame
+        and not hero_card_action_reconciled
+    ):
+        publish_new(
+            observer,
+            before_publications,
+        )
+
+        print(
+            "[PHYSICAL_HAND_END]",
+            f"frame={frame_id}",
+            "reason=hero_cards_disappeared",
+            "after=frame_reconciliation",
+            flush=True,
+        )
+
+        return FrameTransactionResult(
+            "PHYSICAL_HAND_END",
+            result.events,
+        )
+
+    if (
+        state.hero_completion_pending_frame is not None
+        and frame_id > state.hero_completion_pending_frame
+        and observer.hand.next_actor
+        == observer.hero_seat
+    ):
+        hero_player = observer.hand.players[
+            observer.hero_seat
+        ]
+
+        hero_commitment = float(
+            hero_player.street_commitment_bb
+        )
+
+        current_price = float(
+            observer.hand.current_price_bb
+        )
+
+        if abs(
+            hero_commitment - current_price
+        ) <= 0.02:
+            action = (
+                observer.hand
+                .observe_no_commitment(
+                    observer.hero_seat
+                )
+            )
+
+            state.hero_completion_pending_frame = None
+
+            observer._publish_if_changed(
+                frame_id
+            )
+
+            print(
+                "[HERO_ACTION_COMPLETE]",
+                f"frame={frame_id}",
+                f"action={action}",
+                "source=buttons_no_commitment",
+                flush=True,
+            )
+
+    publish_new(
+        observer,
+        before_publications,
+    )
+
+    if (
+        observer.hand.street
+        == "RIVER"
+        and observer.hand.next_actor
+        is None
+    ):
+        print(
+            "[HAND_COMPLETE]",
+            f"actions="
+            f"{len(observer.hand.actions)}",
+            flush=True,
+        )
+        return FrameTransactionResult(
+            "HAND_COMPLETE",
+            result.events,
+        )
+
+    return FrameTransactionResult(
+        "CONTINUE",
+        result.events,
+    )
+
+
 def run_hand(
     window,
     observer,
 ):
-    # Settlement ownership is per physical hand.
-    # Pending quantitative evidence must never cross a hand boundary.
-    settlement_gate = StackSettlementGate()
-
-    # Physical Hero action lifecycle.
-    #
-    # Button disappearance is completion evidence, not immediate
-    # CHECK authority. Give quantitative/card evidence a later
-    # frame to resolve CALL/RAISE/FOLD first.
-    hero_buttons_active = False
-    hero_completion_pending_frame = None
-
+    state = FrameTransactionState()
     frame_id = 0
 
     while True:
@@ -858,397 +1315,15 @@ def run_hand(
             capture_image(window)
         )
 
-        before_publications = len(
-            observer.publications
-        )
-
-        sensor_image = canonical_sensor_frame(
-            image
-        )
-
-        result = observer.process_frame(
-            image,
-            frame_id=frame_id,
-            sensor_frame=sensor_image,
-            sensor_geometry=SENSOR_GEOMETRY,
-        )
-
-        (
-            quantitative_settlement_events,
-            common_mode_quantitative_events,
-        ) = filter_common_mode_quantitative_events(
-            result.events
-        )
-
-        common_mode_seats = {
-            event.get("seat")
-            for event in common_mode_quantitative_events
-        }
-
-        frame_card_events = (
-            retain_frame_card_disappearances(
-                observer,
-                result.events,
-                frame_id=frame_id,
-            )
-        )
-
-        hero_cards_disappeared_this_frame = any(
-            event.get("type")
-            == "HERO_CARDS_DISAPPEARED_PHYSICAL"
-            for event in frame_card_events
-        )
-
-        for event in result.events:
-            typ = event["type"]
-
-            if typ in {
-                "OPPONENT_CARDS_DISAPPEARED",
-                "HERO_CARDS_DISAPPEARED_PHYSICAL",
-            }:
-                # Already retained before this frame's semantic loop.
-                # Preserve Hero physical lifecycle bookkeeping, but
-                # defer semantic authority until frame reconciliation.
-                if (
-                    typ
-                    == "HERO_CARDS_DISAPPEARED_PHYSICAL"
-                ):
-                    hero_completion_pending_frame = None
-                    hero_buttons_active = False
-
-                continue
-
-            elif (
-                typ
-                == "HERO_ACTION_BUTTONS_APPEARED"
-            ):
-                hero_buttons_active = True
-                hero_completion_pending_frame = None
-
-                print(
-                    "[HERO_TURN_PHYSICAL]",
-                    f"frame={frame_id}",
-                    "buttons=visible",
-                    f"next_actor={observer.hand.next_actor}",
-                    flush=True,
-                )
-
-            elif (
-                typ
-                == "HERO_ACTION_BUTTONS_DISAPPEARED"
-            ):
-                if (
-                    hero_buttons_active
-                    and observer.hand.next_actor
-                    == observer.hero_seat
-                ):
-                    hero_completion_pending_frame = frame_id
-
-                    print(
-                        "[HERO_COMPLETION_PENDING]",
-                        f"frame={frame_id}",
-                        "buttons=disappeared",
-                        flush=True,
-                    )
-
-                hero_buttons_active = False
-
-            elif (
-                typ
-                == "STACK_QUANTITATIVE_OBSERVATION"
-            ):
-                if event.get("seat") in common_mode_seats:
-                    print(
-                        "[COMMON_MODE_STACK_SHIFT_REJECTED]",
-                        f"frame={frame_id}",
-                        f"seat={event.get('seat')}",
-                        f"prior={event.get('prior')}",
-                        f"value={event.get('resolved_value')}",
-                        flush=True,
-                    )
-                    continue
-
-                # Terminal accounting is a separate authority lane
-                # from wager commitment.
-                #
-                # After authoritative UNCONTESTED completion,
-                # HandEngine may expose one exact unmatched commitment.
-                # A physical winner-stack increase may confirm that
-                # predetermined accounting value. If consumed here,
-                # never offer the same observation to wager settlement.
-                terminal_rows = (
-                    observer
-                    .admit_terminal_stack_return(
-                        event
-                    )
-                )
-
-                if terminal_rows:
-                    for terminal_event in terminal_rows:
-                        print(
-                            "[TERMINAL_STACK_RETURN]",
-                            f"frame={frame_id}",
-                            f"seat={terminal_event.get('seat')}",
-                            f"prior={terminal_event.get('prior')}",
-                            f"value={terminal_event.get('resolved_value')}",
-                            f"amount={terminal_event.get('amount_bb')}",
-                            flush=True,
-                        )
-
-                    observer.clear_quantitative_ownership(
-                        event.get("seat")
-                    )
-                    settlement_gate.clear_seat(
-                        event.get("seat")
-                    )
-
-                    if (
-                        event.get("seat")
-                        == observer.hero_seat
-                    ):
-                        hero_completion_pending_frame = None
-                        hero_buttons_active = False
-
-                    continue
-
-                # Raw OCR never mutates HandEngine directly.
-                #
-                # StackSettlementGate requires independent temporal
-                # confirmation before a quantitative observation may
-                # enter semantic chronology.
-                seat = event.get("seat")
-
-                has_commitment_evidence = bool(
-                    seat
-                    and seat
-                    in observer.confirmed_bet_regions
-                )
-
-                resolved_value = event.get(
-                    "resolved_value"
-                )
-
-                all_in_confirmed = bool(
-                    has_commitment_evidence
-                    and resolved_value is not None
-                    and abs(
-                        float(resolved_value)
-                    ) <= 0.02
-                )
-
-                settled = settlement_gate.observe(
-                    event,
-                    phase=observer.hand.street,
-                    has_commitment_evidence=(
-                        has_commitment_evidence
-                    ),
-                    all_in_confirmed=(
-                        all_in_confirmed
-                    ),
-                )
-
-                if settled is None:
-                    print(
-                        "[QUANTITATIVE_DEFERRED]",
-                        f"frame={frame_id}",
-                        f"seat={event.get('seat')}",
-                        f"resolved={event.get('resolved')}",
-                        f"value={event.get('resolved_value')}",
-                        flush=True,
-                    )
-                else:
-                    # Preserve the original physical observation as
-                    # semantic input. The gate authorizes it; it does
-                    # not rewrite its OCR metadata.
-                    admitted = (
-                        observer
-                        .admit_quantitative_observation(
-                            event
-                        )
-                    )
-
-                    if admitted:
-                        # Semantic admission consumed this physical
-                        # action. Remove only current quantitative
-                        # work; future transitions for the same seat
-                        # remain eligible normally.
-                        observer.clear_quantitative_ownership(
-                            settled.seat
-                        )
-                        settlement_gate.clear_seat(
-                            settled.seat
-                        )
-
-                    if (
-                        settled.seat == observer.hero_seat
-                        and admitted
-                    ):
-                        hero_completion_pending_frame = None
-                        hero_buttons_active = False
-
-                        print(
-                            "[HERO_ACTION_COMPLETE]",
-                            f"frame={frame_id}",
-                            "source=quantitative",
-                            flush=True,
-                        )
-
-                    print(
-                        "[STACK_SETTLED]",
-                        f"frame={frame_id}",
-                        f"seat={settled.seat}",
-                        f"prior={settled.prior}",
-                        f"value={settled.value}",
-                        f"delta={settled.delta_bb}",
-                        f"admitted={len(admitted)}",
-                        flush=True,
-                    )
-
-            elif typ in {
-                "FLOP_BOUNDARY_PHYSICAL",
-                "TURN_BOUNDARY_PHYSICAL",
-                "RIVER_BOUNDARY_PHYSICAL",
-            }:
-                expected_count = {
-                    "FLOP_BOUNDARY_PHYSICAL":
-                        3,
-                    "TURN_BOUNDARY_PHYSICAL":
-                        4,
-                    "RIVER_BOUNDARY_PHYSICAL":
-                        5,
-                }[typ]
-
-                board = read_board_identity(
-                    frame_path,
-                    expected_count,
-                )
-
-                admit_board_catchup(
-                    observer,
-                    frame_id=frame_id,
-                    board=board,
-                )
-
-        reconciled_cards, reconciled_quantitative = (
-            reconcile_frame_evidence(
-                observer
-            )
-        )
-
-        hero_card_action_reconciled = False
-
-        for reconciled_event in reconciled_cards:
-            print(
-                "[FRAME_CARD_RECONCILED]",
-                f"frame={reconciled_event.get('frame')}",
-                f"seat={reconciled_event.get('seat')}",
-                f"action={reconciled_event.get('semantic_action')}",
-                flush=True,
-            )
-
-            if (
-                reconciled_event.get("seat")
-                == observer.hero_seat
-            ):
-                hero_card_action_reconciled = True
-                hero_completion_pending_frame = None
-                hero_buttons_active = False
-
-                print(
-                    "[HERO_ACTION_COMPLETE]",
-                    f"frame={frame_id}",
-                    f"action={reconciled_event.get('semantic_action')}",
-                    "source=hero_cards_disappeared",
-                    flush=True,
-                )
-
-        for reconciled_event in reconciled_quantitative:
-            print(
-                "[FRAME_QUANTITATIVE_RECONCILED]",
-                f"frame={reconciled_event.get('frame')}",
-                f"seat={reconciled_event.get('seat')}",
-                f"action={reconciled_event.get('semantic_action')}",
-                flush=True,
-            )
-
-        if (
-            hero_cards_disappeared_this_frame
-            and not hero_card_action_reconciled
-        ):
-            publish_new(
-                observer,
-                before_publications,
-            )
-
-            print(
-                "[PHYSICAL_HAND_END]",
-                f"frame={frame_id}",
-                "reason=hero_cards_disappeared",
-                "after=frame_reconciliation",
-                flush=True,
-            )
-
-            return
-
-        if (
-            hero_completion_pending_frame is not None
-            and frame_id > hero_completion_pending_frame
-            and observer.hand.next_actor
-            == observer.hero_seat
-        ):
-            hero_player = observer.hand.players[
-                observer.hero_seat
-            ]
-
-            hero_commitment = float(
-                hero_player.street_commitment_bb
-            )
-
-            current_price = float(
-                observer.hand.current_price_bb
-            )
-
-            if abs(
-                hero_commitment - current_price
-            ) <= 0.02:
-                action = (
-                    observer.hand
-                    .observe_no_commitment(
-                        observer.hero_seat
-                    )
-                )
-
-                hero_completion_pending_frame = None
-
-                observer._publish_if_changed(
-                    frame_id
-                )
-
-                print(
-                    "[HERO_ACTION_COMPLETE]",
-                    f"frame={frame_id}",
-                    f"action={action}",
-                    "source=buttons_no_commitment",
-                    flush=True,
-                )
-
-        publish_new(
+        transaction = process_frame_transaction(
             observer,
-            before_publications,
+            image,
+            frame_path,
+            frame_id,
+            state,
         )
 
-        if (
-            observer.hand.street
-            == "RIVER"
-            and observer.hand.next_actor
-            is None
-        ):
-            print(
-                "[HAND_COMPLETE]",
-                f"actions="
-                f"{len(observer.hand.actions)}",
-                flush=True,
-            )
+        if transaction.outcome != "CONTINUE":
             return
 
         time.sleep(

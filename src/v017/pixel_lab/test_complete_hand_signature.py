@@ -71,7 +71,7 @@ def build_signature():
     signature = {
         "actions": [
             canonical_action(row)
-            for row in result["actions"]
+            for row in observer.hand.semantic_actions()
         ],
         "board": list(
             observer.hand.board

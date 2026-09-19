@@ -12,11 +12,13 @@ Only rendered PNG bytes may later cross the Pixel Lab isolation wall.
 
 from pathlib import Path
 import json
+import math
 
 import cv2
 
 from src.v017.pixel_lab.acr_seat_mapper import (
     map_acr_seats,
+    mapped_dealer_seat,
 )
 from src.v017.pixel_lab.test_novel_stack_pixels import (
     build_atlas,
@@ -54,6 +56,11 @@ MAXIMIZED_ABSENT = (
       "maximized.png"
 )
 
+EMPTY_STACK_DONORS = {
+    "seat_lower_left": SUBSTRATE_6P,
+    "seat_mid_left": MAXIMIZED_ABSENT,
+}
+
 OVERLAY_ABSENT = (
     ROOT
     / "runtime/debug/v017_max_geometry/"
@@ -61,11 +68,27 @@ OVERLAY_ABSENT = (
 )
 
 PRESENT_DONORS = {
-    "seat_upper_left": SUBSTRATE_6P,
+    "seat_upper_left": (
+        ROOT
+        / "runtime/debug/action_sequence/"
+          "20260714_184648/0001_full.png"
+    ),
     "seat_top": DEFAULT_SUBSTRATE,
-    "seat_upper_right": DEFAULT_SUBSTRATE,
-    "seat_mid_right": DEFAULT_SUBSTRATE,
-    "seat_lower_right": DEFAULT_SUBSTRATE,
+    "seat_upper_right": (
+        ROOT
+        / "runtime/debug/action_sequence/"
+          "20260714_183507/0001_full.png"
+    ),
+    "seat_mid_right": (
+        ROOT
+        / "runtime/debug/action_sequence/"
+          "20260714_183507/0001_full.png"
+    ),
+    "seat_lower_right": (
+        ROOT
+        / "runtime/debug/action_sequence/"
+          "20260714_183507/0001_full.png"
+    ),
 }
 
 ABSENT_DONORS = {
@@ -101,6 +124,14 @@ BOARD_ORDER = (
     "river",
 )
 
+DEALER_DONORS = {
+    "seat_upper_left": (
+        ROOT
+        / "runtime/debug/action_sequence/"
+          "20260726_105421/0001_full.png"
+    ),
+}
+
 
 def load_geometry():
     return json.loads(
@@ -119,7 +150,153 @@ def _load_native(path):
     return image
 
 
+def _inverse_sensor_rect(
+    rect,
+    *,
+    sensor_size=(934, 696),
+    native_size=(3456, 2168),
+):
+    """
+    Return the native pixel footprint covering one canonical sensor ROI.
+
+    canonical_sensor_frame() is a full-frame INTER_AREA resize with no
+    crop or translation, so Pixel Lab must place canonical donor pixels
+    into this inverse footprint rather than independently calibrated
+    maximized card coordinates.
+    """
+    sensor_w, sensor_h = sensor_size
+    native_w, native_h = native_size
+
+    x1 = math.floor(
+        float(rect["x"])
+        * native_w
+        / sensor_w
+    )
+    y1 = math.floor(
+        float(rect["y"])
+        * native_h
+        / sensor_h
+    )
+
+    x2 = math.ceil(
+        float(
+            rect["x"]
+            + rect["width"]
+        )
+        * native_w
+        / sensor_w
+    )
+    y2 = math.ceil(
+        float(
+            rect["y"]
+            + rect["height"]
+        )
+        * native_h
+        / sensor_h
+    )
+
+    return {
+        "x": int(x1),
+        "y": int(y1),
+        "width": int(x2 - x1),
+        "height": int(y2 - y1),
+    }
+
+
 def _transplant_hole_cards(
+    destination,
+    donor,
+    *,
+    geometry,
+    seat,
+    donor_geometry=None,
+    canonical_donor=False,
+):
+    """
+    Generator-side authentic hole-card ROI transplant.
+
+    Native/maximized donors use maximized calibrated coordinates.
+
+    Historical canonical 934x696 donors use canonical calibrated
+    coordinates. Only each authentic card ROI is resized into the
+    corresponding maximized target ROI.
+    """
+    result = destination.copy()
+
+    target_regions = (
+        geometry["hole_cards"][seat]
+    )
+
+    source_geometry = (
+        geometry
+        if donor_geometry is None
+        else donor_geometry
+    )
+
+    source_regions = (
+        source_geometry[
+            "hole_cards"
+        ][seat]
+    )
+
+    for card_name in (
+        "card_1",
+        "card_2",
+    ):
+        source_rect = (
+            source_regions[card_name]
+        )
+
+        if canonical_donor:
+            target_rect = _inverse_sensor_rect(
+                source_rect
+            )
+        else:
+            target_rect = (
+                target_regions[card_name]
+            )
+
+        sx = int(source_rect["x"])
+        sy = int(source_rect["y"])
+        sw = int(source_rect["width"])
+        sh = int(source_rect["height"])
+
+        source = donor[
+            sy:sy + sh,
+            sx:sx + sw,
+        ]
+
+        assert source.size > 0, (
+            seat,
+            card_name,
+            source_rect,
+            donor.shape,
+        )
+
+        tw = int(target_rect["width"])
+        th = int(target_rect["height"])
+
+        if source.shape[:2] != (
+            th,
+            tw,
+        ):
+            source = cv2.resize(
+                source,
+                (tw, th),
+                interpolation=cv2.INTER_CUBIC,
+            )
+
+        tx = int(target_rect["x"])
+        ty = int(target_rect["y"])
+
+        result[
+            ty:ty + th,
+            tx:tx + tw,
+        ] = source
+
+    return result
+
+def _transplant_stack_region(
     destination,
     donor,
     *,
@@ -127,42 +304,67 @@ def _transplant_hole_cards(
     seat,
 ):
     """
-    Generator-side authentic hole-card ROI transplant.
+    Generator-side authentic stack-region transplant.
 
-    Only the two production-calibrated hole-card regions are copied.
+    Used for physically empty seats so production occupancy sees the
+    same absence evidence it sees on real ACR material.
     """
     result = destination.copy()
 
-    regions = geometry["hole_cards"][seat]
+    rect = geometry["stack_regions"][seat]
 
-    for card_name in ("card_1", "card_2"):
-        rect = regions[card_name]
+    x = int(rect["x"])
+    y = int(rect["y"])
+    w = int(rect["width"])
+    h = int(rect["height"])
 
-        x = int(rect["x"])
-        y = int(rect["y"])
-        w = int(rect["width"])
-        h = int(rect["height"])
-
-        result[
-            y:y + h,
-            x:x + w,
-        ] = donor[
-            y:y + h,
-            x:x + w,
-        ]
+    result[
+        y:y + h,
+        x:x + w,
+    ] = donor[
+        y:y + h,
+        x:x + w,
+    ]
 
     return result
 
 
-def _load_fold_donors():
-    paths = set(PRESENT_DONORS.values())
-    paths.update(ABSENT_DONORS.values())
-
+def _load_empty_stack_donors():
     return {
-        path: _load_native(path)
-        for path in paths
+        seat: _load_native(path)
+        for seat, path
+        in EMPTY_STACK_DONORS.items()
     }
 
+
+def _load_fold_donors():
+    paths = set(
+        PRESENT_DONORS.values()
+    )
+    paths.update(
+        ABSENT_DONORS.values()
+    )
+
+    donors = {}
+
+    for path in paths:
+        image = cv2.imread(
+            str(path)
+        )
+
+        assert image is not None, path
+
+        assert image.shape[:2] in {
+            (2168, 3456),
+            (696, 934),
+        }, (
+            path,
+            image.shape,
+        )
+
+        donors[path] = image
+
+    return donors
 
 def _old_geometry():
     return json.loads(
@@ -204,51 +406,141 @@ def _transplant_board(
     """
     Generator-side authentic board-presence transplant.
 
-    Each historical calibrated board ROI is independently transformed
-    into the corresponding maximized calibrated ROI. No full-frame
-    scaling and no production geometry changes.
+    Board donors are historical canonical 934x696 pixels.
+
+    canonical_sensor_frame() is a pure full-frame resize, so each
+    canonical board ROI must be rendered into its exact inverse native
+    footprint. Independently calibrated maximized board coordinates
+    are not the inverse sensor transform and must not own placement.
     """
     result = destination.copy()
 
     for card_name in BOARD_ORDER:
-        old_rect = old_geometry[
+        source_rect = old_geometry[
             "board"
         ][card_name]
 
-        new_rect = new_geometry[
-            "board"
-        ][card_name]
+        target_rect = _inverse_sensor_rect(
+            source_rect
+        )
 
-        ox = int(old_rect["x"])
-        oy = int(old_rect["y"])
-        ow = int(old_rect["width"])
-        oh = int(old_rect["height"])
+        sx = int(source_rect["x"])
+        sy = int(source_rect["y"])
+        sw = int(source_rect["width"])
+        sh = int(source_rect["height"])
 
         source = donor[
-            oy:oy + oh,
-            ox:ox + ow,
+            sy:sy + sh,
+            sx:sx + sw,
         ]
 
-        assert source.size > 0
+        assert source.size > 0, (
+            card_name,
+            source_rect,
+            donor.shape,
+        )
 
-        nw = int(new_rect["width"])
-        nh = int(new_rect["height"])
+        tw = int(target_rect["width"])
+        th = int(target_rect["height"])
 
-        resized = cv2.resize(
+        source = cv2.resize(
             source,
-            (nw, nh),
+            (tw, th),
             interpolation=cv2.INTER_CUBIC,
         )
 
-        nx = int(new_rect["x"])
-        ny = int(new_rect["y"])
+        tx = int(target_rect["x"])
+        ty = int(target_rect["y"])
+
+        assert (
+            tx >= 0
+            and ty >= 0
+            and tx + tw <= result.shape[1]
+            and ty + th <= result.shape[0]
+        ), (
+            card_name,
+            target_rect,
+            result.shape,
+        )
 
         result[
-            ny:ny + nh,
-            nx:nx + nw,
-        ] = resized
+            ty:ty + th,
+            tx:tx + tw,
+        ] = source
 
     return result
+
+def _transplant_dealer_button(
+    destination,
+    donor,
+    *,
+    seat,
+    old_geometry,
+):
+    """
+    Generator-side authentic dealer-button transplant.
+
+    Dealer detection operates in canonical 934x696 coordinates.
+    The donor is canonical. Only the selected dealer search zone is
+    transformed into the native 3456x2168 rendered frame.
+    """
+    result = destination.copy()
+
+    zone = old_geometry[
+        "dealer_button_zones"
+    ][seat]
+
+    if isinstance(zone, list):
+        zone = zone[0]
+
+    cx = int(zone["x"])
+    cy = int(zone["y"])
+    cw = int(zone["width"])
+    ch = int(zone["height"])
+
+    patch = donor[
+        cy:cy + ch,
+        cx:cx + cw,
+    ]
+
+    assert patch.size > 0
+
+    native_h, native_w = result.shape[:2]
+
+    sx = native_w / 934.0
+    sy = native_h / 696.0
+
+    x1 = round(cx * sx)
+    y1 = round(cy * sy)
+    x2 = round((cx + cw) * sx)
+    y2 = round((cy + ch) * sy)
+
+    patch = cv2.resize(
+        patch,
+        (x2 - x1, y2 - y1),
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+    result[
+        y1:y2,
+        x1:x2,
+    ] = patch
+
+    return result
+
+def _load_dealer_donors():
+    donors = {}
+
+    for seat, path in DEALER_DONORS.items():
+        image = cv2.imread(str(path))
+        assert image is not None, path
+        assert image.shape[:2] == (696, 934), (
+            path,
+            image.shape,
+        )
+        donors[seat] = image
+
+    return donors
 
 
 def _load_board_donors():
@@ -286,6 +578,8 @@ def render_truth_frame(
     geometry,
     atlas,
     fold_donors,
+    empty_stack_donors,
+    dealer_donors,
     board_donors,
     old_geometry,
 ):
@@ -303,6 +597,27 @@ def render_truth_frame(
     """
     image = substrate.copy()
 
+    dealer_seat = mapped_dealer_seat(
+        hand
+    )
+
+    dealer_donor = dealer_donors.get(
+        dealer_seat
+    )
+
+    if dealer_donor is None:
+        raise RuntimeError(
+            "no physical dealer donor for "
+            f"{dealer_seat}"
+        )
+
+    image = _transplant_dealer_button(
+        image,
+        dealer_donor,
+        seat=dealer_seat,
+        old_geometry=old_geometry,
+    )
+
     board_count = _board_count_for_truth(
         truth_frame
     )
@@ -316,6 +631,19 @@ def render_truth_frame(
 
     seat_map = map_acr_seats(hand)
     players = _player_by_name(hand)
+    occupied_seats = set(
+        seat_map.values()
+    )
+
+    for seat, donor in empty_stack_donors.items():
+        if seat not in occupied_seats:
+            image = _transplant_stack_region(
+                image,
+                donor,
+                geometry=geometry,
+                seat=seat,
+            )
+
     truth = _truth_by_name(truth_frame)
 
     rendered = []
@@ -354,11 +682,28 @@ def render_truth_frame(
                 else PRESENT_DONORS[seat]
             )
 
+            donor = fold_donors[
+                donor_path
+            ]
+
+            canonical_donor = (
+                donor.shape[:2]
+                == (696, 934)
+            )
+
+            donor_geometry = (
+                old_geometry
+                if canonical_donor
+                else geometry
+            )
+
             image = _transplant_hole_cards(
                 image,
-                fold_donors[donor_path],
+                donor,
                 geometry=geometry,
                 seat=seat,
+                donor_geometry=donor_geometry,
+                canonical_donor=canonical_donor,
             )
 
         rendered.append(
@@ -403,6 +748,10 @@ def render_hand_progression(
     # Reuse the already-proven authentic stack glyph extraction.
     atlas = build_atlas(substrate)
     fold_donors = _load_fold_donors()
+    empty_stack_donors = (
+        _load_empty_stack_donors()
+    )
+    dealer_donors = _load_dealer_donors()
     board_donors = _load_board_donors()
     old_geometry = _old_geometry()
 
@@ -417,6 +766,9 @@ def render_hand_progression(
                 geometry=geometry,
                 atlas=atlas,
                 fold_donors=fold_donors,
+                empty_stack_donors=
+                    empty_stack_donors,
+                dealer_donors=dealer_donors,
                 board_donors=board_donors,
                 old_geometry=old_geometry,
             )

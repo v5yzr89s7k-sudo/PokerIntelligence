@@ -15,7 +15,7 @@ def main():
     for node in tree.body:
         if (
             isinstance(node, ast.FunctionDef)
-            and node.name == "run_hand"
+            and node.name == "process_frame_transaction"
         ):
             run = ast.get_source_segment(
                 source,
@@ -47,7 +47,7 @@ def main():
 
     # Later-frame resolution exists.
     assert (
-        "frame_id > hero_completion_pending_frame"
+        "frame_id > state.hero_completion_pending_frame"
         in run
     )
     assert "observe_no_commitment(" in run

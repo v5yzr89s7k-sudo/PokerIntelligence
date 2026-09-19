@@ -191,8 +191,14 @@ def main():
         in physical_types
     ), physical_types
 
-    assert result["actions"], (
-        "FrameHandObserver/HandEngine "
+    observer = result["observer"]
+
+    actions = tuple(
+        observer.hand.semantic_actions()
+    )
+
+    assert actions, (
+        "production HandEngine "
         "made no semantic progress"
     )
 

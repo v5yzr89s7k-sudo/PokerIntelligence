@@ -59,7 +59,7 @@ def main():
     run = get_function(
         source,
         tree,
-        "run_hand",
+        "process_frame_transaction",
     )
 
     # Physical evidence remains observable.

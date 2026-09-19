@@ -416,6 +416,80 @@ class FrameHandObserver:
             x:x + w,
         ]
 
+    def establish_physical_transition_baseline(
+        self,
+        physical_frame,
+        *,
+        physical_geometry,
+    ):
+        """
+        Establish transition-only sensor state from the acquisition frame.
+
+        This emits no events and grants no poker-semantic authority.
+        It exists so the first post-bootstrap physical transition is
+        measured against the frame that actually established the hand.
+        """
+        visibility = {}
+
+        for seat in self.opponent_seats:
+            regions = (
+                physical_geometry
+                .get(
+                    "hole_cards",
+                    {},
+                )
+                .get(seat)
+            )
+
+            if not regions:
+                continue
+
+            visibility[seat] = bool(
+                opponent_cards_visible(
+                    physical_frame,
+                    regions,
+                )
+            )
+
+        self.previous_visibility = visibility
+
+        self.previous_hero_cards_visible = bool(
+            hero_cards_visible(
+                physical_frame,
+                physical_geometry,
+            )
+        )
+
+        if physical_geometry.get(
+            "action_buttons"
+        ):
+            self.previous_action_buttons_visible = bool(
+                action_buttons_visible(
+                    physical_frame,
+                    physical_geometry,
+                )
+            )
+        else:
+            self.previous_action_buttons_visible = False
+
+        # Deliberately do not touch:
+        #   previous_board_count
+        #   previous_frame
+        #   bet-region baselines
+        #   stack/quantitative ownership
+        #   HandEngine
+        #   events/publications
+
+        return {
+            "opponent_visibility":
+                dict(self.previous_visibility),
+            "hero_cards_visible":
+                self.previous_hero_cards_visible,
+            "action_buttons_visible":
+                self.previous_action_buttons_visible,
+        }
+
+
     @property
     def next_actor(self):
         return self.hand.next_actor
