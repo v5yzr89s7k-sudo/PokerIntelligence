@@ -478,6 +478,29 @@ class FrameHandObserver:
         )
 
 
+    def retain_card_disappearance(
+        self,
+        seat: str,
+        *,
+        frame_id=None,
+        physical_type=(
+            "OPPONENT_CARDS_DISAPPEARED"
+        ),
+    ):
+        """
+        Preserve objective card-disappearance evidence without granting
+        immediate semantic authority.
+
+        Use this while one physical frame is still open. Other evidence
+        from that same frame must receive its chronology opportunity
+        before retained card evidence is reconciled.
+        """
+        self._retain_pending_card_disappearance(
+            seat,
+            frame_id=frame_id,
+            physical_type=physical_type,
+        )
+
     def _admit_authoritative_card_disappearance(
         self,
         seat: str,

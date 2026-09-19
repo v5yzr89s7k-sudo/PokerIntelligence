@@ -846,6 +846,65 @@ def filter_common_mode_quantitative_events(
     return eligible, rejected
 
 
+def retain_frame_card_disappearances(
+    observer,
+    events,
+    *,
+    frame_id,
+):
+    """
+    Retain all objective card-disappearance evidence from one physical
+    frame before any semantic admission from that frame.
+
+    Raw detector list order must never determine poker chronology.
+    """
+    retained = []
+
+    for event in events:
+        typ = event.get("type")
+
+        if typ not in {
+            "OPPONENT_CARDS_DISAPPEARED",
+            "HERO_CARDS_DISAPPEARED_PHYSICAL",
+        }:
+            continue
+
+        observer.retain_card_disappearance(
+            event["seat"],
+            frame_id=frame_id,
+            physical_type=typ,
+        )
+
+        retained.append(event)
+
+    return tuple(retained)
+
+
+def reconcile_frame_evidence(
+    observer,
+):
+    """
+    Drain retained evidence after all raw evidence from the current
+    physical frame has had its normal authority opportunity.
+    """
+    card_rows = (
+        observer
+        .reconcile_pending_card_disappearances()
+    )
+
+    quantitative_rows = (
+        observer.reconcile_pending_evidence()
+    )
+
+    observer.reconcile_pending_card_disappearances()
+    observer.reconcile_pending_street_boundaries()
+
+    return (
+        tuple(card_rows),
+        tuple(quantitative_rows),
+    )
+
+
 def run_hand(
     window,
     observer,
@@ -898,6 +957,20 @@ def run_hand(
             for event in common_mode_quantitative_events
         }
 
+        frame_card_events = (
+            retain_frame_card_disappearances(
+                observer,
+                result.events,
+                frame_id=frame_id,
+            )
+        )
+
+        hero_cards_disappeared_this_frame = any(
+            event.get("type")
+            == "HERO_CARDS_DISAPPEARED_PHYSICAL"
+            for event in frame_card_events
+        )
+
         for event in result.events:
             typ = event["type"]
 
@@ -905,14 +978,9 @@ def run_hand(
                 "OPPONENT_CARDS_DISAPPEARED",
                 "HERO_CARDS_DISAPPEARED_PHYSICAL",
             }:
-                admitted_card_action = (
-                    observer.admit_card_disappearance(
-                        event["seat"],
-                        frame_id=frame_id,
-                        physical_type=typ,
-                    )
-                )
-
+                # Already retained before this frame's semantic loop.
+                # Preserve Hero physical lifecycle bookkeeping, but
+                # defer semantic authority until frame reconciliation.
                 if (
                     typ
                     == "HERO_CARDS_DISAPPEARED_PHYSICAL"
@@ -920,28 +988,7 @@ def run_hand(
                     hero_completion_pending_frame = None
                     hero_buttons_active = False
 
-                    if admitted_card_action is not None:
-                        print(
-                            "[HERO_ACTION_COMPLETE]",
-                            f"frame={frame_id}",
-                            f"action={admitted_card_action}",
-                            "source=hero_cards_disappeared",
-                            flush=True,
-                        )
-                    else:
-                        publish_new(
-                            observer,
-                            before_publications,
-                        )
-
-                        print(
-                            "[PHYSICAL_HAND_END]",
-                            f"frame={frame_id}",
-                            "reason=hero_cards_disappeared",
-                            flush=True,
-                        )
-
-                        return
+                continue
 
             elif (
                 typ
@@ -1110,6 +1157,67 @@ def run_hand(
                     frame_id=frame_id,
                     board=board,
                 )
+
+        reconciled_cards, reconciled_quantitative = (
+            reconcile_frame_evidence(
+                observer
+            )
+        )
+
+        hero_card_action_reconciled = False
+
+        for reconciled_event in reconciled_cards:
+            print(
+                "[FRAME_CARD_RECONCILED]",
+                f"frame={reconciled_event.get('frame')}",
+                f"seat={reconciled_event.get('seat')}",
+                f"action={reconciled_event.get('semantic_action')}",
+                flush=True,
+            )
+
+            if (
+                reconciled_event.get("seat")
+                == observer.hero_seat
+            ):
+                hero_card_action_reconciled = True
+                hero_completion_pending_frame = None
+                hero_buttons_active = False
+
+                print(
+                    "[HERO_ACTION_COMPLETE]",
+                    f"frame={frame_id}",
+                    f"action={reconciled_event.get('semantic_action')}",
+                    "source=hero_cards_disappeared",
+                    flush=True,
+                )
+
+        for reconciled_event in reconciled_quantitative:
+            print(
+                "[FRAME_QUANTITATIVE_RECONCILED]",
+                f"frame={reconciled_event.get('frame')}",
+                f"seat={reconciled_event.get('seat')}",
+                f"action={reconciled_event.get('semantic_action')}",
+                flush=True,
+            )
+
+        if (
+            hero_cards_disappeared_this_frame
+            and not hero_card_action_reconciled
+        ):
+            publish_new(
+                observer,
+                before_publications,
+            )
+
+            print(
+                "[PHYSICAL_HAND_END]",
+                f"frame={frame_id}",
+                "reason=hero_cards_disappeared",
+                "after=frame_reconciliation",
+                flush=True,
+            )
+
+            return
 
         if (
             hero_completion_pending_frame is not None

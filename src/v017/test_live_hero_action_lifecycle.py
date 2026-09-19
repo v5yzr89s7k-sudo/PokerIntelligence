@@ -56,9 +56,26 @@ def main():
     # Quantitative Hero admission cancels pending completion.
     assert "source=quantitative" in run
 
-    # Hero card disappearance is no longer universally terminal.
-    assert "admitted_card_action is not None" in run
+    # Hero-card disappearance participates in the complete physical
+    # frame transaction. It may become an authoritative Hero action
+    # after reconciliation; only an unresolved disappearance may use
+    # the physical hand-end fallback.
+    assert "hero_cards_disappeared_this_frame" in run
+    assert "hero_card_action_reconciled" in run
     assert "source=hero_cards_disappeared" in run
+    assert "[PHYSICAL_HAND_END]" in run
+
+    retain = run.index(
+        "retain_frame_card_disappearances("
+    )
+    reconcile = run.index(
+        "reconcile_frame_evidence("
+    )
+    physical_end = run.index(
+        "[PHYSICAL_HAND_END]"
+    )
+
+    assert retain < reconcile < physical_end
 
     print(
         "V0.17 LIVE HERO ACTION LIFECYCLE: PASS"
