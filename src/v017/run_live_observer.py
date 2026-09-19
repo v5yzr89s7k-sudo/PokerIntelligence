@@ -1040,6 +1040,49 @@ def run_hand(
                     )
                     continue
 
+                # Terminal accounting is a separate authority lane
+                # from wager commitment.
+                #
+                # After authoritative UNCONTESTED completion,
+                # HandEngine may expose one exact unmatched commitment.
+                # A physical winner-stack increase may confirm that
+                # predetermined accounting value. If consumed here,
+                # never offer the same observation to wager settlement.
+                terminal_rows = (
+                    observer
+                    .admit_terminal_stack_return(
+                        event
+                    )
+                )
+
+                if terminal_rows:
+                    for terminal_event in terminal_rows:
+                        print(
+                            "[TERMINAL_STACK_RETURN]",
+                            f"frame={frame_id}",
+                            f"seat={terminal_event.get('seat')}",
+                            f"prior={terminal_event.get('prior')}",
+                            f"value={terminal_event.get('resolved_value')}",
+                            f"amount={terminal_event.get('amount_bb')}",
+                            flush=True,
+                        )
+
+                    observer.clear_quantitative_ownership(
+                        event.get("seat")
+                    )
+                    settlement_gate.clear_seat(
+                        event.get("seat")
+                    )
+
+                    if (
+                        event.get("seat")
+                        == observer.hero_seat
+                    ):
+                        hero_completion_pending_frame = None
+                        hero_buttons_active = False
+
+                    continue
+
                 # Raw OCR never mutates HandEngine directly.
                 #
                 # StackSettlementGate requires independent temporal
