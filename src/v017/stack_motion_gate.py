@@ -24,6 +24,21 @@ PIXEL_DIFF_THRESHOLD = 18
 WAKE_CHANGED_FRACTION = 0.05
 WAKE_MEAN_DIFF = 4.0
 
+# Secondary OCR-scheduling wake for compact stack-text changes.
+#
+# Some legitimate quantitative transitions alter only a few glyphs
+# inside the relatively large calibrated stack ROI. Their changed
+# fraction can therefore be far below the broad-motion threshold even
+# though the changed glyph pixels have strong contrast.
+#
+# This remains perception scheduling only. A secondary wake does not
+# update trusted stacks and has no poker-semantic authority; OCR,
+# prior-aware resolution, settlement, and HandEngine admission remain
+# unchanged downstream.
+SECONDARY_CHANGED_FRACTION = 0.007
+SECONDARY_MEAN_DIFF = 0.80
+SECONDARY_MAX_DIFF = 180
+
 
 @dataclass(frozen=True)
 class StackMotion:
@@ -110,11 +125,25 @@ def measure_stack_motion(
         difference.max()
     )
 
-    wake = bool(
+    broad_wake = bool(
         changed_fraction
         >= WAKE_CHANGED_FRACTION
         and mean_diff
         >= WAKE_MEAN_DIFF
+    )
+
+    compact_glyph_wake = bool(
+        changed_fraction
+        >= SECONDARY_CHANGED_FRACTION
+        and mean_diff
+        >= SECONDARY_MEAN_DIFF
+        and max_diff
+        >= SECONDARY_MAX_DIFF
+    )
+
+    wake = bool(
+        broad_wake
+        or compact_glyph_wake
     )
 
     return StackMotion(

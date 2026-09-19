@@ -911,6 +911,172 @@ class FrameHandObserver:
                 bool(all_in_confirmed),
         }
 
+    def admit_terminal_stack_return(
+        self,
+        observation: Dict[str, Any],
+    ):
+        """
+        Admit a physically observed post-terminal uncalled return.
+
+        This lane is intentionally separate from quantitative commitment
+        admission. Stack increases can never represent wagers.
+
+        Authority is narrow:
+          - HandEngine already owns UNCONTESTED completion;
+          - seat is the sole authoritative winner;
+          - HandEngine exposes a positive unmatched commitment;
+          - one raw OCR candidate exactly equals trusted stack plus that
+            authoritative unmatched amount.
+
+        The OCR observation confirms a predetermined accounting value.
+        It does not infer the return amount.
+        """
+        if (
+            observation.get("type")
+            != "STACK_QUANTITATIVE_OBSERVATION"
+        ):
+            return ()
+
+        if not self.hand.hand_complete:
+            return ()
+
+        if (
+            self.hand.completion_reason
+            != "UNCONTESTED"
+        ):
+            return ()
+
+        winners = list(
+            self.hand.winner_seats
+        )
+
+        if len(winners) != 1:
+            return ()
+
+        seat = str(
+            observation.get("seat")
+        )
+
+        if seat != winners[0]:
+            return ()
+
+        if seat not in self.trusted_stacks:
+            return ()
+
+        expected_return = (
+            self.hand
+            .unmatched_commitment_bb(
+                seat
+            )
+        )
+
+        if expected_return <= 0.02:
+            return ()
+
+        prior = round(
+            float(
+                self.trusted_stacks[seat]
+            ),
+            2,
+        )
+
+        expected_value = round(
+            prior + expected_return,
+            2,
+        )
+
+        candidates = []
+
+        for row in (
+            observation.get("raw")
+            or []
+        ):
+            value = row.get(
+                "stack_bb"
+            )
+
+            if value is None:
+                continue
+
+            candidates.append(
+                round(
+                    float(value),
+                    2,
+                )
+            )
+
+        # Preserve the normal reader's top-level value too when present.
+        reader_value = observation.get(
+            "reader_value"
+        )
+
+        if reader_value is not None:
+            candidates.append(
+                round(
+                    float(reader_value),
+                    2,
+                )
+            )
+
+        observed_value = next(
+            (
+                value
+                for value in candidates
+                if abs(
+                    value
+                    - expected_value
+                ) <= 0.02
+            ),
+            None,
+        )
+
+        if observed_value is None:
+            return ()
+
+        amount = (
+            self.hand
+            .observe_uncalled_return(
+                seat,
+                expected_return,
+            )
+        )
+
+        self.trusted_stacks[seat] = (
+            observed_value
+        )
+
+        event = {
+            "frame":
+                observation.get("frame"),
+            "type":
+                "UNCALLED_RETURN_ADMITTED",
+            "seat": seat,
+            "prior": prior,
+            "resolved_value":
+                observed_value,
+            "amount_bb": amount,
+            "expected_value":
+                expected_value,
+        }
+
+        self.events.append(event)
+
+        self._publish_if_changed(
+            observation.get("frame")
+        )
+
+        print(
+            "[UNCALLED_RETURN_ADMITTED]",
+            f"frame={observation.get('frame')}",
+            f"seat={seat}",
+            f"prior={prior}",
+            f"value={observed_value}",
+            f"amount={amount}",
+            flush=True,
+        )
+
+        return (event,)
+
     def admit_quantitative_observation(
         self,
         observation: Dict[str, Any],
@@ -1184,9 +1350,49 @@ class FrameHandObserver:
         self.events.append(event)
         emitted.append(event)
 
-        self._publish_if_changed(
-            observation.get("frame")
-        )
+        # A successful quantitative admission may advance the
+        # authoritative actor frontier onto physical evidence that
+        # arrived earlier in this frame or in a prior frame.
+        #
+        # Catch that evidence up atomically. In particular:
+        #
+        #   later-actor card disappearance arrives
+        #       -> retained
+        #   predecessor quantitative action settles
+        #       -> frontier advances
+        #   retained disappearance
+        #       -> must become authoritative immediately
+        #
+        # Do not call reconcile_pending_evidence() here before the
+        # direct quantitative admission returns: that reconciler itself
+        # enters admit_quantitative_observation(). Instead drain the
+        # other evidence classes first, then allow retained quantitative
+        # work exposed by those folds to run, then drain folds once more.
+        self._begin_publication_transaction()
+
+        try:
+            self.reconcile_pending_card_disappearances()
+
+            reconciled_quantitative = (
+                self.reconcile_pending_evidence()
+            )
+            if reconciled_quantitative:
+                emitted.extend(
+                    reconciled_quantitative
+                )
+
+            self.reconcile_pending_card_disappearances()
+
+            self.reconcile_pending_street_boundaries()
+
+            self._publication_deferred_frame = (
+                observation.get("frame")
+            )
+
+        finally:
+            self._end_publication_transaction(
+                observation.get("frame")
+            )
 
         return tuple(emitted)
 

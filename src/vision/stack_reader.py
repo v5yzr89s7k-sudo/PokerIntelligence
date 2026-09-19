@@ -102,13 +102,25 @@ def _prepare_images(crop):
             "crop must be a non-empty image"
         )
 
-    enlarged = cv2.resize(
-        crop,
-        None,
-        fx=6,
-        fy=6,
-        interpolation=cv2.INTER_CUBIC,
-    )
+    # Legacy canonical crops are approximately 120x35 and need
+    # enlargement before OCR.
+    #
+    # Maximized-native v0.17 crops are approximately 432x174 and
+    # already contain sufficient glyph resolution. Enlarging these
+    # crops again was experimentally proven to create systematic
+    # 5 -> 9 OCR errors.
+    crop_h, crop_w = crop.shape[:2]
+
+    if crop_w >= 300 and crop_h >= 100:
+        enlarged = crop.copy()
+    else:
+        enlarged = cv2.resize(
+            crop,
+            None,
+            fx=6,
+            fy=6,
+            interpolation=cv2.INTER_CUBIC,
+        )
 
     hsv = cv2.cvtColor(
         enlarged,
@@ -351,6 +363,127 @@ def read_stack_independent_consensus(crop) -> Dict[str, Any]:
             else "independent_unresolved"
         ),
         "raw": list(readings or []),
+    }
+
+
+def read_stack_native_fast(crop) -> Dict[str, Any]:
+    """
+    Fast perception-only stack reader for maximized-native crops.
+
+    Contract:
+      - caller supplies an already high-resolution native stack crop;
+      - no enlargement is performed;
+      - one green-mask PSM7 OCR pass is executed;
+      - no continuity, poker semantics, or digit substitution is used.
+
+    Unresolved or syntactically suspicious reads are returned with no
+    quantitative authority so the caller may invoke the full reader as
+    a fallback.
+    """
+    if crop is None or crop.size == 0:
+        raise ValueError(
+            "crop must be a non-empty image"
+        )
+
+    crop_h, crop_w = crop.shape[:2]
+
+    if crop_w < 300 or crop_h < 100:
+        return {
+            "raw": [],
+            "stack_bb": None,
+            "stack_text": "",
+            "confidence": 0.0,
+            "votes": 0,
+            "mode": "native_fast_ineligible",
+        }
+
+    hsv = cv2.cvtColor(
+        crop,
+        cv2.COLOR_BGR2HSV,
+    )
+
+    green = cv2.inRange(
+        hsv,
+        LOWER_GREEN,
+        UPPER_GREEN,
+    )
+
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (2, 2),
+    )
+
+    green = cv2.morphologyEx(
+        green,
+        cv2.MORPH_OPEN,
+        kernel,
+    )
+
+    green = cv2.morphologyEx(
+        green,
+        cv2.MORPH_CLOSE,
+        kernel,
+    )
+
+    reading = {
+        "variant": "native_green_psm7",
+        **_ocr(green),
+    }
+
+    # Native ACR stack displays legitimately use either one or
+    # two decimal digits (for example "62.5 BB" and "73.87 BB").
+    # The legacy _green_is_trustworthy() contract requires exactly
+    # two decimals, so it cannot gate the native fast path.
+    raw = str(reading.get("raw") or "").strip()
+    value = reading.get("stack_bb")
+
+    # ACR/Tesseract may preserve the numeric stack while dropping
+    # or corrupting the trailing BB glyphs. Hero in the maximized
+    # calibration frame is an observed example:
+    #
+    #     "55.62 ." -> 55.62
+    #
+    # Require an intact decimal numeric token with one or two
+    # fractional digits, but do not require the decorative BB suffix.
+    native_token = re.search(
+        r"(?<![\d.])"
+        r"(\d+\.\d{1,2})"
+        r"(?![\d.])",
+        raw,
+    )
+
+    native_trustworthy = (
+        value is not None
+        and 0 <= float(value) <= 1000
+        and native_token is not None
+        and abs(
+            float(native_token.group(1))
+            - float(value)
+        ) < 0.001
+    )
+
+    if not native_trustworthy:
+        return {
+            "raw": [reading],
+            "stack_bb": None,
+            "stack_text": "",
+            "confidence": 0.0,
+            "votes": 0,
+            "mode": "native_fast_unresolved",
+        }
+
+    value = float(
+        reading["stack_bb"]
+    )
+
+    return {
+        "raw": [reading],
+        "stack_bb": value,
+        "stack_text": f"{value:g} BB",
+        # One OCR observation is not independent consensus.
+        "confidence": 0.80,
+        "votes": 1,
+        "mode": "native_green_fast",
     }
 
 

@@ -92,6 +92,16 @@ class HandEngine:
         self.hero_cards = []
         self.board = []
 
+        # Canonical terminal-result state.
+        #
+        # Betting closure (next_actor is None) is not sufficient
+        # to complete a hand: an all-in hand may still be running
+        # out. Result state is established only by an authoritative
+        # terminal condition.
+        self.hand_complete = False
+        self.completion_reason = None
+        self.winner_seats = []
+
         self._post_blind(
             small_blind_seat,
             float(small_blind_bb),
@@ -245,7 +255,142 @@ class HandEngine:
         if len(remaining_after_fold) == 1:
             self.pending_to_act = []
 
+            # This result requires no winner inference from
+            # perception. Once an authoritative FOLD leaves
+            # exactly one dealt-in, non-folded player, HandEngine
+            # itself owns the uncontested winner.
+            self.hand_complete = True
+            self.completion_reason = "UNCONTESTED"
+            self.winner_seats = [
+                remaining_after_fold[0]
+            ]
+
         return "FOLD"
+
+    def unmatched_commitment_bb(
+        self,
+        seat,
+    ):
+        """
+        Return the objectively unmatched portion of one player's
+        current-street commitment.
+
+        This is accounting state only. It does not infer that a refund
+        occurred.
+        """
+        if seat not in self.players:
+            raise ValueError(
+                f"unknown seat: {seat}"
+            )
+
+        player = self.players[seat]
+
+        own = float(
+            player.street_commitment_bb
+        )
+
+        opponent_commitments = [
+            float(
+                candidate.street_commitment_bb
+            )
+            for candidate
+            in self.players.values()
+            if (
+                candidate.seat != seat
+                and candidate.dealt_in
+            )
+        ]
+
+        matched = max(
+            opponent_commitments,
+            default=0.0,
+        )
+
+        return round(
+            max(
+                0.0,
+                own - matched,
+            ),
+            2,
+        )
+
+    def observe_uncalled_return(
+        self,
+        seat,
+        amount_bb,
+    ):
+        """
+        Admit independently observed terminal uncalled-chip return.
+
+        Strict authority contract:
+
+        - the hand must already be complete;
+        - completion must be UNCONTESTED;
+        - the seat must be the sole authoritative winner;
+        - amount must exactly match authoritative unmatched current-
+          street commitment within EPSILON.
+
+        This is terminal accounting, not a betting action. It therefore
+        does not enter semantic_actions() and cannot reopen chronology.
+        """
+        if not self.hand_complete:
+            raise ValueError(
+                "uncalled return requires completed hand"
+            )
+
+        if self.completion_reason != "UNCONTESTED":
+            raise ValueError(
+                "uncalled return requires "
+                "UNCONTESTED completion"
+            )
+
+        if self.winner_seats != [seat]:
+            raise ValueError(
+                "uncalled return seat is not "
+                "authoritative uncontested winner: "
+                f"seat={seat} "
+                f"winners={self.winner_seats}"
+            )
+
+        amount = round(
+            float(amount_bb),
+            2,
+        )
+
+        if amount <= EPSILON:
+            raise ValueError(
+                f"invalid uncalled return: {amount}"
+            )
+
+        expected = self.unmatched_commitment_bb(
+            seat
+        )
+
+        if abs(
+            amount - expected
+        ) > EPSILON:
+            raise ValueError(
+                "uncalled return does not match "
+                "authoritative unmatched commitment: "
+                f"seat={seat} "
+                f"observed={amount} "
+                f"expected={expected}"
+            )
+
+        player = self.players[seat]
+
+        player.street_commitment_bb = round(
+            max(
+                0.0,
+                float(
+                    player.street_commitment_bb
+                )
+                - amount,
+            ),
+            2,
+        )
+
+        return amount
 
     def observe_cards_disappeared(
         self,
