@@ -384,22 +384,30 @@ def populate_local_stacks(
             stack_result.get("votes") or 0
         )
 
-        # Bootstrap is establishing an initial baseline, not validating
-        # a live stack transition. Accept a reliable green-only read so Hero
-        # does not start with no baseline.
-        trusted = (
+        # Bootstrap establishes an initial baseline; it does not
+        # authorize a later live stack transition.
+        #
+        # Legacy readers retain independent-consensus authority.
+        # The maximized-native fast reader has already passed its
+        # strict structural numeric contract and deliberately reports
+        # confidence=.80 / votes=1 because it is one OCR observation.
+        consensus_authority = (
             stack_bb is not None
             and float(stack_bb) > 0.0
-            and (
-                (
-                    confidence >= 0.95
-                    and votes >= 2
-                )
-                or (
-                    seat == "hero"
-                    and stack_result.get("mode") == "green_only"
-                )
-            )
+            and confidence >= 0.95
+            and votes >= 2
+        )
+
+        native_fast_authority = (
+            stack_bb is not None
+            and float(stack_bb) > 0.0
+            and stack_result.get("mode")
+            == "native_green_fast"
+        )
+
+        trusted = (
+            consensus_authority
+            or native_fast_authority
         )
 
         stack_candidates = []
