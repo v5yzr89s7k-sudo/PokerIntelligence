@@ -108,6 +108,36 @@ CURRENT_HAND = Path(
     "runtime/live/current_hand.txt"
 )
 
+LATENCY_TRACE = Path(
+    "runtime/live/v017_action_latency.jsonl"
+)
+
+
+def write_latency_trace(record):
+    """
+    Append diagnostic timing only.
+
+    This function has no perception, semantic, scheduling,
+    settlement, or publication authority.
+    """
+    LATENCY_TRACE.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with LATENCY_TRACE.open(
+        "a",
+        encoding="utf-8",
+    ) as handle:
+        handle.write(
+            json.dumps(
+                record,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+
+
 FRAME_INTERVAL_SECONDS = 0.20
 BOOTSTRAP_POLL_SECONDS = 0.25
 STACK_RETRY_COUNT = 6
@@ -728,10 +758,21 @@ def publish_new(
         before_count:
     ]
 
+    completed = []
+
     for publication in new:
         publish_current_hand_text(
             publication["text"],
             CURRENT_HAND,
+        )
+
+        sink_complete_ns = time.perf_counter_ns()
+
+        completed.append(
+            {
+                "publication": publication,
+                "sink_complete_ns": sink_complete_ns,
+            }
         )
 
         print(
@@ -741,6 +782,8 @@ def publish_new(
             f"actions={publication['action_count']}",
             flush=True,
         )
+
+    return tuple(completed)
 
 
 
@@ -1176,6 +1219,13 @@ class FrameTransactionState:
         self.hero_buttons_active = False
         self.hero_completion_pending_frame = None
 
+        # Diagnostic timing only.
+        #
+        # Maps physical frame IDs to the capture-completion
+        # timestamp of objective evidence first observed there.
+        # This state has no semantic authority.
+        self.capture_complete_ns_by_frame = {}
+
 
 class FrameTransactionResult:
     """Observable result of one production frame transaction."""
@@ -1194,6 +1244,8 @@ def process_frame_transaction(
     frame_path,
     frame_id,
     state,
+    *,
+    capture_complete_ns=None,
 ):
     """
     Execute one authoritative physical-frame semantic transaction.
@@ -1205,6 +1257,25 @@ def process_frame_transaction(
         observer.publications
     )
 
+    # Sink cursor may advance within this transaction when an action
+    # is deliberately flushed before blocking street-boundary work.
+    publication_sink_cursor = before_publications
+
+    before_actions = len(
+        observer.hand.actions
+    )
+
+    transaction_start_ns = time.perf_counter_ns()
+
+    if capture_complete_ns is None:
+        # Deterministic/replay callers do not own live acquisition.
+        # Use transaction entry only as a diagnostic fallback.
+        capture_complete_ns = transaction_start_ns
+
+    state.capture_complete_ns_by_frame[
+        frame_id
+    ] = int(capture_complete_ns)
+
     sensor_image = canonical_sensor_frame(
         image
     )
@@ -1215,6 +1286,8 @@ def process_frame_transaction(
         sensor_frame=sensor_image,
         sensor_geometry=SENSOR_GEOMETRY,
     )
+
+    perception_complete_ns = time.perf_counter_ns()
 
     (
         quantitative_settlement_events,
@@ -1242,7 +1315,27 @@ def process_frame_transaction(
         for event in frame_card_events
     )
 
-    for event in result.events:
+    boundary_types = {
+        "FLOP_BOUNDARY_PHYSICAL",
+        "TURN_BOUNDARY_PHYSICAL",
+        "RIVER_BOUNDARY_PHYSICAL",
+    }
+
+    non_boundary_events = tuple(
+        event
+        for event in result.events
+        if event.get("type")
+        not in boundary_types
+    )
+
+    boundary_events = tuple(
+        event
+        for event in result.events
+        if event.get("type")
+        in boundary_types
+    )
+
+    for event in non_boundary_events:
         typ = event["type"]
 
         if typ in {
@@ -1447,58 +1540,139 @@ def process_frame_transaction(
                     flush=True,
                 )
 
-        elif typ in {
-            "FLOP_BOUNDARY_PHYSICAL",
-            "TURN_BOUNDARY_PHYSICAL",
-            "RIVER_BOUNDARY_PHYSICAL",
-        }:
-            expected_count = {
-                "FLOP_BOUNDARY_PHYSICAL":
-                    3,
-                "TURN_BOUNDARY_PHYSICAL":
-                    4,
-                "RIVER_BOUNDARY_PHYSICAL":
-                    5,
-            }[typ]
+    # Street-boundary identity is potentially blocking external
+    # work. Same-frame non-boundary evidence receives its existing
+    # authority opportunity first. Raw detector order does not grant
+    # a street boundary semantic priority.
+    #
+    # If that evidence admitted a canonical action, flush it to the
+    # live product before beginning board identity work.
+    pre_boundary_publications = ()
 
-            board = read_board_identity(
-                frame_path,
-                expected_count,
+    if boundary_events:
+        observer._publish_if_changed(
+            frame_id
+        )
+
+        pre_boundary_publications = publish_new(
+            observer,
+            publication_sink_cursor,
+        )
+
+        publication_sink_cursor = len(
+            observer.publications
+        )
+
+    for event in boundary_events:
+        typ = event["type"]
+        expected_count = {
+            "FLOP_BOUNDARY_PHYSICAL":
+                3,
+            "TURN_BOUNDARY_PHYSICAL":
+                4,
+            "RIVER_BOUNDARY_PHYSICAL":
+                5,
+        }[typ]
+
+        board_read_start_ns = (
+            time.perf_counter_ns()
+        )
+
+        actions_before_board_read = len(
+            observer.hand.actions
+        )
+
+        actions_admitted_before_board = (
+            actions_before_board_read
+            - before_actions
+        )
+
+        publications_flushed_before_board = len(
+            pre_boundary_publications
+        )
+
+        print(
+            "[BOARD_BLOCK_START]",
+            f"frame={frame_id}",
+            f"type={typ}",
+            f"actions_before_tx={before_actions}",
+            f"actions_before_board={actions_before_board_read}",
+            f"actions_admitted={actions_admitted_before_board}",
+            f"publications_flushed={publications_flushed_before_board}",
+            flush=True,
+        )
+
+        board = read_board_identity(
+            frame_path,
+            expected_count,
+        )
+
+        board_read_end_ns = (
+            time.perf_counter_ns()
+        )
+
+        board_block_ms = (
+            board_read_end_ns
+            - board_read_start_ns
+        ) / 1_000_000.0
+
+        print(
+            "[BOARD_BLOCK_END]",
+            f"frame={frame_id}",
+            f"type={typ}",
+            f"board_ms={board_block_ms:.3f}",
+            f"actions_admitted={actions_admitted_before_board}",
+            f"publications_flushed={publications_flushed_before_board}",
+            flush=True,
+        )
+
+        if (
+            actions_admitted_before_board > 0
+            and publications_flushed_before_board > 0
+        ):
+            print(
+                "[ACTION_PUBLISHED_BEFORE_BOARD]",
+                f"frame={frame_id}",
+                f"type={typ}",
+                f"actions={actions_admitted_before_board}",
+                f"board_ms={board_block_ms:.3f}",
+                flush=True,
             )
 
-            board = reconcile_board_identity_prefix(
+        board = reconcile_board_identity_prefix(
+            observer,
+            board,
+        )
+
+        if len(board) == expected_count:
+            # Normal case: preserve ownership of the exact
+            # physical boundary that was observed this frame.
+            #
+            # This is essential when physical board progression
+            # outruns semantic chronology. TURN and RIVER must
+            # remain independently retained rather than being
+            # rewritten as whatever street HandEngine currently
+            # expects.
+            observer.admit_street_boundary(
+                event,
+                action_order=postflop_action_order(
+                    observer
+                ),
+                board=board,
+                complete_pending=True,
+            )
+        else:
+            # True delayed identity catch-up: the board reader
+            # returned a later board than the physical boundary
+            # that triggered the read. Sequentially decompose
+            # that newer identity through the existing catch-up
+            # contract.
+            admit_board_catchup(
                 observer,
-                board,
+                frame_id=frame_id,
+                board=board,
             )
 
-            if len(board) == expected_count:
-                # Normal case: preserve ownership of the exact
-                # physical boundary that was observed this frame.
-                #
-                # This is essential when physical board progression
-                # outruns semantic chronology. TURN and RIVER must
-                # remain independently retained rather than being
-                # rewritten as whatever street HandEngine currently
-                # expects.
-                observer.admit_street_boundary(
-                    event,
-                    action_order=postflop_action_order(
-                        observer
-                    ),
-                    board=board,
-                    complete_pending=True,
-                )
-            else:
-                # True delayed identity catch-up: the board reader
-                # returned a later board than the physical boundary
-                # that triggered the read. Sequentially decompose
-                # that newer identity through the existing catch-up
-                # contract.
-                admit_board_catchup(
-                    observer,
-                    frame_id=frame_id,
-                    board=board,
-                )
 
     reconciled_cards, reconciled_quantitative = (
         reconcile_frame_evidence(
@@ -1659,10 +1833,135 @@ def process_frame_transaction(
                 flush=True,
             )
 
-    publish_new(
-        observer,
-        before_publications,
+    semantic_complete_ns = time.perf_counter_ns()
+
+    completed_publications = (
+        tuple(pre_boundary_publications)
+        + tuple(
+            publish_new(
+                observer,
+                publication_sink_cursor,
+            )
+        )
     )
+
+    after_actions = len(
+        observer.hand.actions
+    )
+
+    if (
+        after_actions > before_actions
+        and completed_publications
+    ):
+        action_rows = observer.hand.actions[
+            before_actions:
+        ]
+
+        first_publication = completed_publications[0]
+        last_publication = completed_publications[-1]
+
+        sink_complete_ns = int(
+            last_publication["sink_complete_ns"]
+        )
+
+        evidence_frames = [
+            event.get("frame")
+            for event in result.events
+            if event.get("frame") is not None
+        ]
+
+        evidence_frame = (
+            min(evidence_frames)
+            if evidence_frames
+            else frame_id
+        )
+
+        evidence_capture_ns = (
+            state.capture_complete_ns_by_frame.get(
+                evidence_frame,
+                capture_complete_ns,
+            )
+        )
+
+        record = {
+            "type": "ACTION_LATENCY",
+            "transaction_frame": frame_id,
+            "evidence_frame": evidence_frame,
+            "action_count_before": before_actions,
+            "action_count_after": after_actions,
+            "actions_added": [
+                {
+                    "sequence": action.sequence,
+                    "street": action.street,
+                    "seat": action.seat,
+                    "position": action.position,
+                    "action": action.action,
+                    "amount_bb": action.amount_bb,
+                    "raise_to_bb": action.raise_to_bb,
+                }
+                for action in action_rows
+            ],
+            "publication_frame": (
+                last_publication[
+                    "publication"
+                ]["frame"]
+            ),
+            "capture_complete_ns": int(
+                evidence_capture_ns
+            ),
+            "perception_complete_ns": int(
+                perception_complete_ns
+            ),
+            "semantic_complete_ns": int(
+                semantic_complete_ns
+            ),
+            "sink_complete_ns": sink_complete_ns,
+            "perception_ms": round(
+                (
+                    perception_complete_ns
+                    - evidence_capture_ns
+                )
+                / 1_000_000.0,
+                3,
+            ),
+            "semantic_ms": round(
+                (
+                    semantic_complete_ns
+                    - perception_complete_ns
+                )
+                / 1_000_000.0,
+                3,
+            ),
+            "publish_ms": round(
+                (
+                    sink_complete_ns
+                    - semantic_complete_ns
+                )
+                / 1_000_000.0,
+                3,
+            ),
+            "end_to_end_ms": round(
+                (
+                    sink_complete_ns
+                    - evidence_capture_ns
+                )
+                / 1_000_000.0,
+                3,
+            ),
+        }
+
+        write_latency_trace(record)
+
+        print(
+            "[ACTION_LATENCY]",
+            f"frame={frame_id}",
+            f"actions={after_actions - before_actions}",
+            f"perception_ms={record['perception_ms']}",
+            f"semantic_ms={record['semantic_ms']}",
+            f"publish_ms={record['publish_ms']}",
+            f"end_to_end_ms={record['end_to_end_ms']}",
+            flush=True,
+        )
 
     if observer.hand.hand_complete:
         print(
@@ -1696,12 +1995,15 @@ def run_hand(
             capture_image(window)
         )
 
+        capture_complete_ns = time.perf_counter_ns()
+
         transaction = process_frame_transaction(
             observer,
             image,
             frame_path,
             frame_id,
             state,
+            capture_complete_ns=capture_complete_ns,
         )
 
         if transaction.outcome != "CONTINUE":
