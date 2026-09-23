@@ -16,6 +16,7 @@ class PlayerState:
     folded: bool = False
     all_in: bool = False
     street_commitment_bb: float = 0.0
+    total_contribution_bb: float = 0.0
 
 
 @dataclass
@@ -84,6 +85,16 @@ class HandEngine:
         )
 
         self.actions: List[HandAction] = []
+
+        # Canonical lifetime pot accounting.
+        #
+        # HandEngine is the sole semantic owner of admitted chip
+        # contributions. Street commitments may reset at a street
+        # boundary; pot_bb and total_contribution_bb never do.
+        #
+        # Physical pot perception may later confirm this value, but
+        # it must never independently overwrite canonical accounting.
+        self.pot_bb = 0.0
 
         # Objective card observations.
         #
@@ -154,12 +165,132 @@ class HandEngine:
         player.street_commitment_bb = (
             amount_bb
         )
+        player.total_contribution_bb = round(
+            float(player.total_contribution_bb)
+            + float(amount_bb),
+            2,
+        )
+        self.pot_bb = round(
+            float(self.pot_bb)
+            + float(amount_bb),
+            2,
+        )
 
         self._append_action(
             seat,
             action,
             amount_bb=amount_bb,
         )
+
+    def observe_starting_pot(
+        self,
+        observed_pot_bb,
+    ):
+        """
+        Reconcile one objective pre-action physical pot observation
+        with forced contributions already owned by HandEngine.
+
+        This operation exists for acquisition that begins after
+        antes/blinds have physically occurred.
+
+        The observed pot is not a continuing authority. It may only
+        establish forced contribution missing from canonical state
+        before voluntary betting chronology has begun.
+        """
+        if self.street != "PREFLOP":
+            raise ValueError(
+                "starting pot requires PREFLOP"
+            )
+
+        if len(self.actions) != 2:
+            raise ValueError(
+                "starting pot must be reconciled before "
+                "voluntary betting actions"
+            )
+
+        if getattr(
+            self,
+            "_starting_pot_reconciled",
+            False,
+        ):
+            raise ValueError(
+                "starting pot already reconciled"
+            )
+
+        observed = float(
+            observed_pot_bb
+        )
+
+        if observed <= 0:
+            raise ValueError(
+                f"invalid starting pot: {observed}"
+            )
+
+        canonical = float(
+            self.pot_bb
+        )
+
+        if observed + 1e-9 < canonical:
+            raise ValueError(
+                "observed starting pot below canonical "
+                "forced contributions: "
+                f"observed={observed} "
+                f"canonical={canonical}"
+            )
+
+        missing_forced = (
+            observed
+            - canonical
+        )
+
+        self.pot_bb = observed
+        self._starting_pot_reconciled = True
+        self.starting_pot_bb = observed
+        self.preacquisition_forced_pot_bb = (
+            missing_forced
+        )
+
+        return missing_forced
+
+    def post_ante(
+        self,
+        seat,
+        amount_bb,
+    ):
+        """
+        Admit one known forced ante contribution.
+
+        An ante contributes to the lifetime pot but is not a
+        current-street betting commitment and therefore must not
+        reduce the player's preflop call price.
+        """
+        if seat not in self.players:
+            raise ValueError(
+                f"unknown ante seat: {seat}"
+            )
+
+        amount = float(
+            amount_bb
+        )
+
+        if amount <= 0:
+            raise ValueError(
+                f"invalid ante: {amount}"
+            )
+
+        player = self.players[seat]
+
+        player.total_contribution_bb = (
+            float(player.total_contribution_bb)
+            + amount
+        )
+
+        self.pot_bb = (
+            float(self.pot_bb)
+            + amount
+        )
+
+        return amount
 
     def _require_actor(self, seat):
         expected = self.next_actor
@@ -477,6 +608,26 @@ class HandEngine:
             2,
         )
 
+        player.total_contribution_bb = round(
+            max(
+                0.0,
+                float(
+                    player.total_contribution_bb
+                )
+                - amount,
+            ),
+            2,
+        )
+
+        self.pot_bb = round(
+            max(
+                0.0,
+                float(self.pot_bb)
+                - amount,
+            ),
+            2,
+        )
+
         return amount
 
     def observe_cards_disappeared(
@@ -637,6 +788,17 @@ class HandEngine:
                 action,
                 amount_bb=delta_bb,
             )
+
+        player.total_contribution_bb = round(
+            float(player.total_contribution_bb)
+            + delta_bb,
+            2,
+        )
+        self.pot_bb = round(
+            float(self.pot_bb)
+            + delta_bb,
+            2,
+        )
 
         if all_in_confirmed:
             player.all_in = True

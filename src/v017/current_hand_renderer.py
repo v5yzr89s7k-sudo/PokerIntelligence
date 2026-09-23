@@ -251,6 +251,8 @@ def render_current_hand(
 
     lines.extend(
         [
+            f"Pot: {_bb(hand.pot_bb)}",
+            "",
             "STATUS",
             SUBLINE,
         ]

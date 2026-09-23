@@ -10,6 +10,13 @@ from openai import OpenAI
 
 ROOT = Path(__file__).resolve().parents[2]
 
+GEOMETRY = json.loads(
+    (
+        ROOT
+        / "config/geometry.json"
+    ).read_text()
+)
+
 # Created once when api_board_worker starts and reused for all streets.
 CLIENT = OpenAI(timeout=45.0)
 
@@ -71,8 +78,18 @@ def _prepare_images(frame):
 
     image = cv2.resize(image, (934, 696))
 
-    # Preserve the currently validated crop exactly.
-    board = image[245:360, 300:640]
+    # Preserve the historically validated ACR board crop.
+    region = GEOMETRY["board_api_crop"]
+
+    x = int(region["x"])
+    y = int(region["y"])
+    width = int(region["width"])
+    height = int(region["height"])
+
+    board = image[
+        y:y + height,
+        x:x + width,
+    ]
 
     if board.size == 0:
         raise RuntimeError("board crop is empty")

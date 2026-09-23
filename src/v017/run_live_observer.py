@@ -13,6 +13,7 @@ Do not run concurrently with the legacy observer.
 """
 
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 import json
 import time
 
@@ -57,6 +58,9 @@ from src.api.hero_cards_reader_core import (
 )
 from src.api.board_reader_core import (
     read_board,
+)
+from src.api.pot_api_reader import (
+    read_pot,
 )
 from src.v017.card_observation import (
     normalize_cards,
@@ -754,6 +758,20 @@ def build_observer_from_frame(
     This function owns no live-window acquisition and no publication.
     It may therefore be reused by deterministic PNG simulation.
     """
+    # The acquisition frame owns one objective starting-pot
+    # observation. Run the expensive OCR concurrently with the
+    # remaining bootstrap work. It must settle before the initial
+    # publication and before any semantic frame transaction.
+    pot_executor = ThreadPoolExecutor(
+        max_workers=1
+    )
+    starting_pot_future = (
+        pot_executor.submit(
+            read_pot,
+            frame_path,
+        )
+    )
+
     if frozen_participants is None:
         seats = native_occupied_seats(
             image,
@@ -937,6 +955,53 @@ def build_observer_from_frame(
 
     observer.hand.observe_hero_cards(
         hero_cards
+    )
+
+    try:
+        starting_pot_result = (
+            starting_pot_future.result()
+        )
+    finally:
+        pot_executor.shutdown(
+            wait=True
+        )
+
+    if not starting_pot_result.get("ok"):
+        raise RuntimeError(
+            "starting pot unresolved on acquisition frame: "
+            f"{starting_pot_result}"
+        )
+
+    starting_pot_bb = (
+        starting_pot_result.get("pot_bb")
+    )
+    starting_pot_support = int(
+        starting_pot_result.get("support")
+        or 0
+    )
+
+    if (
+        starting_pot_bb is None
+        or starting_pot_support < 2
+    ):
+        raise RuntimeError(
+            "starting pot lacks acquisition authority: "
+            f"{starting_pot_result}"
+        )
+
+    missing_forced_pot_bb = (
+        observer.hand.observe_starting_pot(
+            starting_pot_bb
+        )
+    )
+
+    print(
+        "[BOOTSTRAP_STARTING_POT]",
+        f"observed={starting_pot_bb}",
+        f"support={starting_pot_support}",
+        f"missing_forced={missing_forced_pot_bb}",
+        f"canonical={observer.hand.pot_bb}",
+        flush=True,
     )
 
     # The acquisition frame is physical baseline evidence, not an
