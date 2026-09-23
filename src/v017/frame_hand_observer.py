@@ -421,6 +421,7 @@ class FrameHandObserver:
         physical_frame,
         *,
         physical_geometry,
+        native_frame=None,
     ):
         """
         Establish transition-only sensor state from the acquisition frame.
@@ -472,9 +473,20 @@ class FrameHandObserver:
         else:
             self.previous_action_buttons_visible = False
 
+        # Acquisition establishes the native physical baseline for
+        # first post-acquisition stack-motion comparison.
+        #
+        # It remains baseline evidence only:
+        #   - no OCR is scheduled here;
+        #   - no quantitative event is emitted;
+        #   - no HandEngine authority is granted.
+        if native_frame is not None:
+            self.previous_frame = (
+                native_frame.copy()
+            )
+
         # Deliberately do not touch:
         #   previous_board_count
-        #   previous_frame
         #   bet-region baselines
         #   stack/quantitative ownership
         #   HandEngine
@@ -1174,6 +1186,49 @@ class FrameHandObserver:
 
         return (event,)
 
+    def _advance_physical_stack_baseline(
+        self,
+        seat,
+        value,
+        *,
+        frame=None,
+        reason=None,
+    ):
+        """
+        Record a confirmed visible stack value without granting poker
+        semantic authority.
+
+        This is for terminally consumed physical evidence only.
+        Retained chronology-blocked evidence must keep its original
+        semantic baseline until reconciliation.
+        """
+        seat = str(seat)
+
+        if seat not in self.trusted_stacks:
+            return False
+
+        prior = float(
+            self.trusted_stacks[seat]
+        )
+        value = float(value)
+
+        if value >= prior - 0.01:
+            return False
+
+        self.trusted_stacks[seat] = value
+
+        print(
+            "[PHYSICAL_STACK_BASELINE_ADVANCED]",
+            f"frame={frame}",
+            f"seat={seat}",
+            f"prior={prior}",
+            f"value={value}",
+            f"reason={reason}",
+            flush=True,
+        )
+
+        return True
+
     def admit_quantitative_observation(
         self,
         observation: Dict[str, Any],
@@ -1410,6 +1465,13 @@ class FrameHandObserver:
                     f"{bool(all_in_confirmed)}"
                 ),
                 flush=True,
+            )
+
+            self._advance_physical_stack_baseline(
+                seat,
+                value,
+                frame=observation.get("frame"),
+                reason="below_current_price",
             )
 
             return tuple(emitted)
@@ -1901,6 +1963,156 @@ class FrameHandObserver:
         )
 
         return tuple(emitted)
+
+    def admit_terminal_boundary(
+        self,
+        observation: Dict[str, Any],
+    ):
+        """
+        Admit objective physical evidence that the river betting
+        round has terminated.
+
+        Every pending actor must already match the authoritative
+        current price. The complete pending chain is preflighted
+        before any HandEngine mutation, so admission is all-or-none.
+        """
+        if (
+            observation.get("type")
+            != "WINNER_PHYSICAL"
+        ):
+            raise ValueError(
+                "not a physical terminal boundary: "
+                f"{observation.get('type')}"
+            )
+
+        if self.hand.street != "RIVER":
+            return ()
+
+        emitted = []
+
+        # WINNER evidence may arrive in either of two legitimate
+        # terminal states:
+        #
+        # 1. River betting is still open, but every pending actor is
+        #    already at the authoritative price. Complete that final
+        #    zero-price action chain atomically.
+        #
+        # 2. River betting chronology is already closed
+        #    (next_actor is None). In that case there are no betting
+        #    actions to synthesize; proceed directly to canonical
+        #    contested-result admission.
+        if self.hand.next_actor is not None:
+            pending = list(
+                self.hand.pending_to_act
+            )
+
+            blocked_pending = []
+
+            for seat in pending:
+                player = self.hand.players[
+                    seat
+                ]
+
+                if (
+                    player.street_commitment_bb
+                    + 0.02
+                    < self.hand.current_price_bb
+                ):
+                    blocked_pending.append(
+                        seat
+                    )
+
+            if blocked_pending:
+                print(
+                    "[TERMINAL_BOUNDARY_BLOCKED]",
+                    f"frame={observation.get('frame')}",
+                    f"pending={pending}",
+                    f"blocked={blocked_pending}",
+                    f"price={self.hand.current_price_bb}",
+                    flush=True,
+                )
+                return ()
+
+            for seat in pending:
+                action = (
+                    self.hand
+                    .observe_no_commitment(
+                        seat
+                    )
+                )
+
+                event = {
+                    "frame":
+                        observation.get("frame"),
+                    "type":
+                        "TERMINAL_BOUNDARY_COMPLETION",
+                    "physical_type":
+                        "WINNER_PHYSICAL",
+                    "street":
+                        self.hand.street,
+                    "seat":
+                        seat,
+                    "semantic_action":
+                        action,
+                }
+
+                self.events.append(
+                    event
+                )
+                emitted.append(
+                    event
+                )
+
+            assert (
+                self.hand.next_actor
+                is None
+            )
+
+        winner_seat = observation.get(
+            "winner_seat"
+        )
+
+        if winner_seat is None:
+            raise ValueError(
+                "WINNER_PHYSICAL missing winner_seat"
+            )
+
+        self.hand.observe_contested_winner(
+            winner_seat
+        )
+
+        admitted = {
+            "frame":
+                observation.get("frame"),
+            "type":
+                "TERMINAL_BOUNDARY_ADMITTED",
+            "physical_type":
+                "WINNER_PHYSICAL",
+            "street":
+                self.hand.street,
+            "winner_seat":
+                observation.get(
+                    "winner_seat"
+                ),
+            "confidence":
+                observation.get(
+                    "confidence"
+                ),
+        }
+
+        self.events.append(
+            admitted
+        )
+        emitted.append(
+            admitted
+        )
+
+        self._publish_if_changed(
+            observation.get("frame")
+        )
+
+        return tuple(emitted)
+
 
     def snapshot(self) -> Dict[str, Any]:
         """

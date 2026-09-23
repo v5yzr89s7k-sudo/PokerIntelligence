@@ -199,13 +199,26 @@ def main():
         "canonical betting price"
     )
 
-    # BTN's action existence is already externally owned and its trusted
-    # stack evidence establishes a total 2.0 BB commitment. Record that
-    # quantitative pricing fact without admitting BTN canonically.
-    tracker.commitment_tracker.record_pending_quantitative_commitment(
-        "PREFLOP",
-        "btn",
-        2.0,
+    # Production resolver itself must record BTN's trusted quantitative
+    # pricing evidence while BTN remains chronology-blocked. Do not
+    # manually inject the pending commitment here: that would mask a
+    # production-wiring defect.
+    pending_after_btn = (
+        tracker.commitment_tracker
+        ._state("PREFLOP")
+        .pending_quantitative_commitments
+    )
+
+    print()
+    print(
+        "pending_quantitative_commitments_after_btn =",
+        pending_after_btn,
+    )
+
+    assert pending_after_btn.get("btn") == 2.0, (
+        "RED: resolve_inferred_action(BTN) failed to publish "
+        "BTN's trusted 2.0 BB chronology-blocked commitment "
+        "into pending quantitative pricing state"
     )
 
     effective_price = (

@@ -15,7 +15,10 @@ sys.path.insert(0, str(ROOT))
 from src.events.detectors.action_buttons_detector import action_buttons_visible
 from src.events.detectors.hero_turn_detector import HeroBlinkBuffer
 from src.events.detectors.seat_occupancy_detector import occupied_seats
-from src.events.detectors.card_presence import dealt_in_seats
+from src.events.detectors.card_presence import (
+    dealt_in_seats,
+    opponent_cards_visible,
+)
 from src.events.local_event_detector import ChangeSet, LocalEventDetector
 from src.events.detectors.bet_region_detector import bet_region_occupancy
 from src.events.participant_evidence_collector import (
@@ -1950,10 +1953,28 @@ def process_current_frame_physical_card_ownership(
     if not hand_token:
         return state
 
-    visible_seats = dealt_in_seats(
-        frame,
-        GEOM,
+    # Opponent physical-card ownership and disappearance must use
+    # one calibrated perception definition.  dealt_in_seats() uses
+    # the legacy generic participant-card classifier and is not
+    # authoritative for red ACR opponent card-back visibility.
+    visible_seats = []
+
+    hole_cards = (
+        GEOM.get("hole_cards")
+        or {}
     )
+
+    for seat, regions in hole_cards.items():
+        if seat == "hero":
+            continue
+
+        if opponent_cards_visible(
+            frame,
+            regions or {},
+        ):
+            visible_seats.append(
+                seat
+            )
 
     acquisition_token = str(
         state.get(

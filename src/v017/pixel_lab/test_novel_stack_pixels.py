@@ -28,6 +28,26 @@ SOURCE = (
     "native_6_7_8/substrate_8p.png"
 )
 
+# Authentic ACR donor for digit 5.
+#
+# The original seat_upper_right donor is visually a 5 but unchanged
+# production OCR classifies it as 9 in the controlled 56.52 context.
+#
+# This alternate donor was discovered from authentic native captures
+# and independently accepted by unchanged read_stack_native_fast():
+#
+#   56.52 -> 56.52
+#
+# Exact native source:
+#   capture: acr_table_20260917_111425_225042.png
+#   seat:    seat_top
+#   local box: x=196 y=110 w=23 h=43
+DIGIT_5_SOURCE = (
+    ROOT
+    / "runtime/window_captures/"
+      "acr_table_20260917_111425_225042.png"
+)
+
 GENERATOR_ROOT = (
     ROOT
     / "runtime/pixel_lab/generator_work/"
@@ -87,7 +107,6 @@ def build_atlas(image):
             ("1", (104, 102, 15, 42)),
             ("2", (131, 102, 25, 42)),
             ("0", (160, 102, 23, 43)),
-            ("5", (204, 102, 23, 43)),
             ("3", (231, 102, 23, 43)),
             # Authentic ACR decimal point. Keep the vertical canvas
             # aligned with the digit glyphs so paste_glyph() uses the
@@ -128,7 +147,47 @@ def build_atlas(image):
                 ].copy(),
             )
 
-    assert set("3742.").issubset(
+    # Exact authentic alternate digit-5 donor.
+    #
+    # Do not resize or synthesize this glyph. Harvest its native
+    # 23x43 ACR pixels directly from the validated source capture.
+    digit5_image = load_image(
+        DIGIT_5_SOURCE
+    )
+
+    digit5_crop = stack_crop(
+        digit5_image,
+        "seat_top",
+    )
+
+    digit5_mask = green_mask(
+        digit5_crop
+    )
+
+    x, y, w, h = (
+        196,
+        110,
+        23,
+        43,
+    )
+
+    atlas["5"] = (
+        digit5_crop[
+            y:y + h,
+            x:x + w,
+        ].copy(),
+        digit5_mask[
+            y:y + h,
+            x:x + w,
+        ].copy(),
+    )
+
+    assert atlas["5"][0].shape[:2] == (
+        43,
+        23,
+    )
+
+    assert set("0123456789.").issubset(
         atlas
     )
 
@@ -229,16 +288,15 @@ def render_stack_value(
         y1:y2,
     ] = band
 
-    green_pixels = original[
-        old_mask > 0
-    ]
-
-    assert len(green_pixels)
-
-    foreground = np.median(
-        green_pixels,
-        axis=0,
-    ).astype(np.uint8)
+    # The authentic glyph atlas already contains the original ACR
+    # foreground pixels and paste_glyph() copies those pixels directly.
+    #
+    # Do NOT require the destination seat to retain stale green stack
+    # glyphs. Master-backed rendering intentionally installs a clean
+    # player plate before writing the controlled stack.
+    #
+    # This removes destination-state dependence without changing the
+    # physical glyph source or OCR geometry.
 
     # Match the proven authentic stack text lane.
     x = 105

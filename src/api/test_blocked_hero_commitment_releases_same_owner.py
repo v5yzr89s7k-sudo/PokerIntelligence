@@ -75,6 +75,27 @@ def main():
                 },
             })
 
+            # UTG is not unknown pre-acquisition history. It is an
+            # explicitly owned unresolved predecessor. Hero physical
+            # evidence must therefore remain chronology-blocked until
+            # that predecessor obligation is authoritatively released.
+            state[
+                "unresolved_stack_candidates"
+            ] = {
+                "PREFLOP:utg": {
+                    "seat": "utg",
+                    "street": "PREFLOP",
+                    "sources": [
+                        "stack_motion",
+                    ],
+                    "ts": 9.0,
+                    "awaiting_action": True,
+                    "resolved_reason": (
+                        "validated_stack_transition"
+                    ),
+                }
+            }
+
             event = {
                 "type": "actor_observed",
                 "hand_token": hand.hand_id,
@@ -94,6 +115,7 @@ def main():
             state = sm.handle_actor_observed(
                 state,
                 copy.deepcopy(event),
+                preserve_if_blocked=True,
             )
 
             blocked_hand = store.load()

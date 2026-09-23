@@ -63,7 +63,20 @@ def main():
     assert "hero_cards_disappeared_this_frame" in run
     assert "hero_card_action_reconciled" in run
     assert "source=hero_cards_disappeared" in run
-    assert "[PHYSICAL_HAND_END]" in run
+    assert (
+        "[HERO_DISAPPEARANCE_RETAINED]"
+        in run
+    )
+
+    assert (
+        "[PHYSICAL_HAND_END]"
+        not in run
+    )
+
+    assert (
+        '"PHYSICAL_HAND_END"'
+        not in run
+    )
 
     retain = run.index(
         "retain_frame_card_disappearances("
@@ -71,11 +84,15 @@ def main():
     reconcile = run.index(
         "reconcile_frame_evidence("
     )
-    physical_end = run.index(
-        "[PHYSICAL_HAND_END]"
+    continuation = run.index(
+        "[HERO_DISAPPEARANCE_RETAINED]"
     )
 
-    assert retain < reconcile < physical_end
+    assert (
+        retain
+        < reconcile
+        < continuation
+    )
 
     print(
         "V0.17 LIVE HERO ACTION LIFECYCLE: PASS"

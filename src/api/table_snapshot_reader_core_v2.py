@@ -897,6 +897,226 @@ def _read_local_stacks(cards, cache_snapshot):
     )
 
 
+
+def read_player_identities_v2(
+    frame,
+    dealt_in_seats=None,
+):
+    """
+    Read player identity only from authoritative physical-seat crops.
+
+    Ownership contract:
+      - deterministic topology owns physical seat identity;
+      - Snapshot V3 owns visible player-name identity;
+      - this interface NEVER owns stack values;
+      - unresolved opponent names remain blank;
+      - no physical seat label may substitute for a player name.
+
+    Returns:
+        {
+            "players": [
+                {
+                    "seat": <physical seat>,
+                    "name": <visible identity or "">,
+                    "is_hero": bool,
+                },
+                ...
+            ],
+            "occupied_seats": [...],
+            "confidence": ...,
+            "source": "snapshot_v3_identity_only",
+        }
+    """
+    _, cards = _prepare(
+        frame,
+        dealt_in_seats=dealt_in_seats,
+    )
+
+    dealer = ""
+
+    cache_snapshot = load_cache()
+
+    players_by_seat = {}
+    missing = []
+
+    for card in cards:
+        seat = card["seat"]
+
+        fingerprint = (
+            _cache_fingerprint_image(card)
+        )
+
+        if seat == "hero":
+            cached_entry = (
+                cache_snapshot.get(
+                    "players",
+                    {}
+                ).get(seat)
+                if isinstance(
+                    cache_snapshot,
+                    dict,
+                )
+                else None
+            )
+
+            identity = (
+                IDENTITY_MANAGER.resolve_hero(
+                    seat=seat,
+                    cached_entry=cached_entry,
+                )
+            )
+
+            if identity.resolved:
+                players_by_seat[seat] = {
+                    "seat": seat,
+                    "name": identity.name,
+                    "is_hero": True,
+                }
+                continue
+
+        else:
+            identity, _ = (
+                IDENTITY_MANAGER.cache_lookup(
+                    cache=cache_snapshot,
+                    seat=seat,
+                    fingerprint=fingerprint,
+                    lookup_fn=cache_lookup,
+                )
+            )
+
+            if identity.resolved:
+                players_by_seat[seat] = {
+                    "seat": seat,
+                    "name": identity.name,
+                    "is_hero": False,
+                }
+                continue
+
+        missing.append(card)
+
+    if missing:
+        result = _request_cards_parallel(
+            missing,
+            dealer,
+        )
+
+        for player in (
+            result.get("players")
+            or []
+        ):
+            seat = player.get("seat")
+            name = _normalize_name(
+                player.get("name")
+            )
+
+            if (
+                seat
+                and name
+            ):
+                players_by_seat[seat] = {
+                    "seat": seat,
+                    "name": name,
+                    "is_hero": (
+                        seat == "hero"
+                    ),
+                }
+
+        unresolved_cards = [
+            card
+            for card in missing
+            if not (
+                players_by_seat.get(
+                    card["seat"],
+                    {}
+                ).get("name")
+            )
+            and card["seat"] != "hero"
+        ]
+
+        if unresolved_cards:
+            fresh = {
+                seat: dict(player)
+                for seat, player
+                in players_by_seat.items()
+            }
+
+            for card in unresolved_cards:
+                fresh.setdefault(
+                    card["seat"],
+                    {
+                        "seat": card["seat"],
+                        "name": "",
+                        "is_hero": False,
+                    },
+                )
+
+            retry_unresolved_opponent_names(
+                fresh,
+                unresolved_cards,
+                dealer,
+            )
+
+            for seat, player in fresh.items():
+                name = _normalize_name(
+                    player.get("name")
+                )
+
+                if name:
+                    players_by_seat[seat] = {
+                        "seat": seat,
+                        "name": name,
+                        "is_hero": (
+                            seat == "hero"
+                        ),
+                    }
+
+    ordered = []
+
+    for card in cards:
+        seat = card["seat"]
+
+        player = players_by_seat.get(
+            seat,
+            {
+                "seat": seat,
+                "name": "",
+                "is_hero": seat == "hero",
+            },
+        )
+
+        ordered.append({
+            "seat": seat,
+            "name": _normalize_name(
+                player.get("name")
+            ),
+            "is_hero": seat == "hero",
+        })
+
+    resolved = [
+        row
+        for row in ordered
+        if row["name"]
+    ]
+
+    return {
+        "players": ordered,
+        "occupied_seats": [
+            card["seat"]
+            for card in cards
+        ],
+        "confidence": (
+            1.0
+            if (
+                ordered
+                and len(resolved)
+                == len(ordered)
+            )
+            else None
+        ),
+        "source":
+            "snapshot_v3_identity_only",
+    }
+
 def read_table_snapshot_v2(frame, dealt_in_seats=None):
     total_t0 = perf_counter()
 

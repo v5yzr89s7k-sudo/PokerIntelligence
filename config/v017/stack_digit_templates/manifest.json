@@ -1,0 +1,51 @@
+{
+  "digits": {
+    "0": {
+      "file": "0.png",
+      "sha256": "ea590826e541a4b7175e116f90b36ba8cd235538081a760dc7842971a4472e1c"
+    },
+    "1": {
+      "file": "1.png",
+      "sha256": "34c1324bdc3ee03c26c31898cee0202eb50a60970c0ea13c1f1f89cc2ff96273"
+    },
+    "2": {
+      "file": "2.png",
+      "sha256": "5c79fe01a8af81f59e25efdc2e5f8cad3b0be2cff39e0c68b979d7c2e2aab46e"
+    },
+    "3": {
+      "file": "3.png",
+      "sha256": "7d8edc621e096591427dd2153a17c8240f28111d0f51cfa78b791fa12fb1d848"
+    },
+    "4": {
+      "file": "4.png",
+      "sha256": "e35bb30104f39a3592dc63c56526578e81a4b2e08416f7f3a52821488d0d60e6"
+    },
+    "5": {
+      "file": "5.png",
+      "sha256": "420910bc6b49ba92059268619c3bab83760474f1febf3bfa0a67670a14c013ec"
+    },
+    "6": {
+      "file": "6.png",
+      "sha256": "53ea1b88b713643b2f11b1bf966e19195f5fc252797156e80668db220bc021ac"
+    },
+    "7": {
+      "file": "7.png",
+      "sha256": "e39c47ced07fbce7d9d3aaaa15f0776b3f3a755bd6f9710681a6d890c92c2262"
+    },
+    "8": {
+      "file": "8.png",
+      "sha256": "7d13ed76e9629fb038fbfb40d3a7c5043c7b37bb510b3dbbf561929461ee2d7f"
+    },
+    "9": {
+      "file": "9.png",
+      "sha256": "71b03d409d263ec90d7688226f26ff497d3c7e2413c1ccca3bea25409a3dec89"
+    }
+  },
+  "format": "v017_stack_digit_templates_v1",
+  "normalization": {
+    "height": 48,
+    "inner_height": 44,
+    "inner_width": 28,
+    "width": 32
+  }
+}

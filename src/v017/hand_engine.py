@@ -267,6 +267,93 @@ class HandEngine:
 
         return "FOLD"
 
+    def observe_contested_winner(
+        self,
+        seat,
+    ):
+        """
+        Admit an objectively observed single-seat contested winner.
+
+        This is terminal result state, not a betting action.
+
+        Strict authority contract:
+          - the hand must not already be complete;
+          - betting chronology must already be closed;
+          - the hand must be on RIVER;
+          - winner seat must exist;
+          - winner must have been dealt in;
+          - winner must not have folded.
+
+        Split-pot/multiple-winner results require separate objective
+        evidence and are intentionally not inferred here.
+        """
+        if self.hand_complete:
+            raise ValueError(
+                "hand already complete"
+            )
+
+        if self.street != "RIVER":
+            raise ValueError(
+                "contested winner requires RIVER: "
+                f"street={self.street}"
+            )
+
+        if self.next_actor is not None:
+            raise ValueError(
+                "contested winner requires closed "
+                "betting chronology: "
+                f"next_actor={self.next_actor}"
+            )
+
+        if seat not in self.players:
+            raise ValueError(
+                f"unknown winner seat: {seat}"
+            )
+
+        player = self.players[
+            seat
+        ]
+
+        if not player.dealt_in:
+            raise ValueError(
+                "winner was not dealt in: "
+                f"seat={seat}"
+            )
+
+        if player.folded:
+            raise ValueError(
+                "folded player cannot win contested pot: "
+                f"seat={seat}"
+            )
+
+        remaining = [
+            candidate.seat
+            for candidate
+            in self.players.values()
+            if (
+                candidate.dealt_in
+                and not candidate.folded
+            )
+        ]
+
+        if len(remaining) < 2:
+            raise ValueError(
+                "contested winner requires at least "
+                "two non-folded players: "
+                f"remaining={remaining}"
+            )
+
+        self.hand_complete = True
+        self.completion_reason = (
+            "CONTESTED"
+        )
+        self.winner_seats = [
+            seat
+        ]
+
+        return seat
+
+
     def unmatched_commitment_bb(
         self,
         seat,

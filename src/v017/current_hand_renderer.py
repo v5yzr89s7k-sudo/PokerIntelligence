@@ -256,10 +256,40 @@ def render_current_hand(
         ]
     )
 
-    if hand.next_actor is None:
+    if hand.hand_complete:
+        lines.append(
+            "Hand complete"
+        )
+
+        if hand.completion_reason:
+            lines.append(
+                "Completion: "
+                f"{hand.completion_reason}"
+            )
+
+        if hand.winner_seats:
+            winners = []
+
+            for seat in hand.winner_seats:
+                player = hand.players[
+                    seat
+                ]
+
+                winners.append(
+                    f"{player.position} "
+                    f"({player.name})"
+                )
+
+            lines.append(
+                "Winner: "
+                + ", ".join(winners)
+            )
+
+    elif hand.next_actor is None:
         lines.append(
             "Betting round complete"
         )
+
     else:
         player = hand.players[
             hand.next_actor

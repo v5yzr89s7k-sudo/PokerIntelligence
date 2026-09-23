@@ -73,10 +73,13 @@ def map_acr_seats(
         )
     )
 
+    # ACR sitting-out players remain physically seated and are
+    # still dealt cards; ACR automatically folds their hands when
+    # action reaches them. Therefore sitting_out is player-state
+    # metadata, not physical-seat occupancy.
     occupied_numbers = {
         int(player.seat_number)
         for player in hand.players
-        if not player.sitting_out
     }
 
     occupied_map = {
@@ -119,7 +122,6 @@ def mapped_players(
             ),
         }
         for player in hand.players
-        if not player.sitting_out
     )
 
 

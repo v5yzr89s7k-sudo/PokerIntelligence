@@ -402,6 +402,20 @@ def presentation_overlay(state):
         state,
         hand_token=hand_token,
     ):
+        # Generic COMMITMENT owns physical action evidence only.
+        #
+        # It must remain durable in ActionTimeline so later quantitative
+        # evidence can refine the same owner, but it is not yet a poker
+        # semantic suitable for current_hand.txt.
+        if (
+            str(
+                item.get("action")
+                or ""
+            ).upper()
+            == "COMMITMENT"
+        ):
+            continue
+
         key = (
             f"{item.get('street')}:"
             f"{item.get('seat')}"

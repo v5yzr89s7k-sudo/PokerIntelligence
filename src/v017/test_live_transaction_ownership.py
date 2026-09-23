@@ -52,7 +52,7 @@ def main():
         "settlement_gate.observe(",
         "reconcile_frame_evidence(",
         "observe_no_commitment(",
-        "[PHYSICAL_HAND_END]",
+        "[HERO_DISAPPEARANCE_RETAINED]",
         "[HAND_COMPLETE]",
     )
 
@@ -71,7 +71,6 @@ def main():
     # observed by the single production transaction. Diagnostics must
     # never require a second observer.process_frame() call.
     for outcome in (
-        "PHYSICAL_HAND_END",
         "HAND_COMPLETE",
         "CONTINUE",
     ):
@@ -81,17 +80,22 @@ def main():
         )
 
     assert (
+        '"PHYSICAL_HAND_END"'
+        not in transaction
+    )
+
+    assert (
         transaction.count(
             "return FrameTransactionResult("
         )
-        == 3
+        == 2
     )
 
     assert (
         transaction.count(
             "result.events,"
         )
-        >= 3
+        >= 2
     )
 
     assert "transaction.outcome" in live

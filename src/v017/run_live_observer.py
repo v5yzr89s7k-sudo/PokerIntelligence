@@ -31,6 +31,9 @@ from src.events.detectors.seat_occupancy_detector import (
 from src.v017.native_seat_occupancy import (
     native_occupied_seats,
 )
+from src.v017.participant_freeze import (
+    ParticipantFreeze,
+)
 from src.vision.dealer_detector import (
     detect_dealer_button,
 )
@@ -40,6 +43,11 @@ from src.api.position_engine import (
 from src.bootstrap.hero_bootstrap import (
     bootstrap_local_stacks,
 )
+from src.api.table_snapshot_reader_core_v2 import read_player_identities_v2
+from src.vision.winner_detector import (
+    detect_winner,
+)
+
 from src.vision.stack_reader import (
     read_stack,
     read_stack_native_fast,
@@ -168,10 +176,19 @@ def player_records(
     seats,
     positions,
     local_players,
+    identities=None,
 ):
     by_seat = {
         row["seat"]: row
         for row in local_players
+    }
+
+    identity_by_seat = {
+        row.get("seat"): str(
+            row.get("name") or ""
+        ).strip()
+        for row in (identities or [])
+        if row.get("seat")
     }
 
     players = []
@@ -192,9 +209,14 @@ def player_records(
                 "position":
                     positions[seat],
                 "name": (
-                    "Hero"
-                    if seat == "hero"
-                    else seat
+                    identity_by_seat.get(
+                        seat
+                    )
+                    or (
+                        "Hero"
+                        if seat == "hero"
+                        else ""
+                    )
                 ),
                 "stack_bb": (
                     None
@@ -298,11 +320,12 @@ def wait_for_hand(
     """
     Acquire the frame that owns Hero identity for one hand.
 
-    Initial startup may attach to cards already visible.
+    Participant topology is frozen from three consecutive identical
+    pre-acquisition physical occupancy observations when available.
 
-    Every subsequent hand must be preceded by an explicit canonical
-    Hero-card clear observed by main(). clear_confirmed is therefore
-    an ownership fact, not a card-identity comparison.
+    Initial startup may attach to cards already visible. In that case
+    there may be no historical clean interval, so current-frame
+    occupancy remains the explicit fallback.
     """
     print(
         "[BOOTSTRAP] waiting for "
@@ -311,9 +334,28 @@ def wait_for_hand(
         flush=True,
     )
 
+    participant_freeze = (
+        ParticipantFreeze(
+            stable_required=3
+        )
+    )
+
     while True:
         image, path = capture_image(
             window
+        )
+
+        observed_participants = (
+            native_occupied_seats(
+                image,
+                GEOMETRY,
+            )
+        )
+
+        frozen = (
+            participant_freeze.observe(
+                observed_participants
+            )
         )
 
         sensor_image = canonical_sensor_frame(
@@ -324,13 +366,57 @@ def wait_for_hand(
             sensor_image,
             SENSOR_GEOMETRY,
         ):
+            if frozen is None:
+                frozen = tuple(
+                    observed_participants
+                )
+
+                print(
+                    "[PARTICIPANT_FREEZE_FALLBACK]",
+                    f"seats={frozen}",
+                    "reason=hero_visible_before_stable_freeze",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[PARTICIPANT_FREEZE]",
+                    f"seats={frozen}",
+                    f"streak={participant_freeze.streak}",
+                    flush=True,
+                )
+
             print(
                 "[HERO_ACQUISITION]",
                 f"frame={Path(path).name}",
                 f"clear_confirmed={clear_confirmed}",
                 flush=True,
             )
-            return image, path
+
+            return (
+                image,
+                path,
+                tuple(frozen),
+                participant_freeze.trusted_stacks,
+            )
+
+        # Hero visibility was already checked false above.
+        # Local stack sampling therefore cannot delay acquisition of
+        # a Hero-visible frame.
+        stack_rows = bootstrap_local_stacks(
+            canonical_image=image,
+            frozen_participants=
+                observed_participants,
+            geometry=GEOMETRY,
+            crop_geometry_region=
+                crop_geometry_region,
+            stack_reader=
+                read_stack_native_fast,
+        )
+
+        participant_freeze.observe_stack_authority(
+            stack_rows,
+            frame=Path(path).name,
+        )
 
         time.sleep(
             BOOTSTRAP_POLL_SECONDS
@@ -447,6 +533,88 @@ def read_board_identity(
         )
 
     return board
+
+
+def reconcile_board_identity_prefix(
+    observer,
+    board,
+):
+    """
+    Preserve already accepted canonical board identity.
+
+    A later board observation has authority only over board positions
+    that HandEngine has not yet accepted. Previously accepted cards
+    are immutable historical state.
+
+    HandEngine.start_street remains the final strict validator.
+    """
+    observed = list(board)
+    canonical = list(
+        observer.hand.board
+    )
+
+    if len(observed) < len(canonical):
+        raise ValueError(
+            "board observation shorter than "
+            "canonical history: "
+            f"canonical={canonical} "
+            f"observed={observed}"
+        )
+
+    suffix = observed[
+        len(canonical):
+    ]
+
+    if len(set(suffix)) != len(suffix):
+        raise ValueError(
+            "new board suffix contains duplicates: "
+            f"suffix={suffix}"
+        )
+
+    if any(
+        card in canonical
+        for card in suffix
+    ):
+        raise ValueError(
+            "new board suffix duplicates "
+            "canonical history: "
+            f"canonical={canonical} "
+            f"suffix={suffix}"
+        )
+
+    hero_cards = list(
+        observer.hand.hero_cards
+    )
+
+    if any(
+        card in hero_cards
+        for card in suffix
+    ):
+        raise ValueError(
+            "new board suffix duplicates Hero card: "
+            f"hero_cards={hero_cards} "
+            f"suffix={suffix}"
+        )
+
+    reconciled = (
+        canonical
+        + suffix
+    )
+
+    if (
+        canonical
+        and observed[:len(canonical)]
+        != canonical
+    ):
+        print(
+            "[BOARD_PREFIX_PRESERVED]",
+            f"canonical={canonical}",
+            f"observed={observed}",
+            f"reconciled={reconciled}",
+            flush=True,
+        )
+
+    return reconciled
 
 
 def admit_board_catchup(
@@ -576,6 +744,9 @@ def build_observer_from_frame(
     image,
     frame_path,
     hand_id,
+    *,
+    frozen_participants=None,
+    frozen_stack_authority=None,
 ):
     """
     Build one V0.17 observer from physical acquisition evidence only.
@@ -583,10 +754,21 @@ def build_observer_from_frame(
     This function owns no live-window acquisition and no publication.
     It may therefore be reused by deterministic PNG simulation.
     """
-    seats = native_occupied_seats(
-        image,
-        GEOMETRY,
-    )
+    if frozen_participants is None:
+        seats = native_occupied_seats(
+            image,
+            GEOMETRY,
+        )
+    else:
+        seats = list(
+            frozen_participants
+        )
+
+        print(
+            "[BOOTSTRAP_PARTICIPANTS_FROZEN]",
+            f"seats={seats}",
+            flush=True,
+        )
 
     if "hero" not in seats:
         raise RuntimeError(
@@ -626,6 +808,43 @@ def build_observer_from_frame(
         )
     )
 
+    # Acquisition-frame stack evidence owns the quantitative baseline.
+    #
+    # frozen_stack_authority contains observations made strictly before
+    # Hero-card acquisition. Those observations remain useful diagnostic
+    # evidence, but they cannot be promoted across acquisition because
+    # antes/blinds may have changed a player's stack in the meantime.
+    #
+    # If acquisition-frame OCR is unresolved, leave that seat
+    # quantitatively unknown until current/post-acquisition physical
+    # evidence establishes a valid baseline.
+    frozen_stack_authority = {
+        str(seat): float(value)
+        for seat, value
+        in (
+            frozen_stack_authority
+            or {}
+        ).items()
+    }
+
+    if frozen_stack_authority:
+        for row in local_players:
+            seat = row["seat"]
+
+            if (
+                row.get("stack_bb")
+                is None
+                and seat
+                in frozen_stack_authority
+            ):
+                print(
+                    "[BOOTSTRAP_PREACQUISITION_STACK_REJECTED]",
+                    f"seat={seat}",
+                    "reason=acquisition_frame_unresolved",
+                    f"prior_value={frozen_stack_authority[seat]}",
+                    flush=True,
+                )
+
     unresolved = [
         row["seat"]
         for row in local_players
@@ -652,10 +871,23 @@ def build_observer_from_frame(
         )
         return None
 
+    identity_snapshot = (
+        read_player_identities_v2(
+            frame_path,
+            dealt_in_seats=seats,
+        )
+    )
+
+    identities = (
+        identity_snapshot.get("players")
+        or []
+    )
+
     players = player_records(
         seats,
         positions,
         local_players,
+        identities=identities,
     )
 
     action_order = build_action_order(
@@ -717,6 +949,7 @@ def build_observer_from_frame(
     observer.establish_physical_transition_baseline(
         sensor_image,
         physical_geometry=SENSOR_GEOMETRY,
+        native_frame=image,
     )
 
     observer._publish_if_changed(
@@ -743,17 +976,24 @@ def bootstrap_observer(
     *,
     clear_confirmed=False,
 ):
-    image, frame_path = (
-        wait_for_hand(
-            window,
-            clear_confirmed=clear_confirmed,
-        )
+    (
+        image,
+        frame_path,
+        frozen_participants,
+        frozen_stack_authority,
+    ) = wait_for_hand(
+        window,
+        clear_confirmed=clear_confirmed,
     )
 
     observer = build_observer_from_frame(
         image,
         frame_path,
         hand_id=f"live-v017-{hand_number}",
+        frozen_participants=
+            frozen_participants,
+        frozen_stack_authority=
+            frozen_stack_authority,
     )
 
     if observer is None:
@@ -1161,11 +1401,39 @@ def process_frame_transaction(
                 expected_count,
             )
 
-            admit_board_catchup(
+            board = reconcile_board_identity_prefix(
                 observer,
-                frame_id=frame_id,
-                board=board,
+                board,
             )
+
+            if len(board) == expected_count:
+                # Normal case: preserve ownership of the exact
+                # physical boundary that was observed this frame.
+                #
+                # This is essential when physical board progression
+                # outruns semantic chronology. TURN and RIVER must
+                # remain independently retained rather than being
+                # rewritten as whatever street HandEngine currently
+                # expects.
+                observer.admit_street_boundary(
+                    event,
+                    action_order=postflop_action_order(
+                        observer
+                    ),
+                    board=board,
+                    complete_pending=True,
+                )
+            else:
+                # True delayed identity catch-up: the board reader
+                # returned a later board than the physical boundary
+                # that triggered the read. Sequentially decompose
+                # that newer identity through the existing catch-up
+                # contract.
+                admit_board_catchup(
+                    observer,
+                    frame_id=frame_id,
+                    board=board,
+                )
 
     reconciled_cards, reconciled_quantitative = (
         reconcile_frame_evidence(
@@ -1209,26 +1477,37 @@ def process_frame_transaction(
             flush=True,
         )
 
+    # Frame reconciliation is an authoritative semantic mutation boundary.
+    #
+    # The low-level reconciliation primitives deliberately own no
+    # publication. This transaction does. If retained evidence admitted
+    # any semantic action during this frame, immediately project the
+    # resulting canonical HandEngine state.
+    if (
+        reconciled_cards
+        or reconciled_quantitative
+    ):
+        observer._publish_if_changed(
+            frame_id
+        )
+
     if (
         hero_cards_disappeared_this_frame
         and not hero_card_action_reconciled
     ):
-        publish_new(
-            observer,
-            before_publications,
-        )
-
+        # Hero-card disappearance is objective action evidence,
+        # not poker-hand termination.
+        #
+        # If Hero is not yet the authoritative actor, the retained
+        # disappearance remains owned by FrameHandObserver until
+        # predecessor semantics advance the actor frontier. The hand
+        # must continue to be observed after Hero folds.
         print(
-            "[PHYSICAL_HAND_END]",
+            "[HERO_DISAPPEARANCE_RETAINED]",
             f"frame={frame_id}",
-            "reason=hero_cards_disappeared",
-            "after=frame_reconciliation",
+            f"next_actor={observer.hand.next_actor}",
+            "hand_continues=True",
             flush=True,
-        )
-
-        return FrameTransactionResult(
-            "PHYSICAL_HAND_END",
-            result.events,
         )
 
     if (
@@ -1273,17 +1552,54 @@ def process_frame_transaction(
                 flush=True,
             )
 
+    winner_result = detect_winner(
+        image
+    )
+
+    if winner_result.get("visible"):
+        terminal_events = (
+            observer.admit_terminal_boundary(
+                {
+                    "frame": frame_id,
+                    "type":
+                        "WINNER_PHYSICAL",
+                    "winner_seat":
+                        winner_result.get(
+                            "seat"
+                        ),
+                    "confidence":
+                        winner_result.get(
+                            "confidence"
+                        ),
+                    "score":
+                        winner_result.get(
+                            "score"
+                        ),
+                    "margin":
+                        winner_result.get(
+                            "margin"
+                        ),
+                }
+            )
+        )
+
+        if terminal_events:
+            print(
+                "[TERMINAL_WINNER_RECONCILED]",
+                f"frame={frame_id}",
+                f"winner_seat="
+                f"{winner_result.get('seat')}",
+                f"events="
+                f"{len(terminal_events)}",
+                flush=True,
+            )
+
     publish_new(
         observer,
         before_publications,
     )
 
-    if (
-        observer.hand.street
-        == "RIVER"
-        and observer.hand.next_actor
-        is None
-    ):
+    if observer.hand.hand_complete:
         print(
             "[HAND_COMPLETE]",
             f"actions="

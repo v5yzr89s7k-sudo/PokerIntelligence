@@ -24,6 +24,10 @@ from src.v017.pixel_lab.test_novel_stack_pixels import (
     build_atlas,
     render_stack_value,
 )
+from src.v017.pixel_lab.generic_board_deck import (
+    LEGAL_CARDS,
+    load_card_face,
+)
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -67,7 +71,23 @@ OVERLAY_ABSENT = (
       "geometry_maximized_final_overlay_v2.png"
 )
 
+HERO_ABSENT_DONOR = (
+    ROOT
+    / "runtime/debug/v017_max_geometry/"
+      "geometry_maximized_corrected_overlay.png"
+)
+
 PRESENT_DONORS = {
+    "seat_lower_left": (
+        ROOT
+        / "runtime/debug/action_sequence/"
+          "20260714_183507/0001_full.png"
+    ),
+    "seat_mid_left": (
+        ROOT
+        / "runtime/debug/action_sequence/"
+          "20260714_183507/0001_full.png"
+    ),
     "seat_upper_left": (
         ROOT
         / "runtime/debug/action_sequence/"
@@ -92,6 +112,16 @@ PRESENT_DONORS = {
 }
 
 ABSENT_DONORS = {
+    "seat_lower_left": (
+        ROOT
+        / "runtime/debug/action_sequence/"
+          "20260714_183507/0023_full.png"
+    ),
+    "seat_mid_left": (
+        ROOT
+        / "runtime/debug/action_sequence/"
+          "20260714_183507/0101_full.png"
+    ),
     "seat_upper_left": SUBSTRATE_7P,
     "seat_top": OVERLAY_ABSENT,
     "seat_upper_right": MAXIMIZED_ABSENT,
@@ -129,6 +159,11 @@ DEALER_DONORS = {
         ROOT
         / "runtime/debug/action_sequence/"
           "20260726_105421/0001_full.png"
+    ),
+    "seat_top": (
+        ROOT
+        / "runtime/debug/action_sequence/"
+          "20260715_190358/0001_full.png"
     ),
 }
 
@@ -386,58 +421,119 @@ def _load_old_board_donor(path):
     return image
 
 
-def _board_count_for_truth(truth_frame):
-    count = len(truth_frame.board)
-    assert count in (0, 3, 4, 5), (
+def _board_cards_for_truth(truth_frame):
+    cards = tuple(
+        str(card)
+        for card in truth_frame.board
+    )
+
+    assert len(cards) in (0, 3, 4, 5), (
         truth_frame.sequence,
         truth_frame.street,
-        truth_frame.board,
+        cards,
     )
-    return count
 
+    assert len(set(cards)) == len(cards), (
+        "duplicate board identity",
+        truth_frame.sequence,
+        cards,
+    )
 
-def _transplant_board(
+    assert all(
+        card in LEGAL_CARDS
+        for card in cards
+    ), (
+        "illegal board identity",
+        truth_frame.sequence,
+        cards,
+    )
+
+    return cards
+
+def _render_board(
     destination,
-    donor,
+    cards,
     *,
+    zero_board_donor,
     old_geometry,
-    new_geometry,
 ):
     """
-    Generator-side authentic board-presence transplant.
+    Render TruthFrame board identity into physical native pixels.
 
-    Board donors are historical canonical 934x696 pixels.
-
-    canonical_sensor_frame() is a pure full-frame resize, so each
-    canonical board ROI must be rendered into its exact inverse native
-    footprint. Independently calibrated maximized board coordinates
-    are not the inverse sensor transform and must not own placement.
+    Every board slot is first restored from one authentic preflop ACR
+    donor. Requested identities are then placed left-to-right into the
+    exact inverse native footprints consumed by canonical perception.
     """
+
+    cards = tuple(cards)
+
+    assert len(cards) in (0, 3, 4, 5), cards
+    assert len(set(cards)) == len(cards), cards
+    assert all(
+        card in LEGAL_CARDS
+        for card in cards
+    ), cards
+
     result = destination.copy()
 
-    for card_name in BOARD_ORDER:
-        source_rect = old_geometry[
+    # Clear all five slots from authentic zero-board pixels.
+    for slot in BOARD_ORDER:
+        canonical_rect = old_geometry[
             "board"
-        ][card_name]
+        ][slot]
 
         target_rect = _inverse_sensor_rect(
-            source_rect
+            canonical_rect
         )
 
-        sx = int(source_rect["x"])
-        sy = int(source_rect["y"])
-        sw = int(source_rect["width"])
-        sh = int(source_rect["height"])
+        sx = int(canonical_rect["x"])
+        sy = int(canonical_rect["y"])
+        sw = int(canonical_rect["width"])
+        sh = int(canonical_rect["height"])
 
-        source = donor[
+        source = zero_board_donor[
             sy:sy + sh,
             sx:sx + sw,
         ]
 
         assert source.size > 0, (
-            card_name,
-            source_rect,
-            donor.shape,
+            slot,
+            canonical_rect,
+            zero_board_donor.shape,
+        )
+
+        tw = int(target_rect["width"])
+        th = int(target_rect["height"])
+
+        source = cv2.resize(
+            source,
+            (tw, th),
+            interpolation=cv2.INTER_CUBIC,
+        )
+
+        tx = int(target_rect["x"])
+        ty = int(target_rect["y"])
+
+        result[
+            ty:ty + th,
+            tx:tx + tw,
+        ] = source
+
+    # Overlay semantic identities from the generic physical deck.
+    for index, card in enumerate(cards):
+        slot = BOARD_ORDER[index]
+
+        canonical_rect = old_geometry[
+            "board"
+        ][slot]
+
+        target_rect = _inverse_sensor_rect(
+            canonical_rect
+        )
+
+        source = load_card_face(
+            card,
+            geometry=old_geometry,
         )
 
         tw = int(target_rect["width"])
@@ -458,7 +554,8 @@ def _transplant_board(
             and tx + tw <= result.shape[1]
             and ty + th <= result.shape[0]
         ), (
-            card_name,
+            card,
+            slot,
             target_rect,
             result.shape,
         )
@@ -551,18 +648,20 @@ def _load_board_donors():
 
 
 def _truth_by_name(frame):
+    # sitting_out is player-state metadata, not physical absence.
+    # ACR still deals sitting-out players and auto-folds them.
     return {
         row.name: row
         for row in frame.players
-        if not row.sitting_out
     }
 
 
 def _player_by_name(hand):
+    # Every player recorded in this hand occupies a physical seat.
+    # sitting_out must not remove that player from pixel rendering.
     return {
         row.name: row
         for row in hand.players
-        if not row.sitting_out
     }
 
 
@@ -580,7 +679,7 @@ def render_truth_frame(
     fold_donors,
     empty_stack_donors,
     dealer_donors,
-    board_donors,
+    zero_board_donor,
     old_geometry,
 ):
     """
@@ -618,15 +717,15 @@ def render_truth_frame(
         old_geometry=old_geometry,
     )
 
-    board_count = _board_count_for_truth(
+    board_cards = _board_cards_for_truth(
         truth_frame
     )
 
-    image = _transplant_board(
+    image = _render_board(
         image,
-        board_donors[board_count],
+        board_cards,
+        zero_board_donor=zero_board_donor,
         old_geometry=old_geometry,
-        new_geometry=geometry,
     )
 
     seat_map = map_acr_seats(hand)
@@ -658,6 +757,31 @@ def render_truth_frame(
             hand.big_blind,
         )
 
+        # A synthetic TruthFrame owns the complete visible stack
+        # state. Restore the entire authentic stack crop from the
+        # pristine substrate before drawing the truth value.
+        #
+        # Restoring only the green text lane is insufficient: small
+        # residual differences elsewhere in the composed crop can
+        # change production OCR even when the glyph pixels, cleanup
+        # background, and foreground are otherwise identical.
+        stack_rect = geometry[
+            "stack_regions"
+        ][seat]
+
+        stack_x = int(stack_rect["x"])
+        stack_y = int(stack_rect["y"])
+        stack_w = int(stack_rect["width"])
+        stack_h = int(stack_rect["height"])
+
+        image[
+            stack_y:stack_y + stack_h,
+            stack_x:stack_x + stack_w,
+        ] = substrate[
+            stack_y:stack_y + stack_h,
+            stack_x:stack_x + stack_w,
+        ]
+
         render_stack_value(
             image,
             geometry=geometry,
@@ -673,9 +797,70 @@ def render_truth_frame(
         # only the two calibrated hole-card ROIs are replaced by an
         # authentic detector-negative donor.
         #
-        # Hero is intentionally excluded here. Hero face-up cards have a
-        # separate physical class and lifecycle.
-        if seat != "hero":
+        # Hero face-up cards are a distinct physical class.
+        #
+        # Preserve the substrate while Hero remains live. Once truth
+        # marks Hero folded, replace only the calibrated Hero card
+        # regions with authentic detector-negative native pixels.
+        if seat == "hero":
+            if state.folded:
+                hero_absent_donor = _load_native(
+                    HERO_ABSENT_DONOR
+                )
+
+                # Production card perception consumes the canonical
+                # 934x696 sensor lane. Render Hero absence into the
+                # exact native footprint contributing to each
+                # canonical Hero-card ROI so the physical transition
+                # survives canonical_sensor_frame().
+                for card_name in (
+                    "card_1",
+                    "card_2",
+                ):
+                    source_rect = geometry[
+                        "hero_cards"
+                    ][card_name]
+
+                    canonical_rect = old_geometry[
+                        "hero_cards"
+                    ][card_name]
+
+                    target_rect = _inverse_sensor_rect(
+                        canonical_rect
+                    )
+
+                    sx = int(source_rect["x"])
+                    sy = int(source_rect["y"])
+                    sw = int(source_rect["width"])
+                    sh = int(source_rect["height"])
+
+                    source = hero_absent_donor[
+                        sy:sy + sh,
+                        sx:sx + sw,
+                    ]
+
+                    assert source.size > 0, (
+                        card_name,
+                        source_rect,
+                        hero_absent_donor.shape,
+                    )
+
+                    tx = int(target_rect["x"])
+                    ty = int(target_rect["y"])
+                    tw = int(target_rect["width"])
+                    th = int(target_rect["height"])
+
+                    source = cv2.resize(
+                        source,
+                        (tw, th),
+                        interpolation=cv2.INTER_CUBIC,
+                    )
+
+                    image[
+                        ty:ty + th,
+                        tx:tx + tw,
+                    ] = source
+        else:
             donor_path = (
                 ABSENT_DONORS[seat]
                 if state.folded
@@ -752,7 +937,9 @@ def render_hand_progression(
         _load_empty_stack_donors()
     )
     dealer_donors = _load_dealer_donors()
-    board_donors = _load_board_donors()
+    zero_board_donor = _load_old_board_donor(
+        BOARD_DONORS[0]
+    )
     old_geometry = _old_geometry()
 
     manifest_frames = []
@@ -769,7 +956,7 @@ def render_hand_progression(
                 empty_stack_donors=
                     empty_stack_donors,
                 dealer_donors=dealer_donors,
-                board_donors=board_donors,
+                zero_board_donor=zero_board_donor,
                 old_geometry=old_geometry,
             )
         )

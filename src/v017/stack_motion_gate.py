@@ -39,6 +39,21 @@ SECONDARY_CHANGED_FRACTION = 0.007
 SECONDARY_MEAN_DIFF = 0.80
 SECONDARY_MAX_DIFF = 180
 
+# Native stack-text-band scheduling wake.
+#
+# Controlled physical simulation found legitimate quantitative stack
+# transitions whose changed area is too compact for the existing
+# whole-region gates. Their strong motion is localized in the actual
+# native stack-text glyph band.
+#
+# This grants OCR scheduling only. It has no poker-semantic authority.
+TEXT_BAND_Y0 = 100
+TEXT_BAND_Y1 = 155
+TEXT_BAND_STRONG_DIFF = 80
+TEXT_BAND_STRONG_COUNT = 120
+TEXT_BAND_LARGEST_COMPONENT = 60
+TEXT_BAND_MIN_COMPONENT_HEIGHT = 15
+
 
 @dataclass(frozen=True)
 class StackMotion:
@@ -141,9 +156,73 @@ def measure_stack_motion(
         >= SECONDARY_MAX_DIFF
     )
 
+    band_y0 = min(
+        TEXT_BAND_Y0,
+        difference.shape[0],
+    )
+    band_y1 = min(
+        TEXT_BAND_Y1,
+        difference.shape[0],
+    )
+
+    text_band = difference[
+        band_y0:band_y1,
+        :
+    ]
+
+    text_band_mask = (
+        text_band
+        > TEXT_BAND_STRONG_DIFF
+    ).astype("uint8")
+
+    text_band_strong_count = int(
+        text_band_mask.sum()
+    )
+
+    (
+        component_count,
+        _,
+        component_stats,
+        _,
+    ) = cv2.connectedComponentsWithStats(
+        text_band_mask,
+        connectivity=8,
+    )
+
+    largest_component_area = 0
+    largest_component_height = 0
+
+    for component_index in range(
+        1,
+        component_count,
+    ):
+        _, _, _, height, area = (
+            component_stats[
+                component_index
+            ]
+        )
+
+        if int(area) > largest_component_area:
+            largest_component_area = int(
+                area
+            )
+            largest_component_height = int(
+                height
+            )
+
+    text_band_wake = bool(
+        text_band_strong_count
+        >= TEXT_BAND_STRONG_COUNT
+        and largest_component_area
+        >= TEXT_BAND_LARGEST_COMPONENT
+        and largest_component_height
+        >= TEXT_BAND_MIN_COMPONENT_HEIGHT
+    )
+
     wake = bool(
         broad_wake
         or compact_glyph_wake
+        or text_band_wake
     )
 
     return StackMotion(

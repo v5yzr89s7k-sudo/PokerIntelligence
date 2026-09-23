@@ -20,6 +20,34 @@ from src.api import api_event_coordinator as coordinator
 from src.events.local_event_detector import ChangeSet
 
 
+def visibility_side_effect(visible_seats):
+    visible = set(
+        seat
+        for seat in visible_seats
+        if seat != "hero"
+    )
+
+    hole_cards = (
+        coordinator.GEOM.get("hole_cards")
+        or {}
+    )
+
+    region_owner = {
+        id(regions): seat
+        for seat, regions in hole_cards.items()
+        if seat != "hero"
+    }
+
+    def classify(frame, regions):
+        seat = region_owner.get(
+            id(regions)
+        )
+
+        return seat in visible
+
+    return classify
+
+
 def main():
     frame = np.zeros(
         (696, 934, 3),
@@ -53,11 +81,11 @@ def main():
     with (
         patch.object(
             coordinator,
-            "dealt_in_seats",
-            return_value=[
+            "opponent_cards_visible",
+            side_effect=visibility_side_effect([
                 "seat_mid_right",
                 "seat_lower_right",
-            ],
+            ]),
             create=True,
         ),
         patch.object(
@@ -121,10 +149,10 @@ def main():
     with (
         patch.object(
             coordinator,
-            "dealt_in_seats",
-            return_value=[
+            "opponent_cards_visible",
+            side_effect=visibility_side_effect([
                 "seat_lower_right",
-            ],
+            ]),
             create=True,
         ),
         patch.object(

@@ -24,10 +24,32 @@ from pathlib import Path
 
 import cv2
 
+
 from src.v017.run_live_observer import (
     FrameTransactionState,
     build_observer_from_frame,
     process_frame_transaction,
+    canonical_sensor_frame,
+    SENSOR_GEOMETRY,
+    GEOMETRY,
+    bootstrap_local_stacks,
+    crop_geometry_region,
+    read_stack_native_fast,
+)
+
+from src.v017.frame_hand_observer import (
+    hero_cards_visible,
+)
+
+from src.v017.native_seat_occupancy import (
+    native_occupied_seats,
+)
+
+from src.v017.participant_freeze import (
+    ParticipantFreeze,
+)
+from src.v017.live_product_sink import (
+    publish_current_hand_text,
 )
 
 
@@ -40,10 +62,27 @@ OBSERVER_INPUT = (
 )
 
 
-def run():
+
+def run(
+    observer_input=OBSERVER_INPUT,
+    *,
+    publish_live_product=False,
+    publication_dir=None,
+):
+    observer_input = Path(observer_input)
+
+    if publication_dir is not None:
+        publication_dir = Path(
+            publication_dir
+        )
+        publication_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
     paths = tuple(
         sorted(
-            OBSERVER_INPUT.glob(
+            observer_input.glob(
                 "frame_*.png"
             )
         )
@@ -51,24 +90,110 @@ def run():
 
     if not paths:
         raise RuntimeError(
-            f"no observer PNGs: {OBSERVER_INPUT}"
+            f"no observer PNGs: {observer_input}"
         )
 
-    first_path = paths[0]
+    observer = None
+    acquisition_index = None
 
-    first_image = cv2.imread(
-        str(first_path)
+    participant_freeze = ParticipantFreeze(
+        stable_required=3
     )
 
-    assert first_image is not None, first_path
+    for index, path in enumerate(paths):
+        image = cv2.imread(
+            str(path)
+        )
+        assert image is not None, path
 
-    observer = build_observer_from_frame(
-        first_image,
-        first_path,
-        hand_id="pixel-simulation",
-    )
+        observed_participants = (
+            native_occupied_seats(
+                image,
+                GEOMETRY,
+            )
+        )
 
-    if observer is None:
+        frozen_participants = (
+            participant_freeze.observe(
+                observed_participants
+            )
+        )
+
+        sensor_image = (
+            canonical_sensor_frame(
+                image
+            )
+        )
+
+        visible = hero_cards_visible(
+            sensor_image,
+            SENSOR_GEOMETRY,
+        )
+
+        if not visible:
+            stack_rows = bootstrap_local_stacks(
+                canonical_image=image,
+                frozen_participants=
+                    observed_participants,
+                geometry=GEOMETRY,
+                crop_geometry_region=
+                    crop_geometry_region,
+                stack_reader=
+                    read_stack_native_fast,
+            )
+
+            participant_freeze.observe_stack_authority(
+                stack_rows,
+                frame=path.name,
+            )
+
+            continue
+
+        print(
+            "[PIXEL_ACQUISITION]",
+            f"frame={path.name}",
+            "hero_cards_visible=True",
+        )
+
+        if frozen_participants is None:
+            frozen_participants = tuple(
+                observed_participants
+            )
+
+            print(
+                "[PIXEL_PARTICIPANT_FREEZE_FALLBACK]",
+                f"seats={frozen_participants}",
+            )
+        else:
+            print(
+                "[PIXEL_PARTICIPANT_FREEZE]",
+                f"seats={frozen_participants}",
+                f"streak={participant_freeze.streak}",
+            )
+
+        observer = build_observer_from_frame(
+            image,
+            path,
+            hand_id="pixel-simulation",
+            frozen_participants=
+                frozen_participants,
+            frozen_stack_authority=
+                participant_freeze.trusted_stacks,
+        )
+
+        if observer is None:
+            raise RuntimeError(
+                "physical PNG bootstrap unresolved "
+                "after physical Hero-card acquisition"
+            )
+
+        acquisition_index = index
+        break
+
+    if (
+        observer is None
+        or acquisition_index is None
+    ):
         raise RuntimeError(
             "physical PNG bootstrap unresolved"
         )
@@ -91,6 +216,11 @@ def run():
     )
 
     print(
+        "acquisition_frame =",
+        paths[acquisition_index].name,
+    )
+
+    print(
         "initial next_actor =",
         observer.hand.next_actor,
     )
@@ -100,7 +230,11 @@ def run():
         observer.trusted_stacks,
     )
 
-    for path in paths:
+    # Acquisition frame establishes the physical baseline.
+    # Transactions begin with the following frame.
+    for path in paths[
+        acquisition_index + 1:
+    ]:
         frame_id = int(
             path.stem.split("_")[-1]
         )
@@ -158,6 +292,41 @@ def run():
                 publication.get("street"),
                 publication.get("action_count"),
             )
+
+            if publish_live_product:
+                publish_current_hand_text(
+                    publication["text"]
+                )
+
+            if publication_dir is not None:
+                publication_index = len(
+                    tuple(
+                        publication_dir.glob(
+                            "*_current_hand.txt"
+                        )
+                    )
+                ) + 1
+
+                frame_label = str(
+                    publication.get(
+                        "frame",
+                        "unknown",
+                    )
+                )
+
+                publication_path = (
+                    publication_dir
+                    / (
+                        f"{publication_index:03d}_"
+                        f"frame_{frame_label}_"
+                        "current_hand.txt"
+                    )
+                )
+
+                publication_path.write_text(
+                    publication["text"],
+                    encoding="utf-8",
+                )
 
         if transaction.outcome != "CONTINUE":
             print(
