@@ -179,36 +179,46 @@ def measure_stack_motion(
         text_band_mask.sum()
     )
 
-    (
-        component_count,
-        _,
-        component_stats,
-        _,
-    ) = cv2.connectedComponentsWithStats(
-        text_band_mask,
-        connectivity=8,
-    )
-
-    largest_component_area = 0
-    largest_component_height = 0
-
-    for component_index in range(
-        1,
-        component_count,
-    ):
-        _, _, _, height, area = (
-            component_stats[
-                component_index
-            ]
+    # Canonical stack crops can be shorter than the optional
+    # text-band coordinates. In that case there is no component
+    # evidence to measure, and OpenCV must not receive an empty
+    # image.
+    if text_band_mask.size == 0:
+        component_count = 1
+        component_stats = None
+        largest_component_area = 0
+        largest_component_height = 0
+    else:
+        (
+            component_count,
+            _,
+            component_stats,
+            _,
+        ) = cv2.connectedComponentsWithStats(
+            text_band_mask,
+            connectivity=8,
         )
 
-        if int(area) > largest_component_area:
-            largest_component_area = int(
-                area
+        largest_component_area = 0
+        largest_component_height = 0
+
+        for component_index in range(
+            1,
+            component_count,
+        ):
+            _, _, _, height, area = (
+                component_stats[
+                    component_index
+                ]
             )
-            largest_component_height = int(
-                height
-            )
+
+            if int(area) > largest_component_area:
+                largest_component_area = int(
+                    area
+                )
+                largest_component_height = int(
+                    height
+                )
 
     text_band_wake = bool(
         text_band_strong_count
