@@ -82,10 +82,20 @@ def read_pot(frame):
             "error": "could_not_read_image",
         }
 
-    img = cv2.resize(
-        img,
-        (934, 696),
-        interpolation=cv2.INTER_AREA,
+    canonical_width = 934
+    canonical_height = 696
+
+    source_height, source_width = (
+        img.shape[:2]
+    )
+
+    scale_x = (
+        source_width
+        / canonical_width
+    )
+    scale_y = (
+        source_height
+        / canonical_height
     )
 
     x = int(region["x"])
@@ -93,11 +103,48 @@ def read_pot(frame):
     w = int(region["width"])
     h = int(region["height"])
 
+    source_x1 = round(
+        x * scale_x
+    )
+    source_y1 = round(
+        y * scale_y
+    )
+    source_x2 = round(
+        (x + w) * scale_x
+    )
+    source_y2 = round(
+        (y + h) * scale_y
+    )
+
+    pad_x = round(
+        20 * scale_x
+    )
+    pad_y = round(
+        12 * scale_y
+    )
+
     crops = {
-        "current": img[y:y+h, x:x+w],
+        "current": img[
+            source_y1:source_y2,
+            source_x1:source_x2,
+        ],
         "padded": img[
-            max(0, y - 12):min(img.shape[0], y + h + 12),
-            max(0, x - 20):min(img.shape[1], x + w + 20),
+            max(
+                0,
+                source_y1 - pad_y,
+            ):
+            min(
+                source_height,
+                source_y2 + pad_y,
+            ),
+            max(
+                0,
+                source_x1 - pad_x,
+            ):
+            min(
+                source_width,
+                source_x2 + pad_x,
+            ),
         ],
     }
 
