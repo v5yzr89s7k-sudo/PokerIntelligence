@@ -62,7 +62,12 @@ def main():
 
     assert "capture_image(window)" in live
     assert "process_frame_transaction(" in live
-    assert "FRAME_INTERVAL_SECONDS" in live
+
+    # run_hand owns acquisition/timing orchestration, but timing
+    # ownership must not require an artificial post-transaction
+    # delay. The next physical frame may be acquired immediately
+    # after a CONTINUE transaction.
+    assert "FRAME_INTERVAL_SECONDS" not in live
 
     assert "capture_image(window)" not in transaction
     assert "time.sleep(" not in transaction

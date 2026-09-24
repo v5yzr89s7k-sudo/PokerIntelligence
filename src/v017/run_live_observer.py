@@ -138,7 +138,6 @@ def write_latency_trace(record):
         )
 
 
-FRAME_INTERVAL_SECONDS = 0.20
 BOOTSTRAP_POLL_SECONDS = 0.25
 STACK_RETRY_COUNT = 6
 STACK_RETRY_SECONDS = 0.30
@@ -1226,6 +1225,12 @@ class FrameTransactionState:
         # This state has no semantic authority.
         self.capture_complete_ns_by_frame = {}
 
+        # Diagnostic-only wall clocks for quantitative candidate
+        # epochs. These timestamps grant no settlement or semantic
+        # authority.
+        self.quantitative_first_seen_ns = {}
+        self.quantitative_first_seen_frame = {}
+
 
 class FrameTransactionResult:
     """Observable result of one production frame transaction."""
@@ -1472,6 +1477,18 @@ def process_frame_transaction(
                 ) <= 0.02
             )
 
+            quantitative_observed_ns = (
+                time.perf_counter_ns()
+            )
+
+            pending_before = (
+                state.settlement_gate.pending.get(
+                    str(seat)
+                )
+                if seat
+                else None
+            )
+
             settled = state.settlement_gate.observe(
                 event,
                 phase=observer.hand.street,
@@ -1482,6 +1499,59 @@ def process_frame_transaction(
                     all_in_confirmed
                 ),
             )
+
+            pending_after = (
+                state.settlement_gate.pending.get(
+                    str(seat)
+                )
+                if seat
+                else None
+            )
+
+            if (
+                seat
+                and pending_before is None
+                and pending_after is not None
+            ):
+                state.quantitative_first_seen_ns[
+                    str(seat)
+                ] = quantitative_observed_ns
+
+                state.quantitative_first_seen_frame[
+                    str(seat)
+                ] = frame_id
+
+                print(
+                    "[QUANTITATIVE_CLOCK_ARMED]",
+                    f"frame={frame_id}",
+                    f"seat={seat}",
+                    f"value={event.get('resolved_value')}",
+                    flush=True,
+                )
+
+            if settled is not None:
+                first_seen_ns = (
+                    state.quantitative_first_seen_ns.get(
+                        str(settled.seat)
+                    )
+                )
+
+                first_seen_frame = (
+                    state.quantitative_first_seen_frame.get(
+                        str(settled.seat)
+                    )
+                )
+
+                if first_seen_ns is not None:
+                    print(
+                        "[QUANTITATIVE_CLOCK_CONFIRMED]",
+                        f"frame={frame_id}",
+                        f"seat={settled.seat}",
+                        f"first_frame={first_seen_frame}",
+                        "first_seen_to_confirmation_ms="
+                        f"{(quantitative_observed_ns - first_seen_ns) / 1_000_000.0:.3f}",
+                        flush=True,
+                    )
 
             if settled is None:
                 print(
@@ -1513,6 +1583,16 @@ def process_frame_transaction(
                     )
                     state.settlement_gate.clear_seat(
                         settled.seat
+                    )
+
+                    state.quantitative_first_seen_ns.pop(
+                        str(settled.seat),
+                        None,
+                    )
+
+                    state.quantitative_first_seen_frame.pop(
+                        str(settled.seat),
+                        None,
                     )
 
                 if (
@@ -1987,6 +2067,7 @@ def run_hand(
 ):
     state = FrameTransactionState()
     frame_id = 0
+    prior_capture_complete_ns = None
 
     while True:
         frame_id += 1
@@ -1996,6 +2077,19 @@ def run_hand(
         )
 
         capture_complete_ns = time.perf_counter_ns()
+
+        if prior_capture_complete_ns is not None:
+            print(
+                "[CAPTURE_CADENCE]",
+                f"frame={frame_id}",
+                "capture_to_capture_ms="
+                f"{(capture_complete_ns - prior_capture_complete_ns) / 1_000_000.0:.3f}",
+                flush=True,
+            )
+
+        prior_capture_complete_ns = (
+            capture_complete_ns
+        )
 
         transaction = process_frame_transaction(
             observer,
@@ -2008,10 +2102,6 @@ def run_hand(
 
         if transaction.outcome != "CONTINUE":
             return
-
-        time.sleep(
-            FRAME_INTERVAL_SECONDS
-        )
 
 
 def main():
