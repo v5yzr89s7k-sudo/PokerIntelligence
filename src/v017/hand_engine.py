@@ -71,6 +71,9 @@ class HandEngine:
                         item["stack_bb"]
                     )
                 ),
+                dealt_in=bool(
+                    item.get("dealt_in", True)
+                ),
             )
             for item in players
         }
