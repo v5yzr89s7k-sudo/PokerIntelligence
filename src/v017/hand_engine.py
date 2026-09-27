@@ -135,6 +135,60 @@ class HandEngine:
 
         return self.pending_to_act[0]
 
+    def enrich_player_identity(
+        self,
+        seat,
+        name,
+    ):
+        """
+        Fill one previously unresolved verified player identity.
+
+        Identity enrichment owns NAME ONLY. It may fill a blank
+        PlayerState name and already-admitted blank HandAction names
+        for the same physical seat. It may never change an existing
+        nonblank identity or any poker semantic field.
+        """
+        if seat not in self.players:
+            raise ValueError(
+                f"unknown player seat: {seat}"
+            )
+
+        verified_name = str(
+            name or ""
+        ).strip()
+
+        if not verified_name:
+            return False
+
+        player = self.players[seat]
+        current_name = str(
+            player.name or ""
+        ).strip()
+
+        if current_name:
+            if current_name != verified_name:
+                raise ValueError(
+                    "verified player identity conflict: "
+                    f"seat={seat} "
+                    f"current={current_name!r} "
+                    f"new={verified_name!r}"
+                )
+
+            return False
+
+        player.name = verified_name
+
+        for action in self.actions:
+            if (
+                action.seat == seat
+                and not str(
+                    action.name or ""
+                ).strip()
+            ):
+                action.name = verified_name
+
+        return True
+
     def _append_action(
         self,
         seat,

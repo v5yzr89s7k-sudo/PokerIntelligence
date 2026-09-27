@@ -1,28 +1,17 @@
 """
-V0.17 same-frame boundary deferral regression.
+V0.17 asynchronous street-boundary identity contract.
 
-Physical perception may legitimately emit:
+Same-frame quantitative evidence must settle and publish immediately.
 
-    1. STREET_BOUNDARY_PHYSICAL
-    2. STACK_QUANTITATIVE_OBSERVATION
+Slow board identity may begin asynchronously, but the authoritative
+frame transaction must return without waiting for it.
 
-in raw detector order.
-
-Raw physical event order must not give an expensive street-boundary
-board-identity read priority over an already-confirmable quantitative
-observation from the same captured frame.
-
-Required transaction order:
-
-    quantitative settlement/admission
-    publication of resulting canonical action
-    board identity read
-    street-boundary admission/reconciliation
-
-This test does not weaken two-frame settlement authority.
+The physical boundary remains owned by the outstanding async request
+and is admitted only after that result becomes available.
 """
 
 from pathlib import Path
+from threading import Event
 
 import numpy as np
 
@@ -60,11 +49,7 @@ PLAYERS = [
 ]
 
 
-
-def quantitative(
-    frame,
-    value,
-):
+def quantitative(frame, value):
     return {
         "frame": frame,
         "type":
@@ -108,21 +93,11 @@ def build_observer():
         opponent_seats=[],
         quantitative_seats=[],
         hero_seat="hero",
-        hand_id=(
-            "boundary-defers-blocking-board"
-        ),
+        hand_id="async-boundary-deferral",
     )
 
     hand = observer.hand
 
-    # Reproduce the production boundary state:
-    #
-    # BTN raises to 2 BB.
-    # SB calls the remaining 1.5 BB.
-    # BB has posted 1 BB and is last to act facing 2 BB.
-    #
-    # Therefore a later independently confirmed 1 BB physical
-    # decrease from BB must semantically become CALL.
     assert (
         hand.observe_stack_commitment(
             "raiser",
@@ -142,37 +117,14 @@ def build_observer():
     assert hand.street == "PREFLOP"
     assert hand.next_actor == "bb"
 
-    assert abs(
-        hand.current_price_bb - 2.0
-    ) < 0.001
-
-    assert abs(
-        hand.players[
-            "bb"
-        ].street_commitment_bb
-        - 1.0
-    ) < 0.001
-
-    # Physical authority still references BB's pre-call stack.
-    # No semantic BB action has occurred.
-    observer.trusted_stacks[
-        "bb"
-    ] = 50.0
+    observer.trusted_stacks["bb"] = 50.0
 
     return observer
-
 
 
 def main():
     observer = build_observer()
     state = live.FrameTransactionState()
-
-    # --------------------------------------------------------
-    # FRAME 20
-    #
-    # Establish first native quantitative observation.
-    # It must NOT settle from one frame.
-    # --------------------------------------------------------
 
     first = quantitative(
         20,
@@ -186,21 +138,6 @@ def main():
     )
 
     assert settled is None
-    assert "bb" in state.settlement_gate.pending
-    assert observer.hand.next_actor == "bb"
-
-    before_actions = len(
-        observer.hand.actions
-    )
-
-    # --------------------------------------------------------
-    # FRAME 21
-    #
-    # Raw physical order intentionally reproduces production:
-    #
-    #   boundary first
-    #   quantitative confirmation second
-    # --------------------------------------------------------
 
     events = (
         {
@@ -219,14 +156,13 @@ def main():
     original_process_frame = (
         observer.process_frame
     )
+
     original_board_reader = (
         live.read_board_identity
     )
-    original_publish_new = (
-        live.publish_new
-    )
 
-    execution = []
+    board_started = Event()
+    release_board = Event()
 
     def fake_process_frame(
         image,
@@ -243,19 +179,20 @@ def main():
             text=None,
         )
 
-    def fake_board_reader(
+    def blocked_board_reader(
         frame_path,
         expected_count,
     ):
         assert expected_count == 3
 
-        execution.append(
-            (
-                "board_read",
-                len(observer.hand.actions),
-                observer.hand.street,
+        board_started.set()
+
+        if not release_board.wait(
+            timeout=5.0
+        ):
+            raise RuntimeError(
+                "test board reader release timeout"
             )
-        )
 
         return [
             "Jd",
@@ -263,37 +200,8 @@ def main():
             "Tc",
         ]
 
-    def recording_publish_new(
-        observed,
-        before_count,
-    ):
-        rows = original_publish_new(
-            observed,
-            before_count,
-        )
-
-        if rows:
-            execution.append(
-                (
-                    "publication",
-                    len(observed.hand.actions),
-                    observed.hand.street,
-                )
-            )
-
-        return rows
-
-    observer.process_frame = (
-        fake_process_frame
-    )
-
-    live.read_board_identity = (
-        fake_board_reader
-    )
-
-    live.publish_new = (
-        recording_publish_new
-    )
+    observer.process_frame = fake_process_frame
+    live.read_board_identity = blocked_board_reader
 
     try:
         image = np.zeros(
@@ -305,18 +213,125 @@ def main():
             dtype=np.uint8,
         )
 
+        before_actions = len(
+            observer.hand.actions
+        )
+
         tx = live.process_frame_transaction(
             observer,
             image,
             Path(
                 "/tmp/"
-                "boundary_deferral_frame_21.png"
+                "async_boundary_frame_21.png"
             ),
             21,
             state,
         )
 
+        # Worker must have started, but transaction must have returned
+        # while the worker is deliberately unresolved.
+        assert board_started.wait(
+            timeout=1.0
+        )
+
+        assert tx.outcome == "CONTINUE"
+
+        new_actions = (
+            observer.hand
+            .semantic_actions()[
+                before_actions:
+            ]
+        )
+
+        assert len(new_actions) == 1
+        assert new_actions[0]["seat"] == "bb"
+        assert new_actions[0]["action"] == "CALL"
+
+        # Action is canonical immediately.
+        assert observer.hand.street == "PREFLOP"
+
+        # Slow board request still owns the physical boundary.
+        assert (
+            state.board_identity_reader.future
+            is not None
+        )
+
+        request = (
+            state.board_identity_reader.request
+        )
+
+        assert request is not None
+        assert (
+            request["boundary_event"]["frame"]
+            == 21
+        )
+        assert (
+            request["boundary_event"]["type"]
+            == "FLOP_BOUNDARY_PHYSICAL"
+        )
+
+        # No boundary was lost or admitted early.
+        assert (
+            state.pending_board_boundaries
+            == []
+        )
+
+        print(
+            "FRAME TRANSACTION RETURNED "
+            "BEFORE BOARD IDENTITY: PASS"
+        )
+
+        print(
+            "SAME-FRAME QUANTITATIVE ACTION "
+            "PUBLISHED FIRST: PASS"
+        )
+
+        # Finish worker only after non-blocking behavior is proven.
+        release_board.set()
+
+        completed = None
+
+        for _ in range(100):
+            completed = (
+                state.board_identity_reader
+                .collect_ready()
+            )
+
+            if completed is not None:
+                break
+
+            Event().wait(0.01)
+
+        assert completed is not None
+
+        assert (
+            live.apply_async_board_identity_result(
+                observer,
+                completed,
+            )
+            is True
+        )
+
+        assert observer.hand.street == "FLOP"
+        assert observer.hand.board == [
+            "Jd",
+            "9s",
+            "Tc",
+        ]
+
+        print(
+            "ASYNC BOUNDARY ADMISSION AFTER RESULT: PASS"
+        )
+
+        print(
+            "V0.17 ASYNC BOUNDARY DEFERRAL: PASS"
+        )
+
     finally:
+        release_board.set()
+
+        state.board_identity_reader.close()
+
         observer.process_frame = (
             original_process_frame
         )
@@ -324,152 +339,6 @@ def main():
         live.read_board_identity = (
             original_board_reader
         )
-
-        live.publish_new = (
-            original_publish_new
-        )
-
-    print(
-        "raw_event_order =",
-        [
-            event["type"]
-            for event in events
-        ],
-    )
-
-    print(
-        "execution =",
-        execution,
-    )
-
-    print(
-        "actions_before =",
-        before_actions,
-    )
-
-    print(
-        "actions_after =",
-        len(observer.hand.actions),
-    )
-
-    print(
-        "street_after =",
-        observer.hand.street,
-    )
-
-    assert tx.outcome == "CONTINUE"
-
-    # One new semantic action must exist: BB CALL.
-    new_actions = (
-        observer.hand
-        .semantic_actions()[
-            before_actions:
-        ]
-    )
-
-    print(
-        "new_actions =",
-        new_actions,
-    )
-
-    assert len(new_actions) == 1
-
-    assert (
-        new_actions[0]["seat"]
-        == "bb"
-    )
-
-    assert (
-        new_actions[0]["action"]
-        == "CALL"
-    )
-
-    # --------------------------------------------------------
-    # RED CONTRACT
-    #
-    # At the instant board identity begins, the quantitative
-    # action must already be canonical.
-    # --------------------------------------------------------
-
-    board_rows = [
-        row
-        for row in execution
-        if row[0] == "board_read"
-    ]
-
-    assert len(board_rows) == 1
-
-    board_read = board_rows[0]
-
-    print(
-        "actions_when_board_read_started =",
-        board_read[1],
-    )
-
-    assert (
-        board_read[1]
-        == before_actions + 1
-    ), (
-        "blocking board read started before "
-        "same-frame quantitative action was admitted",
-        execution,
-    )
-
-    # The resulting action must also have reached the live
-    # publication boundary before board identity starts.
-    publication_indices = [
-        index
-        for index, row in enumerate(
-            execution
-        )
-        if row[0] == "publication"
-    ]
-
-    board_index = next(
-        index
-        for index, row in enumerate(
-            execution
-        )
-        if row[0] == "board_read"
-    )
-
-    assert publication_indices, execution
-
-    assert (
-        publication_indices[0]
-        < board_index
-    ), (
-        "canonical action was not published "
-        "before blocking board identity",
-        execution,
-    )
-
-    # Boundary still admits normally afterward.
-    assert observer.hand.street == "FLOP"
-
-    assert observer.hand.board == [
-        "Jd",
-        "9s",
-        "Tc",
-    ]
-
-    print()
-    print(
-        "QUANTITATIVE SETTLEMENT BEFORE BOARD READ: PASS"
-    )
-    print(
-        "ACTION PUBLICATION BEFORE BOARD READ: PASS"
-    )
-    print(
-        "BOUNDARY ADMISSION AFTER BOARD READ: PASS"
-    )
-    print(
-        "RAW EVENT ORDER OWNS SEMANTICS: NO"
-    )
-    print()
-    print(
-        "V0.17 BOUNDARY DEFERRAL: PASS"
-    )
 
 
 if __name__ == "__main__":

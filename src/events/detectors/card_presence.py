@@ -154,7 +154,17 @@ def board_card_present(card_crop):
         (gray > 145).mean()
     )
 
-    return bright_ratio > 0.45
+    # Live v0.17 calibration:
+    #
+    # A legitimate dark flop card was measured at 0.408676 while
+    # simultaneous empty turn/river controls measured 0.004809 and
+    # 0.001684. The historical 0.45 ratio threshold therefore rejected
+    # a real board card and prevented the physical 0 -> 3 flop boundary.
+    #
+    # Preserve the established pixel-brightness threshold above and
+    # lower only the aggregate presence ratio, retaining substantial
+    # separation from measured empty-board regions.
+    return bright_ratio > 0.35
 
 
 def count_board_cards(frame, geometry):

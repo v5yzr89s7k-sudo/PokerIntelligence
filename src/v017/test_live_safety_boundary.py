@@ -1,16 +1,20 @@
 """
 Structural safety contract for the v0.17 live runner.
 
-Raw quantitative OCR must never directly mutate HandEngine.
+run_hand owns acquisition/timing only.
 
-Live quantitative semantic admission is allowed only after:
+process_frame_transaction owns quantitative settlement and semantic
+admission.
+
+Raw quantitative OCR may mutate HandEngine only through:
+
     STACK_QUANTITATIVE_OBSERVATION
         -> StackSettlementGate.observe()
         -> non-None settlement
         -> admit_quantitative_observation()
 
-The settlement gate is instantiated per physical hand, so pending
-quantitative evidence cannot cross hand ownership boundaries.
+One FrameTransactionState belongs to one physical hand and owns one
+StackSettlementGate.
 """
 
 from pathlib import Path
@@ -18,18 +22,10 @@ import ast
 
 
 ROOT = Path(__file__).resolve().parents[2]
-
-RUNNER = (
-    ROOT
-    / "src/v017/run_live_observer.py"
-)
+RUNNER = ROOT / "src/v017/run_live_observer.py"
 
 
-def get_function(
-    source,
-    tree,
-    name,
-):
+def get_function(source, tree, name):
     for node in tree.body:
         if (
             isinstance(node, ast.FunctionDef)
@@ -55,46 +51,44 @@ def main():
         "run_hand",
     )
 
-    # --------------------------------------------------------
-    # Per-hand ownership.
-    # --------------------------------------------------------
+    transaction = get_function(
+        source,
+        tree,
+        "process_frame_transaction",
+    )
 
     assert (
-        "settlement_gate = "
-        "StackSettlementGate()"
+        "state = FrameTransactionState()"
         in run
     )
 
-    # --------------------------------------------------------
-    # Raw quantitative evidence remains observable.
-    # --------------------------------------------------------
+    assert (
+        "self.settlement_gate = "
+        "StackSettlementGate()"
+        in source
+    )
 
     assert (
         '"STACK_QUANTITATIVE_OBSERVATION"'
-        in run
+        in transaction
     )
 
     assert (
         "[QUANTITATIVE_DEFERRED]"
-        in run
+        in transaction
     )
 
-    # --------------------------------------------------------
-    # Settlement must occur before semantic admission.
-    # --------------------------------------------------------
-
-    settle = run.index(
-        "settlement_gate.observe("
+    settle = transaction.index(
+        "state.settlement_gate.observe("
     )
 
-    admission = run.index(
+    admission = transaction.index(
         "admit_quantitative_observation"
     )
 
     assert settle < admission
 
-    # Admission must live in the successful-settlement branch.
-    settled_branch = run[
+    settled_branch = transaction[
         settle:
         admission + 200
     ]
@@ -109,11 +103,6 @@ def main():
         in settled_branch
     )
 
-    # --------------------------------------------------------
-    # No direct HandEngine stack mutation in the runner.
-    # FrameHandObserver remains semantic owner.
-    # --------------------------------------------------------
-
     forbidden = (
         ".observe_stack_commitment(",
         ".trusted_stacks[",
@@ -122,48 +111,44 @@ def main():
 
     for token in forbidden:
         assert token not in run, (
-            "live runner bypasses semantic boundary: "
+            "live acquisition loop bypasses "
+            "semantic boundary: "
             f"{token}"
         )
 
-    # --------------------------------------------------------
-    # Existing physical hand-end safety remains present.
-    # --------------------------------------------------------
-
     assert (
         "HERO_CARDS_DISAPPEARED_PHYSICAL"
-        in run
+        in transaction
     )
-
-    assert (
-        "[PHYSICAL_HAND_END]"
-        in run
-    )
-
-    # --------------------------------------------------------
-    # Settlement observability.
-    # --------------------------------------------------------
 
     assert (
         "[STACK_SETTLED]"
-        in run
+        in transaction
     )
 
     assert (
         "observer.clear_quantitative_ownership("
-        in source
-    ), (
-        "successful live quantitative admission must "
-        "clear observer-owned physical work"
+        in transaction
     )
 
     assert (
-        "settlement_gate.clear_seat("
-        in source
-    ), (
-        "successful live quantitative admission must "
-        "clear settlement candidate ownership"
+        "state.settlement_gate.clear_seat("
+        in transaction
     )
+
+    semantic_tokens = (
+        "state.settlement_gate.observe(",
+        "admit_quantitative_observation",
+        "[QUANTITATIVE_DEFERRED]",
+        "[STACK_SETTLED]",
+    )
+
+    for token in semantic_tokens:
+        assert token not in run, (
+            "semantic ownership leaked into "
+            "run_hand: "
+            f"{token}"
+        )
 
     print(
         "V0.17 LIVE SAFETY BOUNDARY: PASS"

@@ -28,6 +28,8 @@ from src.events.detectors.card_presence import (
     count_board_cards,
     hero_cards_visible,
     opponent_cards_visible,
+    opponent_card_back_score,
+    crop as card_presence_crop,
 )
 from src.events.detectors.action_buttons_detector import (
     action_buttons_visible,
@@ -168,6 +170,9 @@ class FrameHandObserver:
         quantitative_seats: Optional[
             Iterable[str]
         ] = None,
+        participant_provenance_seats: Optional[
+            Iterable[str]
+        ] = None,
         hero_seat: str = "hero",
         hand_id: Optional[str] = None,
         stack_reader=read_stack,
@@ -214,6 +219,18 @@ class FrameHandObserver:
             quantitative_seats
         )
 
+        # Independent hand-participation provenance.
+        #
+        # Live bootstrap may explicitly establish that a frozen
+        # opponent belongs to this hand even when acquisition-frame
+        # card-back perception false-negatives. This authority is
+        # deliberately opt-in; generic/replay observers retain the
+        # raw positive-card-presence contract.
+        self.participant_provenance_seats = set(
+            participant_provenance_seats
+            or ()
+        )
+
         self.events: List[
             Dict[str, Any]
         ] = []
@@ -227,6 +244,17 @@ class FrameHandObserver:
             str,
             bool,
         ] = {}
+
+        # Persistent physical opponent-card presence/absence ownership.
+        #
+        # Absence is not disappearance. A seat must first have positive
+        # card-presence provenance in the current hand before later
+        # independent absence observations can establish disappearance.
+        #
+        # This state has no poker-semantic authority.
+        self.opponent_card_presence_confirmed = set()
+        self.opponent_card_absence_pending = {}
+        self.opponent_card_absence_confirmed = set()
 
         self.previous_hero_cards_visible = (
             None
@@ -453,6 +481,14 @@ class FrameHandObserver:
             )
 
         self.previous_visibility = visibility
+
+        self.opponent_card_presence_confirmed = {
+            seat
+            for seat, visible in visibility.items()
+            if visible
+        }
+        self.opponent_card_absence_pending = {}
+        self.opponent_card_absence_confirmed = set()
 
         self.previous_hero_cards_visible = bool(
             hero_cards_visible(
@@ -784,6 +820,37 @@ class FrameHandObserver:
         return action
 
 
+    def _earliest_pending_street_boundary_frame(
+        self,
+    ):
+        """
+        Return the earliest retained physical street-boundary frame.
+
+        While semantic chronology remains on the prior street,
+        quantitative evidence physically observed after this frame
+        cannot describe an action on that prior street.
+        """
+        frames = []
+
+        for retained in self.pending_street_boundaries:
+            observation = (
+                retained.get("observation")
+                or {}
+            )
+
+            frame = observation.get("frame")
+
+            if frame is None:
+                continue
+
+            frames.append(int(frame))
+
+        if not frames:
+            return None
+
+        return min(frames)
+
+
     def _retain_blocked_quantitative_evidence(
         self,
         observation: Dict[str, Any],
@@ -797,6 +864,18 @@ class FrameHandObserver:
         """
 
         retained = dict(observation)
+
+        # Quantitative evidence is meaningful only in the
+        # authoritative betting-price context in which it was
+        # first blocked. A later price change must not allow an
+        # old physical stack observation to be reinterpreted as
+        # a new action.
+        retained.setdefault(
+            "retained_current_price_bb",
+            float(
+                self.hand.current_price_bb
+            ),
+        )
 
         seat = str(
             retained.get("seat")
@@ -860,6 +939,32 @@ class FrameHandObserver:
             seat = str(
                 observation.get("seat")
             )
+
+            retained_price = observation.get(
+                "retained_current_price_bb"
+            )
+
+            current_price = float(
+                self.hand.current_price_bb
+            )
+
+            if (
+                retained_price is not None
+                and abs(
+                    float(retained_price)
+                    - current_price
+                ) > 0.02
+            ):
+                print(
+                    "[STALE_QUANTITATIVE_RETIRED]",
+                    f"frame={observation.get('frame')}",
+                    f"seat={seat}",
+                    f"retained_price={retained_price}",
+                    f"current_price={current_price}",
+                    "reason=betting_price_changed",
+                    flush=True,
+                )
+                continue
 
             before_stack = (
                 self.trusted_stacks.get(seat)
@@ -1264,6 +1369,29 @@ class FrameHandObserver:
             )
             return ()
 
+        boundary_frame = (
+            self._earliest_pending_street_boundary_frame()
+        )
+
+        observation_frame = observation.get("frame")
+
+        if (
+            boundary_frame is not None
+            and observation_frame is not None
+            and int(observation_frame) > int(boundary_frame)
+        ):
+            print(
+                "[QUANTITATIVE_REJECT]",
+                f"frame={observation_frame}",
+                f"seat={seat}",
+                "reason=after_pending_street_boundary",
+                f"boundary_frame={boundary_frame}",
+                f"street={self.hand.street}",
+                flush=True,
+            )
+
+            return ()
+
         if not observation.get("resolved"):
             print(
                 "[QUANTITATIVE_REJECT]",
@@ -1595,6 +1723,45 @@ class FrameHandObserver:
                 and existing_observation.get("type")
                 == typ
             ):
+                prior_complete = bool(
+                    existing.get(
+                        "complete_pending",
+                        False,
+                    )
+                )
+
+                upgraded_complete = bool(
+                    prior_complete
+                    or complete_pending
+                )
+
+                existing["complete_pending"] = (
+                    upgraded_complete
+                )
+
+                # Later identity resolution may carry the
+                # authoritative next-street order and board.
+                # Refresh those payloads without replacing the
+                # original physical boundary identity.
+                existing["action_order"] = list(
+                    action_order
+                )
+                existing["board"] = list(
+                    board
+                )
+
+                if (
+                    upgraded_complete
+                    != prior_complete
+                ):
+                    print(
+                        "[STREET_BOUNDARY_AUTHORITY_UPGRADED]",
+                        f"frame={frame}",
+                        f"type={typ}",
+                        "complete_pending=True",
+                        flush=True,
+                    )
+
                 return
 
         self.pending_street_boundaries.append(
@@ -2328,6 +2495,18 @@ class FrameHandObserver:
             self.previous_board_count
         )
 
+        if (
+            previous_board_count is None
+            or board_count != previous_board_count
+        ):
+            print(
+                "[BOARD_COUNT_PHYSICAL]",
+                f"frame={frame_id}",
+                f"previous={previous_board_count}",
+                f"current={board_count}",
+                flush=True,
+            )
+
         boundary_type = None
 
         if previous_board_count is not None:
@@ -2388,23 +2567,128 @@ class FrameHandObserver:
 
             visibility[seat] = visible
 
+            # Diagnostic only: expose raw physical card-back
+            # measurements for the authoritative chronology frontier.
+            # This changes no detector threshold and grants no
+            # semantic authority.
+            if seat == self.hand.next_actor:
+                diagnostic_scores = {}
+
+                for diagnostic_card_name in (
+                    "card_1",
+                    "card_2",
+                ):
+                    diagnostic_rect = regions.get(
+                        diagnostic_card_name
+                    )
+
+                    if diagnostic_rect:
+                        diagnostic_scores[
+                            diagnostic_card_name
+                        ] = opponent_card_back_score(
+                            card_presence_crop(
+                                physical_frame,
+                                diagnostic_rect,
+                            )
+                        )
+
+                print(
+                    "[NEXT_ACTOR_CARD_VISIBILITY]",
+                    f"frame={frame_id}",
+                    f"street={self.hand.street}",
+                    f"seat={seat}",
+                    f"visible={visible}",
+                    f"scores={diagnostic_scores}",
+                    flush=True,
+                )
+
             before = (
                 self.previous_visibility
                 .get(seat)
             )
 
             if (
-                before is True
-                and visible is False
+                seat
+                not in self.opponent_card_absence_confirmed
             ):
-                frame_events.append(
-                    {
-                        "frame": frame_id,
-                        "type":
-                            "OPPONENT_CARDS_DISAPPEARED",
-                        "seat": seat,
-                    }
-                )
+                if visible:
+                    # Positive physical presence is the prerequisite
+                    # provenance for any later disappearance claim.
+                    self.opponent_card_presence_confirmed.add(
+                        seat
+                    )
+
+                    # A positive independent observation disproves
+                    # an unconfirmed physical-absence candidate.
+                    self.opponent_card_absence_pending.pop(
+                        seat,
+                        None,
+                    )
+
+                elif (
+                    seat
+                    in self.opponent_card_presence_confirmed
+                    or seat
+                    in self.participant_provenance_seats
+                ):
+                    absence = (
+                        self.opponent_card_absence_pending
+                        .get(seat)
+                    )
+
+                    if absence is None:
+                        self.opponent_card_absence_pending[
+                            seat
+                        ] = {
+                            "first_frame": frame_id,
+                            "last_frame": frame_id,
+                            "confirmations": 1,
+                        }
+
+                    elif (
+                        absence.get("last_frame")
+                        != frame_id
+                    ):
+                        confirmations = int(
+                            absence.get(
+                                "confirmations",
+                                0,
+                            )
+                        ) + 1
+
+                        absence[
+                            "confirmations"
+                        ] = confirmations
+                        absence[
+                            "last_frame"
+                        ] = frame_id
+
+                        if confirmations >= 2:
+                            frame_events.append(
+                                {
+                                    "frame": frame_id,
+                                    "type":
+                                        "OPPONENT_CARDS_DISAPPEARED",
+                                    "seat": seat,
+                                }
+                            )
+
+                            self.opponent_card_absence_confirmed.add(
+                                seat
+                            )
+
+                            self.opponent_card_absence_pending.pop(
+                                seat,
+                                None,
+                            )
+
+                            print(
+                                "[OPPONENT_CARD_ABSENCE_CONFIRMED]",
+                                f"frame={frame_id}",
+                                f"seat={seat}",
+                                "confirmations=2",
+                                flush=True,
+                            )
 
         hero_visible = bool(
             hero_cards_visible(
@@ -2438,6 +2722,15 @@ class FrameHandObserver:
             self.previous_action_buttons_visible
         )
 
+        if self.hand.next_actor == self.hero_seat:
+            print(
+                "[HERO_BUTTON_STATE]",
+                f"frame={frame_id}",
+                f"previous={previous_action_buttons_visible}",
+                f"current={action_buttons_are_visible}",
+                flush=True,
+            )
+
         if (
             previous_action_buttons_visible
             is not None
@@ -2464,6 +2757,52 @@ class FrameHandObserver:
                             self.hero_seat,
                     }
                 )
+
+                # Physical Hero-action completion proves that Hero
+                # acted, but does not classify CALL / RAISE / FOLD.
+                #
+                # Preserve a bounded quantitative evidence opportunity
+                # before any subsequent street boundary can fence later
+                # physical stack evidence. This grants no HandEngine
+                # authority; normal settlement/admission remains the
+                # only semantic path.
+                if (
+                    self.hand.next_actor
+                    == self.hero_seat
+                    and self.hero_seat
+                    in self.quantitative_seats
+                    and self.hero_seat
+                    in self.trusted_stacks
+                ):
+                    retry_state = (
+                        self.quantitative_retry_pending
+                        .get(self.hero_seat)
+                    )
+
+                    if retry_state is None:
+                        self.quantitative_retry_pending[
+                            self.hero_seat
+                        ] = {
+                            "attempts": 0,
+                            "first_frame": frame_id,
+                            "last_frame": frame_id,
+                            "commitment_seen": bool(
+                                self.hero_seat
+                                in self.confirmed_bet_regions
+                            ),
+                            "reason":
+                                "hero_action_completion",
+                        }
+
+                        print(
+                            "[HERO_QUANTITATIVE_RETRY_ARMED]",
+                            f"frame={frame_id}",
+                            f"seat={self.hero_seat}",
+                            "attempt=0",
+                            "commitment="
+                            f"{self.hero_seat in self.confirmed_bet_regions}",
+                            flush=True,
+                        )
 
         if (
             self.previous_hero_cards_visible
@@ -2569,6 +2908,26 @@ class FrameHandObserver:
                         retry_state = None
                         retry_owned = False
 
+                # Diagnostic only: expose the physical stack-motion
+                # measurement for the authoritative chronology frontier,
+                # including measurements that do not wake OCR.
+                #
+                # This grants no semantic authority and changes no gate.
+                if seat == self.hand.next_actor:
+                    print(
+                        "[NEXT_ACTOR_STACK_MOTION]",
+                        f"frame={frame_id}",
+                        f"street={self.hand.street}",
+                        f"seat={seat}",
+                        f"changed_fraction={motion.changed_fraction:.6f}",
+                        f"mean_diff={motion.mean_diff:.6f}",
+                        f"max_diff={motion.max_diff}",
+                        f"wake={motion.wake}",
+                        f"retry_owned={retry_owned}",
+                        f"confirmation_owned={confirmation_owned}",
+                        flush=True,
+                    )
+
                 if (
                     not motion.wake
                     and not retry_owned
@@ -2595,21 +2954,126 @@ class FrameHandObserver:
                 )
 
                 if resolution.resolved:
-                    if retry_state is not None:
-                        print(
-                            "[QUANTITATIVE_RETRY_RESOLVED]",
-                            f"frame={frame_id}",
-                            f"seat={seat}",
-                            f"value={resolution.value}",
-                            f"attempts="
-                            f"{retry_state.get('attempts', 0)}",
-                            flush=True,
-                        )
-
-                    self.quantitative_retry_pending.pop(
-                        seat,
-                        None,
+                    resolved_retry_value = (
+                        float(resolution.value)
+                        if resolution.value is not None
+                        else None
                     )
+
+                    retry_reason = (
+                        retry_state.get("reason")
+                        if retry_state is not None
+                        else None
+                    )
+
+                    hero_completion_retry = bool(
+                        retry_reason
+                        == "hero_action_completion"
+                    )
+
+                    resolved_same_baseline = bool(
+                        resolved_retry_value is not None
+                        and abs(
+                            resolved_retry_value
+                            - float(
+                                self.trusted_stacks[seat]
+                            )
+                        )
+                        <= 0.01
+                    )
+
+                    fresh_motion_baseline = bool(
+                        motion.wake
+                        and retry_state is None
+                        and resolved_same_baseline
+                    )
+
+                    same_baseline_retry = bool(
+                        resolved_same_baseline
+                        and (
+                            hero_completion_retry
+                            or retry_reason == "stack_motion"
+                            or fresh_motion_baseline
+                        )
+                    )
+
+                    if same_baseline_retry:
+                        if fresh_motion_baseline:
+                            retry_state = {
+                                "attempts": 0,
+                                "first_frame": frame_id,
+                                "last_frame": frame_id,
+                                "commitment_seen": bool(
+                                    seat
+                                    in self.confirmed_bet_regions
+                                ),
+                                "reason": "stack_motion",
+                            }
+                            self.quantitative_retry_pending[
+                                seat
+                            ] = retry_state
+                            retry_reason = "stack_motion"
+
+                        attempts = int(
+                            retry_state.get(
+                                "attempts",
+                                0,
+                            )
+                        ) + 1
+
+                        if (
+                            attempts
+                            < self.quantitative_retry_max_attempts
+                        ):
+                            retry_state[
+                                "attempts"
+                            ] = attempts
+                            retry_state[
+                                "last_frame"
+                            ] = frame_id
+
+                            print(
+                                "[QUANTITATIVE_RETRY_BASELINE]",
+                                f"frame={frame_id}",
+                                f"seat={seat}",
+                                f"value={resolved_retry_value}",
+                                f"attempt={attempts}",
+                                f"reason={retry_reason}",
+                                flush=True,
+                            )
+                        else:
+                            self.quantitative_retry_pending.pop(
+                                seat,
+                                None,
+                            )
+
+                            retry_state = None
+
+                            print(
+                                "[QUANTITATIVE_RETRY_EXHAUSTED]",
+                                f"frame={frame_id}",
+                                f"seat={seat}",
+                                f"attempts={attempts}",
+                                f"reason={retry_reason}",
+                                flush=True,
+                            )
+
+                    else:
+                        if retry_state is not None:
+                            print(
+                                "[QUANTITATIVE_RETRY_RESOLVED]",
+                                f"frame={frame_id}",
+                                f"seat={seat}",
+                                f"value={resolution.value}",
+                                f"attempts="
+                                f"{retry_state.get('attempts', 0)}",
+                                flush=True,
+                            )
+
+                        self.quantitative_retry_pending.pop(
+                            seat,
+                            None,
+                        )
 
                 elif (
                     motion.wake
@@ -2663,6 +3127,15 @@ class FrameHandObserver:
                                 )
                                 or seat
                                 in self.confirmed_bet_regions
+                            ),
+                            "reason": (
+                                (
+                                    retry_state
+                                    or {}
+                                ).get(
+                                    "reason"
+                                )
+                                or "stack_motion"
                             ),
                         }
 

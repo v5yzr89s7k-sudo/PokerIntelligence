@@ -61,7 +61,10 @@ ROOT = Path(
 )
 
 GEOMETRY = json.loads(
-    Path("config/geometry.json").read_text()
+    Path(
+        "config/v017/"
+        "geometry_july22_20260722_152155.json"
+    ).read_text()
 )
 
 BOARD_OBSERVATION_PATH = (

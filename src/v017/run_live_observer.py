@@ -15,13 +15,18 @@ Do not run concurrently with the legacy observer.
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
+import subprocess
 import time
 
 import cv2
 
 from src.vision.window_capture import (
     find_acr_table_window,
-    capture_window_crop,
+)
+
+from src.capture.sck_frame_source import (
+    SCKFrameSource,
 )
 from src.events.detectors.card_presence import (
     hero_cards_visible,
@@ -30,6 +35,7 @@ from src.events.detectors.seat_occupancy_detector import (
     occupied_seats,
 )
 from src.v017.native_seat_occupancy import (
+    SEAT_ORDER,
     native_occupied_seats,
 )
 from src.v017.participant_freeze import (
@@ -142,6 +148,432 @@ BOOTSTRAP_POLL_SECONDS = 0.25
 STACK_RETRY_COUNT = 6
 STACK_RETRY_SECONDS = 0.30
 
+# Temporal opponent identity enrichment is metadata-only and must
+# never block the semantic/action hot path.
+IDENTITY_ENRICHMENT_RETRY_FRAMES = 8
+
+SCK_SOURCE = Path(
+    "src/capture/sck_sampler.swift"
+)
+
+SCK_BINARY = Path(
+    "runtime/bin/poker_intelligence_sck_sampler"
+)
+
+SCK_SOCKET = Path(
+    "/tmp/poker_intelligence_frame.sock"
+)
+
+_SCK_PROCESS = None
+_SCK_FRAME_SOURCE = None
+
+SCK_MATERIALIZED_FRAME_DIR = (
+    ROOT
+    / "runtime/live/sck_materialized"
+)
+
+_SCK_CAPTURE_SEQUENCE = 0
+
+
+class InMemoryFrameReference:
+    """
+    Logical identity for one authoritative in-memory SCK frame.
+
+    Path materialization is deferred until a path-based API reader
+    explicitly requires this exact frame.
+    """
+
+    def __init__(
+        self,
+        sequence,
+        image,
+    ):
+        self.sequence = int(sequence)
+        self.image = image
+        self._path = None
+
+    @property
+    def name(self):
+        return (
+            f"sck_frame_{self.sequence:08d}.png"
+        )
+
+    def materialize(self):
+        if self._path is not None:
+            return self._path
+
+        SCK_MATERIALIZED_FRAME_DIR.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        path = (
+            SCK_MATERIALIZED_FRAME_DIR
+            / self.name
+        )
+
+        ok = cv2.imwrite(
+            str(path),
+            self.image,
+        )
+
+        if not ok:
+            raise RuntimeError(
+                "failed to materialize native SCK frame "
+                f"{self.name}"
+            )
+
+        self._path = path
+
+        print(
+            "[SCK_MATERIALIZE]",
+            f"frame={self.name}",
+            flush=True,
+        )
+
+        return path
+
+
+class TemporalIdentityEnricher:
+    """
+    One-worker asynchronous fresh-frame opponent identity recovery.
+
+    The worker owns external identity acquisition only. It never
+    mutates HandEngine and never publishes. Canonical application is
+    performed by the live acquisition thread.
+    """
+
+    def __init__(
+        self,
+        reader=None,
+        retry_frames=IDENTITY_ENRICHMENT_RETRY_FRAMES,
+    ):
+        self.reader = (
+            reader
+            if reader is not None
+            else read_player_identities_v2
+        )
+        self.retry_frames = max(
+            1,
+            int(retry_frames),
+        )
+        self.executor = ThreadPoolExecutor(
+            max_workers=1
+        )
+        self.future = None
+        self.seat = None
+        self.submitted_frame = None
+        self.next_retry_frame = {}
+
+    def unresolved_seats(
+        self,
+        observer,
+    ):
+        return [
+            seat
+            for seat, player
+            in observer.hand.players.items()
+            if seat != observer.hero_seat
+            and not str(
+                player.name or ""
+            ).strip()
+        ]
+
+    def collect_ready(
+        self,
+    ):
+        if (
+            self.future is None
+            or not self.future.done()
+        ):
+            return None
+
+        future = self.future
+        seat = self.seat
+        submitted_frame = self.submitted_frame
+
+        self.future = None
+        self.seat = None
+        self.submitted_frame = None
+
+        try:
+            result = future.result()
+        except Exception as exc:
+            return {
+                "seat": seat,
+                "name": "",
+                "submitted_frame": submitted_frame,
+                "error": (
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            }
+
+        name = ""
+
+        for player in (
+            result.get("players")
+            or []
+        ):
+            if player.get("seat") != seat:
+                continue
+
+            name = str(
+                player.get("name")
+                or ""
+            ).strip()
+            break
+
+        return {
+            "seat": seat,
+            "name": name,
+            "submitted_frame": submitted_frame,
+            "error": None,
+        }
+
+    def submit_if_needed(
+        self,
+        observer,
+        frame_reference,
+        frame_id,
+    ):
+        if self.future is not None:
+            return False
+
+        unresolved = self.unresolved_seats(
+            observer
+        )
+
+        eligible = [
+            seat
+            for seat in unresolved
+            if int(frame_id) >= int(
+                self.next_retry_frame.get(
+                    seat,
+                    0,
+                )
+            )
+        ]
+
+        if not eligible:
+            return False
+
+        seat = eligible[0]
+
+        # Materialization occurs on the acquisition thread before
+        # submission. The expensive external identity read itself
+        # remains entirely off the semantic transaction path.
+        frame_path = require_frame_path(
+            frame_reference
+        )
+
+        self.seat = seat
+        self.submitted_frame = int(
+            frame_id
+        )
+        self.next_retry_frame[seat] = (
+            int(frame_id)
+            + self.retry_frames
+        )
+
+        self.future = self.executor.submit(
+            self.reader,
+            frame_path,
+            dealt_in_seats=[seat],
+        )
+
+        print(
+            "[IDENTITY_ENRICHMENT_SUBMITTED]",
+            f"frame={frame_id}",
+            f"seat={seat}",
+            flush=True,
+        )
+
+        return True
+
+    def close(
+        self,
+    ):
+        # Never wait for an external API straggler while ending a
+        # hand or returning control to the terminal.
+        future = self.future
+
+        if (
+            future is not None
+            and not future.done()
+        ):
+            future.cancel()
+
+        self.executor.shutdown(
+            wait=False,
+            cancel_futures=True,
+        )
+
+        self.future = None
+        self.seat = None
+        self.submitted_frame = None
+
+
+def frame_reference_name(
+    frame_reference,
+):
+    if frame_reference is None:
+        return "unknown"
+
+    name = getattr(
+        frame_reference,
+        "name",
+        None,
+    )
+
+    if name:
+        return str(name)
+
+    return Path(
+        frame_reference
+    ).name
+
+
+def require_frame_path(
+    frame_reference,
+):
+    if frame_reference is None:
+        raise RuntimeError(
+            "path-based reader requested a frame "
+            "without frame identity"
+        )
+
+    materialize = getattr(
+        frame_reference,
+        "materialize",
+        None,
+    )
+
+    if materialize is not None:
+        return materialize()
+
+    return Path(
+        frame_reference
+    )
+
+
+def build_sck_sampler():
+    SCK_BINARY.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    result = subprocess.run(
+        [
+            "swiftc",
+            "-parse-as-library",
+            str(SCK_SOURCE),
+            "-o",
+            str(SCK_BINARY),
+        ],
+        cwd=ROOT,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "ScreenCaptureKit sampler compilation failed"
+        )
+
+
+def start_sck_capture():
+    global _SCK_PROCESS
+    global _SCK_FRAME_SOURCE
+
+    if _SCK_PROCESS is not None:
+        return
+
+    try:
+        SCK_SOCKET.unlink()
+    except FileNotFoundError:
+        pass
+
+    build_sck_sampler()
+
+    environment = os.environ.copy()
+
+    environment["POKER_SCK_WIDTH"] = str(
+        NATIVE_FRAME_SIZE[0]
+    )
+    environment["POKER_SCK_HEIGHT"] = str(
+        NATIVE_FRAME_SIZE[1]
+    )
+
+    _SCK_PROCESS = subprocess.Popen(
+        [str(SCK_BINARY)],
+        cwd=ROOT,
+        env=environment,
+        start_new_session=True,
+    )
+
+    deadline = time.monotonic() + 10.0
+
+    while time.monotonic() < deadline:
+        if _SCK_PROCESS.poll() is not None:
+            raise RuntimeError(
+                "ScreenCaptureKit sampler exited "
+                "before socket creation"
+            )
+
+        if SCK_SOCKET.exists():
+            break
+
+        time.sleep(0.05)
+    else:
+        raise RuntimeError(
+            "timed out waiting for "
+            "ScreenCaptureKit socket"
+        )
+
+    _SCK_FRAME_SOURCE = SCKFrameSource(
+        socket_path=str(SCK_SOCKET),
+        width=NATIVE_FRAME_SIZE[0],
+        height=NATIVE_FRAME_SIZE[1],
+    )
+
+    _SCK_FRAME_SOURCE.connect()
+
+    print(
+        "[SCK_CAPTURE]",
+        "persistent native source connected",
+        f"size={NATIVE_FRAME_SIZE[0]}x"
+        f"{NATIVE_FRAME_SIZE[1]}",
+        flush=True,
+    )
+
+
+def stop_sck_capture():
+    global _SCK_PROCESS
+    global _SCK_FRAME_SOURCE
+
+    if _SCK_FRAME_SOURCE is not None:
+        try:
+            _SCK_FRAME_SOURCE.close()
+        finally:
+            _SCK_FRAME_SOURCE = None
+
+    process = _SCK_PROCESS
+    _SCK_PROCESS = None
+
+    if process is not None and process.poll() is None:
+        process.terminate()
+
+        try:
+            process.wait(
+                timeout=5.0
+            )
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+    try:
+        SCK_SOCKET.unlink()
+    except FileNotFoundError:
+        pass
+
 
 def crop_geometry_region(
     image,
@@ -159,17 +591,20 @@ def crop_geometry_region(
 
 
 def capture_image(window):
-    path = capture_window_crop(
-        window
-    )
+    global _SCK_CAPTURE_SEQUENCE
 
-    image = cv2.imread(
-        str(path)
-    )
+    del window
 
-    if image is None:
+    if _SCK_FRAME_SOURCE is None:
         raise RuntimeError(
-            f"could not read capture {path}"
+            "native SCK capture source is not started"
+        )
+
+    image = _SCK_FRAME_SOURCE.read()
+
+    if image is None or image.size == 0:
+        raise RuntimeError(
+            "ScreenCaptureKit returned empty frame"
         )
 
     native_size = (
@@ -185,8 +620,14 @@ def capture_image(window):
             "ACR must be maximized at the calibrated size."
         )
 
-    return image, path
+    _SCK_CAPTURE_SEQUENCE += 1
 
+    frame_reference = InMemoryFrameReference(
+        _SCK_CAPTURE_SEQUENCE,
+        image,
+    )
+
+    return image, frame_reference
 
 def canonical_sensor_frame(
     native_image,
@@ -349,6 +790,7 @@ def wait_for_hand(
     window,
     *,
     clear_confirmed=False,
+    participant_freeze=None,
 ):
     """
     Acquire the frame that owns Hero identity for one hand.
@@ -367,11 +809,12 @@ def wait_for_hand(
         flush=True,
     )
 
-    participant_freeze = (
-        ParticipantFreeze(
-            stable_required=3
+    if participant_freeze is None:
+        participant_freeze = (
+            ParticipantFreeze(
+                stable_required=3
+            )
         )
-    )
 
     while True:
         image, path = capture_image(
@@ -400,14 +843,39 @@ def wait_for_hand(
             SENSOR_GEOMETRY,
         ):
             if frozen is None:
+                fallback = (
+                    participant_freeze
+                    .fallback_participants
+                )
+
+                if fallback is None:
+                    fallback = tuple(
+                        observed_participants
+                    )
+
+                fallback = set(
+                    fallback
+                )
+
+                # Hero-card visibility is positive physical
+                # participation evidence for this acquisition frame.
+                # Native stack-text occupancy may transiently miss
+                # Hero while cards are already visible. Preserve the
+                # observed opponent topology and merge Hero only at
+                # this Hero-visible fallback boundary.
+                fallback.add("hero")
+
                 frozen = tuple(
-                    observed_participants
+                    seat
+                    for seat in SEAT_ORDER
+                    if seat in fallback
                 )
 
                 print(
                     "[PARTICIPANT_FREEZE_FALLBACK]",
                     f"seats={frozen}",
                     "reason=hero_visible_before_stable_freeze",
+                    f"support={participant_freeze.best_streak}",
                     flush=True,
                 )
             else:
@@ -420,7 +888,7 @@ def wait_for_hand(
 
             print(
                 "[HERO_ACQUISITION]",
-                f"frame={Path(path).name}",
+                f"frame={frame_reference_name(path)}",
                 f"clear_confirmed={clear_confirmed}",
                 flush=True,
             )
@@ -448,7 +916,7 @@ def wait_for_hand(
 
         participant_freeze.observe_stack_authority(
             stack_rows,
-            frame=Path(path).name,
+            frame=frame_reference_name(path),
         )
 
         time.sleep(
@@ -459,6 +927,10 @@ def wait_for_hand(
 def read_hero_identity(
     frame_path,
 ):
+    frame_path = require_frame_path(
+        frame_path
+    )
+
     result, timing = read_hero_cards(
         frame_path
     )
@@ -515,10 +987,112 @@ def read_hero_identity(
     return cards
 
 
+class AsyncBoardIdentityReader:
+    """
+    One-worker asynchronous board identity acquisition.
+
+    Physical street-boundary detection remains owned by the live frame
+    transaction. This worker owns only slow external board identity.
+
+    Exactly one board request may be outstanding per physical hand.
+    The immutable triggering boundary and its frame remain attached to
+    that request until the result is collected.
+    """
+
+    def __init__(self):
+        self.executor = ThreadPoolExecutor(
+            max_workers=1
+        )
+        self.future = None
+        self.request = None
+
+    def submit_if_idle(
+        self,
+        *,
+        frame_path,
+        boundary_event,
+        expected_count,
+    ):
+        if self.future is not None:
+            return False
+
+        durable_path = require_frame_path(
+            frame_path
+        )
+
+        self.request = {
+            "frame_path": durable_path,
+            "boundary_event": dict(
+                boundary_event
+            ),
+            "expected_count": int(
+                expected_count
+            ),
+        }
+
+        self.future = self.executor.submit(
+            read_board_identity,
+            durable_path,
+            int(expected_count),
+        )
+
+        print(
+            "[BOARD_IDENTITY_SUBMITTED]",
+            "frame="
+            f"{boundary_event.get('frame')}",
+            "type="
+            f"{boundary_event.get('type')}",
+            f"expected={expected_count}",
+            flush=True,
+        )
+
+        return True
+
+    def collect_ready(self):
+        if self.future is None:
+            return None
+
+        if not self.future.done():
+            return None
+
+        future = self.future
+        request = self.request
+
+        self.future = None
+        self.request = None
+
+        try:
+            board = future.result()
+        except Exception as exc:
+            return {
+                "request": request,
+                "board": None,
+                "error": (
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            }
+
+        return {
+            "request": request,
+            "board": list(board),
+            "error": None,
+        }
+
+    def close(self):
+        self.executor.shutdown(
+            wait=False,
+            cancel_futures=True,
+        )
+
+
 def read_board_identity(
     frame_path,
     expected_count,
 ):
+    frame_path = require_frame_path(
+        frame_path
+    )
+
     result, timing = read_board(
         frame_path
     )
@@ -794,6 +1368,9 @@ def build_observer_from_frame(
     frozen_participants=None,
     frozen_stack_authority=None,
 ):
+    frame_path = require_frame_path(
+        frame_path
+    )
     """
     Build one V0.17 observer from physical acquisition evidence only.
 
@@ -990,6 +1567,11 @@ def build_observer_from_frame(
         quantitative_seats=list(
             trusted_stacks.keys()
         ),
+        participant_provenance_seats=[
+            seat
+            for seat in seats
+            if seat != "hero"
+        ],
         hero_seat="hero",
         hand_id=str(hand_id),
         stack_reader=read_stack_native_fast,
@@ -1009,10 +1591,14 @@ def build_observer_from_frame(
         )
 
     if not starting_pot_result.get("ok"):
-        raise RuntimeError(
-            "starting pot unresolved on acquisition frame: "
-            f"{starting_pot_result}"
+        print(
+            "[BOOTSTRAP_RETRY]",
+            "starting_pot_not_authoritative",
+            "reason=reader_unresolved",
+            f"result={starting_pot_result}",
+            flush=True,
         )
+        return None
 
     starting_pot_bb = (
         starting_pot_result.get("pot_bb")
@@ -1026,17 +1612,40 @@ def build_observer_from_frame(
         starting_pot_bb is None
         or starting_pot_support < 2
     ):
-        raise RuntimeError(
-            "starting pot lacks acquisition authority: "
-            f"{starting_pot_result}"
+        print(
+            "[BOOTSTRAP_RETRY]",
+            "starting_pot_not_authoritative",
+            "reason=insufficient_authority",
+            f"observed={starting_pot_bb}",
+            f"support={starting_pot_support}",
+            flush=True,
         )
+        return None
 
-    missing_forced_pot_bb = (
-        observer.hand.observe_starting_pot(
-            starting_pot_bb
+    try:
+        missing_forced_pot_bb = (
+            observer.hand.observe_starting_pot(
+                starting_pot_bb
+            )
         )
-    )
+    except ValueError as exc:
+        if (
+            "observed starting pot below canonical "
+            "forced contributions"
+            not in str(exc)
+        ):
+            raise
 
+        print(
+            "[BOOTSTRAP_RETRY]",
+            "starting_pot_not_authoritative",
+            "reason=below_canonical_forced_contributions",
+            f"observed={starting_pot_bb}",
+            f"support={starting_pot_support}",
+            f"canonical_forced={observer.hand.pot_bb}",
+            flush=True,
+        )
+        return None
     print(
         "[BOOTSTRAP_STARTING_POT]",
         f"observed={starting_pot_bb}",
@@ -1082,6 +1691,7 @@ def bootstrap_observer(
     hand_number,
     *,
     clear_confirmed=False,
+    participant_freeze=None,
 ):
     (
         image,
@@ -1091,6 +1701,7 @@ def bootstrap_observer(
     ) = wait_for_hand(
         window,
         clear_confirmed=clear_confirmed,
+        participant_freeze=participant_freeze,
     )
 
     observer = build_observer_from_frame(
@@ -1215,6 +1826,8 @@ class FrameTransactionState:
 
     def __init__(self):
         self.settlement_gate = StackSettlementGate()
+        self.board_identity_reader = AsyncBoardIdentityReader()
+        self.pending_board_boundaries = []
         self.hero_buttons_active = False
         self.hero_completion_pending_frame = None
 
@@ -1241,6 +1854,107 @@ class FrameTransactionResult:
             dict(event)
             for event in events
         )
+
+
+def apply_async_board_identity_result(
+    observer,
+    completed,
+):
+    """
+    Apply one completed board identity using the immutable physical
+    boundary that originally requested it.
+
+    The worker owns identity only. FrameHandObserver remains the sole
+    semantic owner.
+    """
+    if completed is None:
+        return False
+
+    request = completed["request"]
+    boundary = dict(
+        request["boundary_event"]
+    )
+
+    boundary_frame = boundary.get("frame")
+    typ = boundary.get("type")
+    expected_count = int(
+        request["expected_count"]
+    )
+
+    error = completed.get("error")
+
+    if error:
+        print(
+            "[BOARD_IDENTITY_FAILED]",
+            f"frame={boundary_frame}",
+            f"type={typ}",
+            f"error={error}",
+            flush=True,
+        )
+        return False
+
+    board = reconcile_board_identity_prefix(
+        observer,
+        completed["board"],
+    )
+
+    print(
+        "[BOARD_IDENTITY_READY]",
+        f"frame={boundary_frame}",
+        f"type={typ}",
+        f"expected={expected_count}",
+        f"observed={len(board)}",
+        flush=True,
+    )
+
+    if len(board) == expected_count:
+        observer.admit_street_boundary(
+            boundary,
+            action_order=postflop_action_order(
+                observer
+            ),
+            board=board,
+            complete_pending=True,
+        )
+    else:
+        admit_board_catchup(
+            observer,
+            frame_id=boundary_frame,
+            board=board,
+        )
+
+    return True
+
+
+def submit_next_pending_board_boundary(
+    state,
+):
+    """
+    Submit the oldest retained physical boundary when board transport
+    is idle.
+
+    Returns True only when a request was actually submitted.
+    """
+    if not state.pending_board_boundaries:
+        return False
+
+    if state.board_identity_reader.future is not None:
+        return False
+
+    item = state.pending_board_boundaries[0]
+
+    submitted = (
+        state.board_identity_reader.submit_if_idle(
+            frame_path=item["frame_path"],
+            boundary_event=item["boundary_event"],
+            expected_count=item["expected_count"],
+        )
+    )
+
+    if submitted:
+        state.pending_board_boundaries.pop(0)
+
+    return bool(submitted)
 
 
 def process_frame_transaction(
@@ -1489,6 +2203,41 @@ def process_frame_transaction(
                 else None
             )
 
+            if (
+                seat
+                and pending_before is not None
+                and seat in observer.trusted_stacks
+                and abs(
+                    float(pending_before.value)
+                    - float(observer.trusted_stacks[seat])
+                ) <= 0.01
+            ):
+                print(
+                    "[STALE_SETTLEMENT_RETIRED]",
+                    f"frame={frame_id}",
+                    f"seat={seat}",
+                    f"candidate={pending_before.value}",
+                    "trusted_baseline="
+                    f"{observer.trusted_stacks[seat]}",
+                    flush=True,
+                )
+
+                state.settlement_gate.clear_seat(
+                    seat
+                )
+
+                state.quantitative_first_seen_ns.pop(
+                    str(seat),
+                    None,
+                )
+
+                state.quantitative_first_seen_frame.pop(
+                    str(seat),
+                    None,
+                )
+
+                pending_before = None
+
             settled = state.settlement_gate.observe(
                 event,
                 phase=observer.hand.street,
@@ -1629,6 +2378,37 @@ def process_frame_transaction(
     # live product before beginning board identity work.
     pre_boundary_publications = ()
 
+    # An objective expected-next-street boundary proves that the
+    # prior betting round has physically ended.
+    #
+    # If Hero is still the semantic frontier and was previously
+    # observed actionable, stale button visibility must not keep
+    # Hero completion unresolved indefinitely.
+    #
+    # This establishes completion opportunity only. It does not
+    # classify Hero's action or mutate HandEngine. Existing
+    # quantitative settlement / reconciliation remains the sole
+    # semantic classification path.
+    if (
+        boundary_events
+        and observer.hand.next_actor
+        == observer.hero_seat
+        and state.hero_buttons_active
+        and state.hero_completion_pending_frame
+        is None
+    ):
+        state.hero_completion_pending_frame = (
+            frame_id
+        )
+        state.hero_buttons_active = False
+
+        print(
+            "[HERO_COMPLETION_PENDING]",
+            f"frame={frame_id}",
+            "source=street_boundary",
+            flush=True,
+        )
+
     if boundary_events:
         observer._publish_if_changed(
             frame_id
@@ -1654,16 +2434,12 @@ def process_frame_transaction(
                 5,
         }[typ]
 
-        board_read_start_ns = (
-            time.perf_counter_ns()
-        )
-
-        actions_before_board_read = len(
+        actions_before_board_submit = len(
             observer.hand.actions
         )
 
         actions_admitted_before_board = (
-            actions_before_board_read
+            actions_before_board_submit
             - before_actions
         )
 
@@ -1671,40 +2447,42 @@ def process_frame_transaction(
             pre_boundary_publications
         )
 
+        durable_path = require_frame_path(
+            frame_path
+        )
+
+        state.pending_board_boundaries.append(
+            {
+                "frame_path": durable_path,
+                "boundary_event": dict(event),
+                "expected_count": expected_count,
+            }
+        )
+
         print(
-            "[BOARD_BLOCK_START]",
+            "[BOARD_BOUNDARY_QUEUED]",
             f"frame={frame_id}",
             f"type={typ}",
-            f"actions_before_tx={before_actions}",
-            f"actions_before_board={actions_before_board_read}",
+            f"expected={expected_count}",
             f"actions_admitted={actions_admitted_before_board}",
             f"publications_flushed={publications_flushed_before_board}",
+            f"pending={len(state.pending_board_boundaries)}",
             flush=True,
         )
 
-        board = read_board_identity(
-            frame_path,
-            expected_count,
+        submitted = (
+            submit_next_pending_board_boundary(
+                state
+            )
         )
 
-        board_read_end_ns = (
-            time.perf_counter_ns()
-        )
-
-        board_block_ms = (
-            board_read_end_ns
-            - board_read_start_ns
-        ) / 1_000_000.0
-
-        print(
-            "[BOARD_BLOCK_END]",
-            f"frame={frame_id}",
-            f"type={typ}",
-            f"board_ms={board_block_ms:.3f}",
-            f"actions_admitted={actions_admitted_before_board}",
-            f"publications_flushed={publications_flushed_before_board}",
-            flush=True,
-        )
+        if submitted:
+            print(
+                "[BOARD_BOUNDARY_SUBMITTED]",
+                f"frame={frame_id}",
+                f"type={typ}",
+                flush=True,
+            )
 
         if (
             actions_admitted_before_board > 0
@@ -1715,44 +2493,24 @@ def process_frame_transaction(
                 f"frame={frame_id}",
                 f"type={typ}",
                 f"actions={actions_admitted_before_board}",
-                f"board_ms={board_block_ms:.3f}",
+                "mode=async",
                 flush=True,
             )
 
-        board = reconcile_board_identity_prefix(
+
+    completed_board = (
+        state.board_identity_reader.collect_ready()
+    )
+
+    if completed_board is not None:
+        apply_async_board_identity_result(
             observer,
-            board,
+            completed_board,
         )
 
-        if len(board) == expected_count:
-            # Normal case: preserve ownership of the exact
-            # physical boundary that was observed this frame.
-            #
-            # This is essential when physical board progression
-            # outruns semantic chronology. TURN and RIVER must
-            # remain independently retained rather than being
-            # rewritten as whatever street HandEngine currently
-            # expects.
-            observer.admit_street_boundary(
-                event,
-                action_order=postflop_action_order(
-                    observer
-                ),
-                board=board,
-                complete_pending=True,
-            )
-        else:
-            # True delayed identity catch-up: the board reader
-            # returned a later board than the physical boundary
-            # that triggered the read. Sequentially decompose
-            # that newer identity through the existing catch-up
-            # contract.
-            admit_board_catchup(
-                observer,
-                frame_id=frame_id,
-                board=board,
-            )
-
+        submit_next_pending_board_boundary(
+            state
+        )
 
     reconciled_cards, reconciled_quantitative = (
         reconcile_frame_evidence(
@@ -2068,40 +2826,104 @@ def run_hand(
     state = FrameTransactionState()
     frame_id = 0
     prior_capture_complete_ns = None
+    identity_enricher = TemporalIdentityEnricher()
 
-    while True:
-        frame_id += 1
+    try:
+        while True:
+            frame_id += 1
 
-        image, frame_path = (
-            capture_image(window)
-        )
-
-        capture_complete_ns = time.perf_counter_ns()
-
-        if prior_capture_complete_ns is not None:
-            print(
-                "[CAPTURE_CADENCE]",
-                f"frame={frame_id}",
-                "capture_to_capture_ms="
-                f"{(capture_complete_ns - prior_capture_complete_ns) / 1_000_000.0:.3f}",
-                flush=True,
+            image, frame_path = (
+                capture_image(window)
             )
 
-        prior_capture_complete_ns = (
-            capture_complete_ns
-        )
+            # Capture latency ends at authoritative frame acquisition.
+            # Temporal identity collection/materialization is auxiliary
+            # post-capture work and must not contaminate this timestamp.
+            capture_complete_ns = time.perf_counter_ns()
 
-        transaction = process_frame_transaction(
-            observer,
-            image,
-            frame_path,
-            frame_id,
-            state,
-            capture_complete_ns=capture_complete_ns,
-        )
+            identity_result = (
+                identity_enricher.collect_ready()
+            )
 
-        if transaction.outcome != "CONTINUE":
-            return
+            if identity_result is not None:
+                seat = identity_result["seat"]
+                name = identity_result["name"]
+                error = identity_result["error"]
+
+                if error:
+                    print(
+                        "[IDENTITY_ENRICHMENT_FAILED]",
+                        f"frame={frame_id}",
+                        f"seat={seat}",
+                        f"error={error}",
+                        flush=True,
+                    )
+                elif name:
+                    changed = (
+                        observer.hand
+                        .enrich_player_identity(
+                            seat,
+                            name,
+                        )
+                    )
+
+                    if changed:
+                        observer._publish_if_changed(
+                            frame_id
+                        )
+                        publish_new(
+                            observer,
+                            len(observer.publications) - 1,
+                        )
+
+                        print(
+                            "[IDENTITY_ENRICHMENT_APPLIED]",
+                            f"frame={frame_id}",
+                            f"seat={seat}",
+                            f"name={name!r}",
+                            flush=True,
+                        )
+                else:
+                    print(
+                        "[IDENTITY_ENRICHMENT_UNRESOLVED]",
+                        f"frame={frame_id}",
+                        f"seat={seat}",
+                        flush=True,
+                    )
+
+            identity_enricher.submit_if_needed(
+                observer,
+                frame_path,
+                frame_id,
+            )
+
+            if prior_capture_complete_ns is not None:
+                print(
+                    "[CAPTURE_CADENCE]",
+                    f"frame={frame_id}",
+                    "capture_to_capture_ms="
+                    f"{(capture_complete_ns - prior_capture_complete_ns) / 1_000_000.0:.3f}",
+                    flush=True,
+                )
+
+            prior_capture_complete_ns = (
+                capture_complete_ns
+            )
+
+            transaction = process_frame_transaction(
+                observer,
+                image,
+                frame_path,
+                frame_id,
+                state,
+                capture_complete_ns=capture_complete_ns,
+            )
+
+            if transaction.outcome != "CONTINUE":
+                return
+    finally:
+        identity_enricher.close()
+        state.board_identity_reader.close()
 
 
 def main():
@@ -2124,12 +2946,17 @@ def main():
         flush=True,
     )
 
+    start_sck_capture()
+
     hand_number = 0
 
     while True:
         hand_number += 1
 
         observer = None
+        participant_freeze = ParticipantFreeze(
+            stable_required=3
+        )
 
         while observer is None:
             observer = bootstrap_observer(
@@ -2138,6 +2965,7 @@ def main():
                 clear_confirmed=(
                     hand_number > 1
                 ),
+                participant_freeze=participant_freeze,
             )
 
             if observer is None:
@@ -2190,3 +3018,5 @@ if __name__ == "__main__":
         print(
             "V0.17 live observer stopped."
         )
+    finally:
+        stop_sck_capture()

@@ -92,26 +92,104 @@ def main():
         "run_hand",
     )
 
+    transaction = function_source(
+        source,
+        tree,
+        "process_frame_transaction",
+    )
+
+    # run_hand owns acquisition/timing only. Prove structurally that
+    # the native image is handed unchanged to the single transaction
+    # owner; formatting and indentation are not part of the contract.
+    run_tree = ast.parse(run)
+
+    transaction_calls = [
+        node
+        for node in ast.walk(run_tree)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id
+            == "process_frame_transaction"
+        )
+    ]
+
+    assert transaction_calls
+
+    transaction_call = transaction_calls[0]
+
+    assert len(transaction_call.args) >= 2
+
+    assert (
+        isinstance(
+            transaction_call.args[0],
+            ast.Name,
+        )
+        and transaction_call.args[0].id
+        == "observer"
+    )
+
+    assert (
+        isinstance(
+            transaction_call.args[1],
+            ast.Name,
+        )
+        and transaction_call.args[1].id
+        == "image"
+    )
+
+    # Canonical physical sensors are derived inside the transaction
+    # from that same native image.
     assert (
         "sensor_image = canonical_sensor_frame"
-        in run
+        in transaction
     )
 
     assert (
         "sensor_frame=sensor_image"
-        in run
+        in transaction
     )
 
     assert (
         "sensor_geometry=SENSOR_GEOMETRY"
-        in run
+        in transaction
     )
 
-    # Native image must remain the primary process_frame frame.
+    # Native image remains the primary process_frame frame.
+    #
+    # Do not encode indentation/formatting here. The production call
+    # currently assigns its return value before processing the native
+    # frame, and AST/source formatting may change without changing
+    # ownership.
     assert (
-        "observer.process_frame(\n"
-        "            image,"
-        in run
+        "observer.process_frame("
+        in transaction
+    )
+
+    assert (
+        "image,"
+        in transaction
+    )
+
+    assert (
+        "sensor_frame=sensor_image"
+        in transaction
+    )
+
+    assert (
+        "sensor_geometry=SENSOR_GEOMETRY"
+        in transaction
+    )
+
+    # Semantic/sensor processing must not migrate back into run_hand.
+    assert (
+        "canonical_sensor_frame"
+        not in run
+    )
+
+    assert (
+        "observer.process_frame("
+        not in run
     )
 
     main_source = function_source(

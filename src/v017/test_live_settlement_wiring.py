@@ -3,18 +3,10 @@ import ast
 
 
 ROOT = Path(__file__).resolve().parents[2]
-
-PATH = (
-    ROOT
-    / "src/v017/run_live_observer.py"
-)
+PATH = ROOT / "src/v017/run_live_observer.py"
 
 
-def function_source(
-    source,
-    tree,
-    name,
-):
+def function_source(source, tree, name):
     for node in tree.body:
         if (
             isinstance(node, ast.FunctionDef)
@@ -40,55 +32,68 @@ def main():
         "run_hand",
     )
 
+    transaction = function_source(
+        source,
+        tree,
+        "process_frame_transaction",
+    )
+
+    assert "StackSettlementGate" in source
+
     assert (
-        "StackSettlementGate"
+        "state = FrameTransactionState()"
+        in run
+    )
+
+    assert (
+        "self.settlement_gate = "
+        "StackSettlementGate()"
         in source
     )
 
-    # One fresh gate belongs to each run_hand invocation.
     assert (
-        "settlement_gate = "
-        "StackSettlementGate()"
-        in run
-    )
-
-    assert (
-        "settlement_gate.observe("
-        in run
+        "state.settlement_gate.observe("
+        in transaction
     )
 
     assert (
         "observer.hand.street"
-        in run
+        in transaction
     )
 
     assert (
         "admit_quantitative_observation"
-        in run
+        in transaction
     )
 
     assert (
         "[QUANTITATIVE_DEFERRED]"
-        in run
+        in transaction
     )
 
     assert (
         "[STACK_SETTLED]"
-        in run
+        in transaction
     )
 
-    # Semantic admission must be downstream of settlement.
-    settle_index = run.index(
-        "settlement_gate.observe("
+    settle_index = transaction.index(
+        "state.settlement_gate.observe("
     )
 
-    admission_index = run.index(
+    admission_index = transaction.index(
         "admit_quantitative_observation"
     )
 
+    assert settle_index < admission_index
+
     assert (
-        settle_index
-        < admission_index
+        "state.settlement_gate.observe("
+        not in run
+    )
+
+    assert (
+        "admit_quantitative_observation"
+        not in run
     )
 
     print(

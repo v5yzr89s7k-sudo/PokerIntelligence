@@ -11,7 +11,6 @@ SOCKET_PATH = "/tmp/poker_intelligence_frame.sock"
 WIDTH = 934
 HEIGHT = 696
 CHANNELS = 4
-PAYLOAD_SIZE = WIDTH * HEIGHT * CHANNELS
 
 
 def _recv_exact(sock, size):
@@ -44,8 +43,17 @@ class SCKFrameSource:
     def __init__(
         self,
         socket_path=SOCKET_PATH,
+        width=WIDTH,
+        height=HEIGHT,
     ):
         self.socket_path = socket_path
+        self.width = int(width)
+        self.height = int(height)
+        self.payload_size = (
+            self.width
+            * self.height
+            * CHANNELS
+        )
         self.sock = None
 
     def connect(self):
@@ -84,10 +92,10 @@ class SCKFrameSource:
             header,
         )[0]
 
-        if size != PAYLOAD_SIZE:
+        if size != self.payload_size:
             raise RuntimeError(
                 f"unexpected SCK payload size "
-                f"{size}; expected {PAYLOAD_SIZE}"
+                f"{size}; expected {self.payload_size}"
             )
 
         payload = _recv_exact(
@@ -99,8 +107,8 @@ class SCKFrameSource:
             payload,
             dtype=np.uint8,
         ).reshape(
-            HEIGHT,
-            WIDTH,
+            self.height,
+            self.width,
             CHANNELS,
         )
 

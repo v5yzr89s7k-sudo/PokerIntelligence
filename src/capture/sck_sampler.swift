@@ -4,13 +4,26 @@ import CoreMedia
 import CoreVideo
 import Darwin
 
+private let SCK_WIDTH = Int(
+    ProcessInfo.processInfo.environment[
+        "POKER_SCK_WIDTH"
+    ] ?? "934"
+) ?? 934
+
+private let SCK_HEIGHT = Int(
+    ProcessInfo.processInfo.environment[
+        "POKER_SCK_HEIGHT"
+    ] ?? "696"
+) ?? 696
+
+
 final class LatestFrameStreamer: NSObject, SCStreamOutput {
     private let socketPath = "/tmp/poker_intelligence_frame.sock"
     private var serverFD: Int32 = -1
     private var clientFD: Int32 = -1
 
-    private let width = 934
-    private let height = 696
+    private let width = SCK_WIDTH
+    private let height = SCK_HEIGHT
     private let bytesPerPixel = 4
 
     private var lastSent = CFAbsoluteTimeGetCurrent()
@@ -410,8 +423,8 @@ struct Main {
 
         // Produce the exact canonical image expected by the
         // existing Poker Intelligence geometry.
-        config.width = 934
-        config.height = 696
+        config.width = SCK_WIDTH
+        config.height = SCK_HEIGHT
 
         config.minimumFrameInterval =
             CMTime(

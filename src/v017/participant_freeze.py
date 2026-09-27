@@ -28,6 +28,12 @@ class ParticipantFreeze:
         self.streak = 0
         self.frozen = None
 
+        # Strongest temporally-supported topology observed before
+        # canonical freeze. This is fallback evidence only; it never
+        # overrides a fully frozen topology.
+        self.best_candidate = None
+        self.best_streak = 0
+
         # Latest directly observed trusted local stack value for each
         # physical participant during the pre-acquisition interval.
         #
@@ -50,6 +56,10 @@ class ParticipantFreeze:
         else:
             self.candidate = participants
             self.streak = 1
+
+        if self.streak > self.best_streak:
+            self.best_candidate = participants
+            self.best_streak = self.streak
 
         if (
             "hero" in participants
@@ -93,6 +103,21 @@ class ParticipantFreeze:
         return dict(
             self.stack_authority
         )
+
+    @property
+    def fallback_participants(self):
+        """
+        Best temporally-supported topology seen before canonical
+        freeze. Used only when Hero becomes visible before the normal
+        stable_required contract can complete.
+        """
+        if self.frozen is not None:
+            return self.frozen
+
+        if self.best_candidate is not None:
+            return self.best_candidate
+
+        return self.candidate
 
     @property
     def trusted_stacks(self):
