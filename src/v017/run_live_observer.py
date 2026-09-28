@@ -29,6 +29,7 @@ from src.capture.sck_frame_source import (
     SCKFrameSource,
 )
 from src.events.detectors.card_presence import (
+    count_board_cards,
     hero_cards_visible,
 )
 from src.events.detectors.seat_occupancy_detector import (
@@ -80,6 +81,7 @@ from src.v017.action_order import (
     postflop_action_order,
 )
 
+from src.v017.current_hand_renderer import render_current_hand
 from src.v017.frame_hand_observer import (
     FrameHandObserver,
     common_mode_stack_shift_seats,
@@ -256,6 +258,11 @@ class TemporalIdentityEnricher:
         self.submitted_frame = None
         self.next_retry_frame = {}
 
+        # Fair scheduling cursor for unresolved identities.
+        # A repeatedly unresolved early seat must never starve later
+        # unresolved seats.
+        self.last_submitted_seat = None
+
     def unresolved_seats(
         self,
         observer,
@@ -348,7 +355,30 @@ class TemporalIdentityEnricher:
         if not eligible:
             return False
 
+        # Preserve observer seat order, but continue after the most
+        # recently submitted seat. This provides deterministic
+        # round-robin fairness while retaining retry cooldowns.
         seat = eligible[0]
+
+        if self.last_submitted_seat in unresolved:
+            start = (
+                unresolved.index(
+                    self.last_submitted_seat
+                )
+                + 1
+            )
+
+            rotated = (
+                unresolved[start:]
+                + unresolved[:start]
+            )
+
+            for candidate in rotated:
+                if candidate in eligible:
+                    seat = candidate
+                    break
+
+        self.last_submitted_seat = seat
 
         # Materialization occurs on the acquisition thread before
         # submission. The expensive external identity read itself
@@ -790,10 +820,28 @@ def wait_for_hand(
             )
         )
 
+    clean_hand_seen = bool(clear_confirmed)
+
     while True:
         image, path = capture_image(
             window
         )
+
+        hero_visible = hero_cards_visible(
+            image,
+            GEOMETRY,
+        )
+
+        board_count = count_board_cards(
+            image,
+            GEOMETRY,
+        )
+
+        if (
+            not hero_visible
+            and board_count == 0
+        ):
+            clean_hand_seen = True
 
         observed_participants = (
             native_occupied_seats(
@@ -808,9 +856,10 @@ def wait_for_hand(
             )
         )
 
-        if hero_cards_visible(
-            image,
-            GEOMETRY,
+        if (
+            hero_visible
+            and board_count == 0
+            and clean_hand_seen
         ):
             if frozen is None:
                 fallback = (
@@ -870,9 +919,16 @@ def wait_for_hand(
                 participant_freeze.trusted_stacks,
             )
 
-        # Hero visibility was already checked false above.
-        # Local stack sampling therefore cannot delay acquisition of
-        # a Hero-visible frame.
+        # Before clean-hand synchronization, only cheap physical
+        # acquisition sensors run; stack authority is unnecessary.
+        if not clean_hand_seen:
+            time.sleep(
+                BOOTSTRAP_POLL_SECONDS
+            )
+            continue
+
+        # Once clean-hand synchronization exists, collect stack
+        # authority while waiting for Hero's next dealt hand.
         stack_rows = bootstrap_local_stacks(
             canonical_image=image,
             frozen_participants=
@@ -2068,6 +2124,14 @@ def process_frame_transaction(
         observer.hand.actions
     )
 
+    # Publication ownership follows authoritative product state, not
+    # action-count growth alone. A street/board transition can change
+    # current_hand.txt without appending a semantic poker action.
+    before_projection = render_current_hand(
+        observer.hand,
+        hand_id=observer.hand_id,
+    )
+
     transaction_start_ns = time.perf_counter_ns()
 
     if capture_complete_ns is None:
@@ -2079,6 +2143,22 @@ def process_frame_transaction(
         frame_id
     ] = int(capture_complete_ns)
 
+    # Board transport must be polled before enforcing the semantic
+    # barrier. Otherwise an unresolved boundary prevents this transaction
+    # from ever reaching the later collect_ready() site, permanently
+    # starving its own completed asynchronous result.
+    completed_board = (
+        state.board_identity_reader.collect_ready()
+    )
+
+    if completed_board is not None:
+        finalize_async_board_identity_result(
+            observer,
+            state,
+            completed_board,
+            publication_frame=frame_id,
+        )
+
     outstanding_boundary = (
         state.unresolved_board_boundary is not None
     )
@@ -2087,7 +2167,7 @@ def process_frame_transaction(
         state.deferred_semantic_frames.append(
             {
                 "image": image.copy(),
-                "frame_path": Path(frame_path),
+                "frame_path": frame_path,
                 "frame_id": frame_id,
                 "capture_complete_ns":
                     int(capture_complete_ns),
@@ -2622,18 +2702,20 @@ def process_frame_transaction(
             )
 
 
+    # Preserve a second non-blocking poll after this frame's boundary
+    # submission. A fast board worker may complete during the current
+    # transaction. All completed results nevertheless use the same
+    # authoritative finalization lifecycle as the pre-barrier poll.
     completed_board = (
         state.board_identity_reader.collect_ready()
     )
 
     if completed_board is not None:
-        apply_async_board_identity_result(
+        finalize_async_board_identity_result(
             observer,
+            state,
             completed_board,
-        )
-
-        submit_next_pending_board_boundary(
-            state
+            publication_frame=frame_id,
         )
 
     reconciled_cards, reconciled_quantitative = (
@@ -2810,15 +2892,25 @@ def process_frame_transaction(
     # commit boundary.
     #
     # Admission/reconciliation primitives own semantic mutation only.
-    # If canonical action state changed anywhere during this transaction,
-    # ensure the final authoritative projection exists here. Deduplication
-    # remains owned by FrameHandObserver.
-    if after_actions > before_actions:
+    # Commit whenever the authoritative product projection changed.
+    # Action-count growth is insufficient: street/board/next-actor state
+    # may change without fabricating a semantic poker action.
+    after_projection = render_current_hand(
+        observer.hand,
+        hand_id=observer.hand_id,
+    )
+
+    authoritative_projection_changed = (
+        after_projection != before_projection
+    )
+
+    if authoritative_projection_changed:
         print(
             "[OUTER_PUBLICATION_COMMIT_PROBE]",
             f"frame={frame_id}",
             f"before_actions={before_actions}",
             f"after_actions={after_actions}",
+            "projection_changed=True",
             f"publications_before={len(observer.publications)}",
             flush=True,
         )
