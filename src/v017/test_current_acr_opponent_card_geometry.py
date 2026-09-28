@@ -5,13 +5,12 @@ import cv2
 from src.events.detectors.card_presence import (
     opponent_cards_visible,
 )
-from src.v017.run_live_observer import (
-    canonical_sensor_frame,
-)
 
 
 GEOMETRY = json.loads(
-    Path("config/geometry.json").read_text()
+    Path(
+        "config/v017/geometry_maximized.json"
+    ).read_text()
 )
 
 SIX_SEAT_FRAME = Path(
@@ -27,18 +26,23 @@ TOP_FRAME = Path(
 )
 
 
-def canonical(path):
+def native(path):
     image = cv2.imread(str(path))
-
     assert image is not None, path
 
-    return canonical_sensor_frame(
-        image
+    assert image.shape[:2] == (
+        2168,
+        3456,
+    ), (
+        path,
+        image.shape,
     )
+
+    return image
 
 
 def main():
-    six = canonical(
+    six = native(
         SIX_SEAT_FRAME
     )
 
@@ -51,63 +55,29 @@ def main():
         "seat_mid_left",
     )
 
-    print(
-        "===== SIX-SEAT CALIBRATION FRAME ====="
-    )
-
     for seat in expected_six:
-        visible = opponent_cards_visible(
+        assert opponent_cards_visible(
             six,
             GEOMETRY["hole_cards"][seat],
-        )
+        ) is True, seat
 
-        print(
-            seat,
-            "visible=",
-            visible,
-        )
-
-        assert visible is True, seat
-
-    # seat_top visibly had no cards in this frame.
-    top_absent = opponent_cards_visible(
+    assert opponent_cards_visible(
         six,
         GEOMETRY["hole_cards"]["seat_top"],
-    )
+    ) is False
 
-    print(
-        "seat_top visible=",
-        top_absent,
-        "(expected absent on this frame)",
-    )
-
-    assert top_absent is False
-
-    print()
-    print(
-        "===== TOP-SEAT CALIBRATION FRAME ====="
-    )
-
-    top = canonical(
+    top = native(
         TOP_FRAME
     )
 
-    top_visible = opponent_cards_visible(
+    assert opponent_cards_visible(
         top,
         GEOMETRY["hole_cards"]["seat_top"],
-    )
+    ) is True
 
-    print(
-        "seat_top visible=",
-        top_visible,
-    )
-
-    assert top_visible is True
-
-    print()
-    print(
-        "CURRENT ACR OPPONENT CARD GEOMETRY: PASS"
-    )
+    print("NATIVE 3456x2168 CARD GEOMETRY: PASS")
+    print("SMALL-FRAME CONVERSION: ABSENT")
+    print("CURRENT ACR OPPONENT CARD GEOMETRY: PASS")
 
 
 if __name__ == "__main__":

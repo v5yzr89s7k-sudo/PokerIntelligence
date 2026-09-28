@@ -88,27 +88,15 @@ PRESENT_DONORS = {
         / "runtime/debug/action_sequence/"
           "20260714_183507/0001_full.png"
     ),
-    "seat_upper_left": (
-        ROOT
-        / "runtime/debug/action_sequence/"
-          "20260714_184648/0001_full.png"
-    ),
+    # These native donors are independently certified by
+    # test_authentic_fold_pixels against the unchanged production
+    # opponent-card detector. Keep renderer truth physical:
+    # dealt-in must measure True before folded measures False.
+    "seat_upper_left": SUBSTRATE_6P,
     "seat_top": DEFAULT_SUBSTRATE,
-    "seat_upper_right": (
-        ROOT
-        / "runtime/debug/action_sequence/"
-          "20260714_183507/0001_full.png"
-    ),
-    "seat_mid_right": (
-        ROOT
-        / "runtime/debug/action_sequence/"
-          "20260714_183507/0001_full.png"
-    ),
-    "seat_lower_right": (
-        ROOT
-        / "runtime/debug/action_sequence/"
-          "20260714_183507/0001_full.png"
-    ),
+    "seat_upper_right": DEFAULT_SUBSTRATE,
+    "seat_mid_right": DEFAULT_SUBSTRATE,
+    "seat_lower_right": DEFAULT_SUBSTRATE,
 }
 
 ABSENT_DONORS = {
@@ -246,6 +234,7 @@ def _transplant_hole_cards(
     seat,
     donor_geometry=None,
     canonical_donor=False,
+    old_geometry=None,
 ):
     """
     Generator-side authentic hole-card ROI transplant.
@@ -257,6 +246,11 @@ def _transplant_hole_cards(
     corresponding maximized target ROI.
     """
     result = destination.copy()
+
+    if old_geometry is None:
+        raise ValueError(
+            "canonical target geometry required"
+        )
 
     target_regions = (
         geometry["hole_cards"][seat]
@@ -282,14 +276,22 @@ def _transplant_hole_cards(
             source_regions[card_name]
         )
 
-        if canonical_donor:
-            target_rect = _inverse_sensor_rect(
-                source_rect
-            )
-        else:
-            target_rect = (
-                target_regions[card_name]
-            )
+        # Source geometry owns only extraction from the authentic
+        # donor. Rendered opponent-card evidence must always land
+        # in the exact native footprint consumed by the CURRENT
+        # canonical production sensor lane.
+        #
+        # This is intentionally independent of whether the donor
+        # itself is historical canonical or native/maximized.
+        canonical_target_rect = (
+            old_geometry["hole_cards"][
+                seat
+            ][card_name]
+        )
+
+        target_rect = _inverse_sensor_rect(
+            canonical_target_rect
+        )
 
         sx = int(source_rect["x"])
         sy = int(source_rect["y"])
@@ -889,6 +891,7 @@ def render_truth_frame(
                 seat=seat,
                 donor_geometry=donor_geometry,
                 canonical_donor=canonical_donor,
+                old_geometry=old_geometry,
             )
 
         rendered.append(

@@ -316,6 +316,17 @@ class FrameHandObserver:
         # admission succeeds later.
         self.pending_quantitative_evidence = []
 
+        # Raw observed stack increases that may later become
+        # authoritative terminal accounting evidence.
+        #
+        # This queue is deliberately separate from normal quantitative
+        # evidence:
+        #   - no wager authority;
+        #   - no trusted-stack mutation;
+        #   - no generic quantitative reconciliation;
+        #   - consumption only through admit_terminal_stack_return().
+        self.pending_terminal_stack_returns = []
+
         # Objective card-disappearance evidence that belongs to a
         # later actor than the current authoritative chronology
         # frontier. Retention itself has no semantic authority.
@@ -339,13 +350,6 @@ class FrameHandObserver:
             None
         )
 
-        # Semantic catch-up may consume multiple already-known
-        # physical observations after one chronology release.
-        # Suppress intermediate product projections and publish
-        # only the final authoritative state.
-        self._publication_defer_depth = 0
-        self._publication_deferred_frame = None
-
     def _publish_if_changed(
         self,
         frame_id,
@@ -356,10 +360,6 @@ class FrameHandObserver:
         This method has no semantic authority. It runs only after a
         successful admission has already mutated HandEngine.
         """
-
-        if self._publication_defer_depth > 0:
-            self._publication_deferred_frame = frame_id
-            return None
 
         text = render_current_hand(
             self.hand,
@@ -387,39 +387,19 @@ class FrameHandObserver:
 
         return publication
 
-    def _begin_publication_transaction(
+    def publish_authoritative_state(
         self,
+        frame_id,
     ):
-        self._publication_defer_depth += 1
+        """
+        Sole public publication gateway.
 
-
-    def _end_publication_transaction(
-        self,
-        frame_id=None,
-    ):
-        if self._publication_defer_depth <= 0:
-            raise AssertionError(
-                "publication transaction underflow"
-            )
-
-        self._publication_defer_depth -= 1
-
-        if self._publication_defer_depth > 0:
-            return None
-
-        deferred_frame = (
-            frame_id
-            if frame_id is not None
-            else self._publication_deferred_frame
-        )
-
-        self._publication_deferred_frame = None
-
-        if deferred_frame is None:
-            return None
-
+        Callers may request projection after an authoritative state
+        transition, but only FrameHandObserver owns deduplication,
+        transaction deferral, rendering, and publication history.
+        """
         return self._publish_if_changed(
-            deferred_frame
+            frame_id
         )
 
 
@@ -781,41 +761,29 @@ class FrameHandObserver:
             )
             return None
 
-        self._begin_publication_transaction()
-
-        try:
-            action = (
-                self._admit_authoritative_card_disappearance(
-                    seat,
-                    frame_id=frame_id,
-                    physical_type=physical_type,
-                )
+        action = (
+            self._admit_authoritative_card_disappearance(
+                seat,
+                frame_id=frame_id,
+                physical_type=physical_type,
             )
+        )
 
-            # First consume quantitative evidence because it may
-            # advance the actor frontier through commitments.
-            self.reconcile_pending_evidence()
+        # First consume quantitative evidence because it may
+        # advance the actor frontier through commitments.
+        self.reconcile_pending_evidence()
 
-            # Then consume objective folds that have become
-            # authoritative.
-            self.reconcile_pending_card_disappearances()
+        # Then consume objective folds that have become
+        # authoritative.
+        self.reconcile_pending_card_disappearances()
 
-            # Card catch-up may itself expose another retained
-            # quantitative observation.
-            self.reconcile_pending_evidence()
+        # Card catch-up may itself expose another retained
+        # quantitative observation.
+        self.reconcile_pending_evidence()
 
-            # Only after action evidence is exhausted may a retained
-            # physical street boundary cross.
-            self.reconcile_pending_street_boundaries()
-
-            self._publication_deferred_frame = (
-                frame_id
-            )
-
-        finally:
-            self._end_publication_transaction(
-                frame_id
-            )
+        # Only after action evidence is exhausted may a retained
+        # physical street boundary cross.
+        self.reconcile_pending_street_boundaries()
 
         return action
 
@@ -1125,6 +1093,159 @@ class FrameHandObserver:
                 bool(all_in_confirmed),
         }
 
+    def retain_terminal_stack_return(
+        self,
+        observation: Dict[str, Any],
+    ):
+        """
+        Retain one raw upward stack observation for possible later
+        terminal accounting.
+
+        Retention grants no poker-semantic or trusted-stack authority.
+        The observation may be consumed only by the existing strict
+        admit_terminal_stack_return() authority after UNCONTESTED
+        completion independently becomes authoritative.
+        """
+        if (
+            observation.get("type")
+            != "STACK_QUANTITATIVE_OBSERVATION"
+        ):
+            return False
+
+        seat = str(
+            observation.get("seat")
+        )
+
+        if seat not in self.trusted_stacks:
+            return False
+
+        prior = float(
+            self.trusted_stacks[seat]
+        )
+
+        candidates = []
+
+        for row in (
+            observation.get("raw")
+            or []
+        ):
+            value = row.get("stack_bb")
+
+            if value is None:
+                continue
+
+            candidates.append(
+                float(value)
+            )
+
+        reader_value = observation.get(
+            "reader_value"
+        )
+
+        if reader_value is not None:
+            candidates.append(
+                float(reader_value)
+            )
+
+        # This ownership class is only for an objectively observed
+        # increase. Unchanged/decreasing values remain exclusively in
+        # normal quantitative processing.
+        if not any(
+            value > prior + 0.02
+            for value in candidates
+        ):
+            return False
+
+        frame = observation.get("frame")
+
+        for existing in (
+            self.pending_terminal_stack_returns
+        ):
+            if (
+                existing.get("seat") == seat
+                and existing.get("frame") == frame
+            ):
+                return False
+
+        retained = dict(observation)
+
+        self.pending_terminal_stack_returns.append(
+            retained
+        )
+
+        self.pending_terminal_stack_returns.sort(
+            key=lambda row: (
+                int(
+                    row.get("frame")
+                    if row.get("frame") is not None
+                    else -1
+                ),
+                str(row.get("seat", "")),
+            )
+        )
+
+        print(
+            "[TERMINAL_STACK_RETURN_RETAINED]",
+            f"frame={frame}",
+            f"seat={seat}",
+            f"prior={prior}",
+            f"reader_value={reader_value}",
+            flush=True,
+        )
+
+        return True
+
+
+    def reconcile_terminal_stack_returns(
+        self,
+    ):
+        """
+        Retry retained raw upward observations against current terminal
+        authority.
+
+        Observations that still lack terminal authority remain retained.
+        Successful terminal accounting is consumed exactly once through
+        admit_terminal_stack_return().
+        """
+        if not self.pending_terminal_stack_returns:
+            return ()
+
+        pending = list(
+            self.pending_terminal_stack_returns
+        )
+
+        self.pending_terminal_stack_returns = []
+
+        emitted = []
+
+        for observation in pending:
+            admitted = (
+                self.admit_terminal_stack_return(
+                    observation
+                )
+            )
+
+            if admitted:
+                emitted.extend(admitted)
+
+                print(
+                    "[TERMINAL_STACK_RETURN_RECONCILED]",
+                    f"frame={observation.get('frame')}",
+                    f"seat={observation.get('seat')}",
+                    flush=True,
+                )
+
+                continue
+
+            # No authority yet. Preserve exactly the same raw physical
+            # observation for a later semantic release.
+            self.pending_terminal_stack_returns.append(
+                observation
+            )
+
+        return tuple(emitted)
+
+
     def admit_terminal_stack_return(
         self,
         observation: Dict[str, Any],
@@ -1182,6 +1303,20 @@ class FrameHandObserver:
             .unmatched_commitment_bb(
                 seat
             )
+        )
+
+        print(
+            "[TERMINAL_RETURN_AUTHORITY_PROBE]",
+            f"frame={observation.get('frame')}",
+            f"seat={seat}",
+            f"hand_complete={self.hand.hand_complete}",
+            f"completion_reason={self.hand.completion_reason}",
+            f"winners={list(self.hand.winner_seats)}",
+            f"trusted={self.trusted_stacks.get(seat)}",
+            f"expected_return={expected_return}",
+            f"reader_value={observation.get('reader_value')}",
+            f"raw={[row.get('stack_bb') for row in (observation.get('raw') or [])]}",
+            flush=True,
         )
 
         if expected_return <= 0.02:
@@ -1274,10 +1409,6 @@ class FrameHandObserver:
         }
 
         self.events.append(event)
-
-        self._publish_if_changed(
-            observation.get("frame")
-        )
 
         print(
             "[UNCALLED_RETURN_ADMITTED]",
@@ -1453,6 +1584,29 @@ class FrameHandObserver:
                 f"pending={list(self.hand.pending_to_act)}",
                 flush=True,
             )
+
+            # The actor has already been consumed semantically, so
+            # this observation cannot create another betting action.
+            #
+            # But an independently confirmed visible decrease is
+            # physically consumed evidence, not chronology-blocked
+            # evidence. Preserve that physical baseline so a later
+            # stack increase can authenticate terminal accounting.
+            advanced = (
+                self._advance_physical_stack_baseline(
+                    seat,
+                    value,
+                    frame=observation.get("frame"),
+                    reason="seat_not_pending",
+                )
+            )
+
+            if advanced:
+                self.hand.observe_terminal_physical_commitment(
+                    seat,
+                    physical_delta,
+                )
+
             return ()
 
         emitted = []
@@ -1655,31 +1809,19 @@ class FrameHandObserver:
         # enters admit_quantitative_observation(). Instead drain the
         # other evidence classes first, then allow retained quantitative
         # work exposed by those folds to run, then drain folds once more.
-        self._begin_publication_transaction()
+        self.reconcile_pending_card_disappearances()
 
-        try:
-            self.reconcile_pending_card_disappearances()
-
-            reconciled_quantitative = (
-                self.reconcile_pending_evidence()
-            )
-            if reconciled_quantitative:
-                emitted.extend(
-                    reconciled_quantitative
-                )
-
-            self.reconcile_pending_card_disappearances()
-
-            self.reconcile_pending_street_boundaries()
-
-            self._publication_deferred_frame = (
-                observation.get("frame")
+        reconciled_quantitative = (
+            self.reconcile_pending_evidence()
+        )
+        if reconciled_quantitative:
+            emitted.extend(
+                reconciled_quantitative
             )
 
-        finally:
-            self._end_publication_transaction(
-                observation.get("frame")
-            )
+        self.reconcile_pending_card_disappearances()
+
+        self.reconcile_pending_street_boundaries()
 
         return tuple(emitted)
 
@@ -2125,10 +2267,6 @@ class FrameHandObserver:
         self.events.append(admitted)
         emitted.append(admitted)
 
-        self._publish_if_changed(
-            observation.get("frame")
-        )
-
         return tuple(emitted)
 
     def admit_terminal_boundary(
@@ -2272,10 +2410,6 @@ class FrameHandObserver:
         )
         emitted.append(
             admitted
-        )
-
-        self._publish_if_changed(
-            observation.get("frame")
         )
 
         return tuple(emitted)

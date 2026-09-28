@@ -21,6 +21,7 @@ process_frame_transaction() used by live ACR.
 """
 
 from pathlib import Path
+import time
 
 import cv2
 
@@ -29,8 +30,9 @@ from src.v017.run_live_observer import (
     FrameTransactionState,
     build_observer_from_frame,
     process_frame_transaction,
-    canonical_sensor_frame,
-    SENSOR_GEOMETRY,
+    finalize_async_board_identity_result,
+    apply_async_board_identity_result,
+    submit_next_pending_board_boundary,
     GEOMETRY,
     bootstrap_local_stacks,
     crop_geometry_region,
@@ -118,16 +120,9 @@ def run(
                 observed_participants
             )
         )
-
-        sensor_image = (
-            canonical_sensor_frame(
-                image
-            )
-        )
-
         visible = hero_cards_visible(
-            sensor_image,
-            SENSOR_GEOMETRY,
+            image,
+            GEOMETRY,
         )
 
         if not visible:
@@ -335,6 +330,80 @@ def run(
                 f"outcome={transaction.outcome}",
             )
             break
+
+    # Finite PNG replay has no future physical frame on which
+    # production can naturally collect asynchronous board identity.
+    # Drain transport ownership before inspecting final semantic state.
+    #
+    # This grants no new semantic authority: completed identities are
+    # applied through the same production application path, and queued
+    # physical boundaries are submitted in their existing order.
+    drain_deadline = time.monotonic() + 10.0
+
+    while (
+        state.board_identity_reader.future is not None
+        or state.pending_board_boundaries
+    ):
+        completed = (
+            state.board_identity_reader.collect_ready()
+        )
+
+        if completed is not None:
+            finalized = (
+                finalize_async_board_identity_result(
+                    observer,
+                    state,
+                    completed,
+                    publication_frame="async_drain",
+                )
+            )
+
+            for reconciled_event in finalized[
+                "reconciled_cards"
+            ]:
+                print(
+                    "[PIXEL_ASYNC_CARD_RECONCILED]",
+                    f"frame={reconciled_event.get('frame')}",
+                    f"seat={reconciled_event.get('seat')}",
+                    f"action={reconciled_event.get('semantic_action')}",
+                )
+
+            for reconciled_event in finalized[
+                "reconciled_quantitative"
+            ]:
+                print(
+                    "[PIXEL_ASYNC_QUANTITATIVE_RECONCILED]",
+                    f"frame={reconciled_event.get('frame')}",
+                    f"seat={reconciled_event.get('seat')}",
+                    f"action={reconciled_event.get('semantic_action')}",
+                )
+
+            continue
+
+        if (
+            state.board_identity_reader.future is None
+            and state.pending_board_boundaries
+        ):
+            submit_next_pending_board_boundary(
+                state
+            )
+            continue
+
+        if time.monotonic() >= drain_deadline:
+            raise RuntimeError(
+                "Pixel Lab async board drain timed out"
+            )
+
+        time.sleep(0.01)
+
+    print(
+        "[PIXEL_ASYNC_DRAIN_COMPLETE]",
+        f"street={observer.hand.street}",
+        f"board={observer.hand.board}",
+        f"actions={len(observer.hand.semantic_actions())}",
+    )
+
+    state.board_identity_reader.close()
 
     print()
     print(

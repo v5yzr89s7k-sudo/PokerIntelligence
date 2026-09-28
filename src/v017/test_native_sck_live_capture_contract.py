@@ -1,7 +1,6 @@
 from pathlib import Path
 import ast
 
-
 SOURCE_PATH = Path(
     "src/v017/run_live_observer.py"
 )
@@ -38,80 +37,31 @@ def main():
         "capture_image"
     )
 
-    sensor = function_source(
-        "canonical_sensor_frame"
+    transaction = function_source(
+        "process_frame_transaction"
     )
 
-    run_hand = function_source(
-        "run_hand"
-    )
+    assert "SCKFrameSource" in SOURCE
 
-    print(
-        "===== NATIVE CAPTURE OWNERSHIP ====="
-    )
-
-    assert "SCKFrameSource" in SOURCE, (
-        "v0.17 has no persistent SCK frame source"
-    )
-
-    assert "capture_window_crop" not in capture, (
-        "capture_image still uses legacy "
-        "screencapture/PNG acquisition"
-    )
-
-    assert "cv2.imread" not in capture, (
-        "capture_image still decodes a materialized "
-        "PNG from disk"
-    )
-
-    assert "cv2.imwrite" not in capture, (
-        "normal capture path must not materialize "
-        "every live frame"
-    )
-
-    print(
-        "NORMAL LIVE CAPTURE IS IN-MEMORY: PASS"
-    )
-
-    print()
-    print(
-        "===== NATIVE FRAME CONTRACT ====="
-    )
+    assert "capture_window_crop" not in capture
+    assert "cv2.imread" not in capture
+    assert "cv2.imwrite" not in capture
 
     assert "NATIVE_FRAME_SIZE" in capture
+    assert "native frame size mismatch" in capture
 
-    assert (
-        "native frame size mismatch"
-        in capture
-    )
+    assert "canonical_sensor_frame" not in SOURCE
+    assert "SENSOR_FRAME_SIZE" not in SOURCE
+    assert "SENSOR_GEOMETRY" not in SOURCE
 
-    print(
-        "NATIVE DIMENSION GUARD: PASS"
-    )
+    assert "observer.process_frame(" in transaction
+    assert "sensor_frame=" not in transaction
+    assert "sensor_geometry=" not in transaction
 
-    print()
-    print(
-        "===== DUAL-FRAME CONTRACT ====="
-    )
-
-    assert "cv2.resize" in sensor
-    assert "SENSOR_FRAME_SIZE" in sensor
-
-    assert "capture_image(" in run_hand
-    assert "process_frame_transaction(" in run_hand
-
-    print(
-        "NATIVE -> CANONICAL DERIVATION: PASS"
-    )
-
-    print(
-        "RUN_HAND USES CAPTURE OWNER: PASS"
-    )
-
-    print()
-    print(
-        "V0.17 NATIVE SCK LIVE CAPTURE CONTRACT: PASS"
-    )
+    print("IN-MEMORY CAPTURE: PASS")
+    print("3456x2168 DIMENSION GUARD: PASS")
+    print("SECOND SENSOR FRAME: ABSENT")
+    print("V0.17 FULL-SIZE LIVE CAPTURE CONTRACT: PASS")
 
 
 if __name__ == "__main__":

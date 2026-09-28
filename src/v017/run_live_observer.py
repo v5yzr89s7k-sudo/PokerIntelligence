@@ -101,15 +101,6 @@ NATIVE_FRAME_SIZE = (
     int(GEOMETRY["table_size"]["height"]),
 )
 
-SENSOR_GEOMETRY = json.loads(
-    Path("config/geometry.json").read_text()
-)
-
-SENSOR_FRAME_SIZE = (
-    int(SENSOR_GEOMETRY["table_size"]["width"]),
-    int(SENSOR_GEOMETRY["table_size"]["height"]),
-)
-
 CURRENT_HAND = Path(
     "runtime/live/current_hand.txt"
 )
@@ -629,23 +620,6 @@ def capture_image(window):
 
     return image, frame_reference
 
-def canonical_sensor_frame(
-    native_image,
-):
-    """
-    Derive the established 934x696 physical-sensor lane from the
-    exact same native capture used by quantitative stack perception.
-    """
-    width, height = SENSOR_FRAME_SIZE
-
-    return cv2.resize(
-        native_image,
-        (width, height),
-        interpolation=cv2.INTER_AREA,
-    )
-
-
-
 def player_records(
     seats,
     positions,
@@ -834,13 +808,9 @@ def wait_for_hand(
             )
         )
 
-        sensor_image = canonical_sensor_frame(
-            image
-        )
-
         if hero_cards_visible(
-            sensor_image,
-            SENSOR_GEOMETRY,
+            image,
+            GEOMETRY,
         ):
             if frozen is None:
                 fallback = (
@@ -1658,17 +1628,13 @@ def build_observer_from_frame(
     # The acquisition frame is physical baseline evidence, not an
     # action frame. Establish transition sensors without emitting
     # events or granting semantic authority.
-    sensor_image = canonical_sensor_frame(
-        image
-    )
-
     observer.establish_physical_transition_baseline(
-        sensor_image,
-        physical_geometry=SENSOR_GEOMETRY,
+        image,
+        physical_geometry=GEOMETRY,
         native_frame=image,
     )
 
-    observer._publish_if_changed(
+    observer.publish_authoritative_state(
         "bootstrap"
     )
 
@@ -1828,6 +1794,8 @@ class FrameTransactionState:
         self.settlement_gate = StackSettlementGate()
         self.board_identity_reader = AsyncBoardIdentityReader()
         self.pending_board_boundaries = []
+        self.unresolved_board_boundary = None
+        self.deferred_semantic_frames = []
         self.hero_buttons_active = False
         self.hero_completion_pending_frame = None
 
@@ -1926,6 +1894,122 @@ def apply_async_board_identity_result(
     return True
 
 
+def finalize_async_board_identity_result(
+    observer,
+    state,
+    completed,
+    *,
+    publication_frame=None,
+):
+    """
+    Complete the production semantic lifecycle for one asynchronous
+    board-identity result outside the physical-frame transaction.
+
+    Finite/replay callers may reach EOF while board identity is still
+    in flight. Applying identity alone is insufficient: a street
+    advance may make already-retained physical evidence authoritative.
+
+    Semantic ownership remains entirely in production:
+        board application
+        -> queued-boundary submission
+        -> retained-evidence reconciliation
+        -> canonical publication
+
+    No new physical evidence is created here.
+    """
+
+    if completed is None:
+        return {
+            "applied": False,
+            "reconciled_cards": (),
+            "reconciled_quantitative": (),
+            "publication": None,
+        }
+
+    applied = apply_async_board_identity_result(
+        observer,
+        completed,
+    )
+
+    submit_next_pending_board_boundary(
+        state
+    )
+
+    if not applied:
+        return {
+            "applied": False,
+            "reconciled_cards": (),
+            "reconciled_quantitative": (),
+            "publication": None,
+        }
+
+    state.unresolved_board_boundary = None
+
+    deferred = list(
+        state.deferred_semantic_frames
+    )
+    state.deferred_semantic_frames.clear()
+
+    for item in deferred:
+        print(
+            "[SEMANTIC_FRAME_REPLAY]",
+            f"frame={item['frame_id']}",
+            f"street={observer.hand.street}",
+            flush=True,
+        )
+
+        process_frame_transaction(
+            observer,
+            item["image"],
+            item["frame_path"],
+            item["frame_id"],
+            state,
+            capture_complete_ns=(
+                item["capture_complete_ns"]
+            ),
+        )
+
+    (
+        reconciled_cards,
+        reconciled_quantitative,
+    ) = reconcile_frame_evidence(
+        observer
+    )
+
+    reconciled_terminal = (
+        observer.reconcile_terminal_stack_returns()
+    )
+
+    if publication_frame is None:
+        publication_frame = (
+            completed["request"][
+                "boundary_event"
+            ].get("frame")
+        )
+
+    publication = None
+
+    if (
+        reconciled_cards
+        or reconciled_quantitative
+        or reconciled_terminal
+    ):
+        publication = observer.publish_authoritative_state(
+            publication_frame
+        )
+
+    return {
+        "applied": True,
+        "reconciled_cards":
+            tuple(reconciled_cards),
+        "reconciled_quantitative":
+            tuple(reconciled_quantitative),
+        "reconciled_terminal":
+            tuple(reconciled_terminal),
+        "publication": publication,
+    }
+
+
 def submit_next_pending_board_boundary(
     state,
 ):
@@ -1995,15 +2079,37 @@ def process_frame_transaction(
         frame_id
     ] = int(capture_complete_ns)
 
-    sensor_image = canonical_sensor_frame(
-        image
+    outstanding_boundary = (
+        state.unresolved_board_boundary is not None
     )
+
+    if outstanding_boundary:
+        state.deferred_semantic_frames.append(
+            {
+                "image": image.copy(),
+                "frame_path": Path(frame_path),
+                "frame_id": frame_id,
+                "capture_complete_ns":
+                    int(capture_complete_ns),
+            }
+        )
+
+        print(
+            "[SEMANTIC_FRAME_DEFERRED]",
+            f"frame={frame_id}",
+            "reason=board_identity_pending",
+            f"queued={len(state.deferred_semantic_frames)}",
+            flush=True,
+        )
+
+        return FrameTransactionResult(
+            "CONTINUE",
+            (),
+        )
 
     result = observer.process_frame(
         image,
         frame_id=frame_id,
-        sensor_frame=sensor_image,
-        sensor_geometry=SENSOR_GEOMETRY,
     )
 
     perception_complete_ns = time.perf_counter_ns()
@@ -2165,6 +2271,19 @@ def process_frame_transaction(
                     state.hero_buttons_active = False
 
                 continue
+
+            # A raw unresolved stack increase cannot represent a
+            # wager. It may, however, later confirm an authoritative
+            # UNCALLED_RETURN after independent semantic evidence
+            # establishes UNCONTESTED completion.
+            #
+            # Retention grants no poker-semantic or trusted-stack
+            # authority. The dedicated terminal owner independently
+            # verifies that the raw observation is an actual increase.
+            if not event.get("resolved"):
+                observer.retain_terminal_stack_return(
+                    event
+                )
 
             # Raw OCR never mutates HandEngine directly.
             #
@@ -2410,7 +2529,7 @@ def process_frame_transaction(
         )
 
     if boundary_events:
-        observer._publish_if_changed(
+        observer.publish_authoritative_state(
             frame_id
         )
 
@@ -2451,13 +2570,18 @@ def process_frame_transaction(
             frame_path
         )
 
+        boundary_item = {
+            "frame_path": durable_path,
+            "boundary_event": dict(event),
+            "expected_count": expected_count,
+        }
+
         state.pending_board_boundaries.append(
-            {
-                "frame_path": durable_path,
-                "boundary_event": dict(event),
-                "expected_count": expected_count,
-            }
+            boundary_item
         )
+
+        if state.unresolved_board_boundary is None:
+            state.unresolved_board_boundary = boundary_item
 
         print(
             "[BOARD_BOUNDARY_QUEUED]",
@@ -2518,6 +2642,10 @@ def process_frame_transaction(
         )
     )
 
+    reconciled_terminal = (
+        observer.reconcile_terminal_stack_returns()
+    )
+
     hero_card_action_reconciled = False
 
     for reconciled_event in reconciled_cards:
@@ -2563,8 +2691,9 @@ def process_frame_transaction(
     if (
         reconciled_cards
         or reconciled_quantitative
+        or reconciled_terminal
     ):
-        observer._publish_if_changed(
+        observer.publish_authoritative_state(
             frame_id
         )
 
@@ -2617,7 +2746,7 @@ def process_frame_transaction(
 
             state.hero_completion_pending_frame = None
 
-            observer._publish_if_changed(
+            observer.publish_authoritative_state(
                 frame_id
             )
 
@@ -2673,6 +2802,41 @@ def process_frame_transaction(
 
     semantic_complete_ns = time.perf_counter_ns()
 
+    after_actions = len(
+        observer.hand.actions
+    )
+
+    # One physical transaction has one authoritative publication
+    # commit boundary.
+    #
+    # Admission/reconciliation primitives own semantic mutation only.
+    # If canonical action state changed anywhere during this transaction,
+    # ensure the final authoritative projection exists here. Deduplication
+    # remains owned by FrameHandObserver.
+    if after_actions > before_actions:
+        print(
+            "[OUTER_PUBLICATION_COMMIT_PROBE]",
+            f"frame={frame_id}",
+            f"before_actions={before_actions}",
+            f"after_actions={after_actions}",
+            f"publications_before={len(observer.publications)}",
+            flush=True,
+        )
+
+        publication_probe = (
+            observer.publish_authoritative_state(
+                frame_id
+            )
+        )
+
+        print(
+            "[OUTER_PUBLICATION_COMMIT_RESULT]",
+            f"frame={frame_id}",
+            f"created={publication_probe is not None}",
+            f"publications_after={len(observer.publications)}",
+            flush=True,
+        )
+
     completed_publications = (
         tuple(pre_boundary_publications)
         + tuple(
@@ -2681,10 +2845,6 @@ def process_frame_transaction(
                 publication_sink_cursor,
             )
         )
-    )
-
-    after_actions = len(
-        observer.hand.actions
     )
 
     if (
@@ -2868,7 +3028,7 @@ def run_hand(
                     )
 
                     if changed:
-                        observer._publish_if_changed(
+                        observer.publish_authoritative_state(
                             frame_id
                         )
                         publish_new(
@@ -2990,13 +3150,9 @@ def main():
                 window
             )
 
-            sensor_image = canonical_sensor_frame(
-                image
-            )
-
             if not hero_cards_visible(
-                sensor_image,
-                SENSOR_GEOMETRY,
+                image,
+                GEOMETRY,
             ):
                 print(
                     "[HERO_CLEAR_CONFIRMED]",

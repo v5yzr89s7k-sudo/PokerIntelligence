@@ -98,6 +98,7 @@ class HandEngine:
         # Physical pot perception may later confirm this value, but
         # it must never independently overwrite canonical accounting.
         self.pot_bb = 0.0
+        self.terminal_physical_commitment_bb = {}
 
         # Objective card observations.
         #
@@ -581,13 +582,52 @@ class HandEngine:
             default=0.0,
         )
 
-        return round(
+        current = round(
             max(
                 0.0,
                 own - matched,
             ),
             2,
         )
+
+        terminal = float(
+            self.terminal_physical_commitment_bb.get(
+                seat,
+                0.0,
+            )
+        )
+
+        return round(
+            max(current, terminal),
+            2,
+        )
+
+    def observe_terminal_physical_commitment(
+        self,
+        seat,
+        amount_bb,
+    ):
+        if seat not in self.players:
+            raise ValueError(
+                f"unknown seat: {seat}"
+            )
+
+        amount = round(
+            float(amount_bb),
+            2,
+        )
+
+        if amount <= EPSILON:
+            raise ValueError(
+                "invalid terminal physical commitment: "
+                f"{amount}"
+            )
+
+        self.terminal_physical_commitment_bb[
+            seat
+        ] = amount
+
+        return amount
 
     def observe_uncalled_return(
         self,
@@ -683,6 +723,11 @@ class HandEngine:
                 - amount,
             ),
             2,
+        )
+
+        self.terminal_physical_commitment_bb.pop(
+            seat,
+            None,
         )
 
         return amount

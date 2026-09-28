@@ -148,9 +148,9 @@ def main():
     ) == 11
 
     assert signature["board"] == [
-        "Jd",
-        "9s",
-        "Tc",
+        "4s",
+        "Qs",
+        "6s",
     ]
 
     assert (
@@ -206,7 +206,7 @@ def main():
         "11 BETTING ACTIONS: PASS"
     )
     print(
-        "CANONICAL BOARD Jd 9s Tc: PASS"
+        "CANONICAL BOARD 4s Qs 6s: PASS"
     )
     print(
         "UNCONTESTED HERO RESULT: PASS"

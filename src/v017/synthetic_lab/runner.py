@@ -1,15 +1,19 @@
 from dataclasses import dataclass
 from typing import Tuple
 
+import time
+
 from src.v017.frame_hand_observer import (
     FrameHandObserver,
 )
-from src.v017.quantitative_transaction import (
-    process_quantitative_frame,
+
+from src.v017.run_live_observer import (
+    FrameTransactionState,
+    process_frame_transaction,
+    finalize_async_board_identity_result,
+    submit_next_pending_board_boundary,
 )
-from src.v017.stack_settlement_gate import (
-    StackSettlementGate,
-)
+
 from src.v017.july22_frame_preflop_replay import (
     ACTION_ORDER,
     GEOMETRY,
@@ -61,103 +65,46 @@ def build_observer():
 
 def run_july22():
     """
-    Controlled visual laboratory baseline.
-
-    Inputs visible to observer:
-        authentic ACR pixels
-        initial table facts
-
-    Ground-truth actions are never supplied to the observer.
+    July22 authentic-pixel laboratory through the same production
+    frame transaction used by live ACR.
     """
     source = RecordedFrameSource()
     observer = build_observer()
-    boards = load_board_observations()
-    settlement_gate = StackSettlementGate()
-
+    state = FrameTransactionState()
     snapshots = []
 
-    for number in range(1, 136):
+    # Frame 1 is the acquisition frame: establish physical
+    # transition state without treating it as an action frame.
+    acquisition_image = source.load(1)
+    observer.establish_physical_transition_baseline(
+        acquisition_image,
+        physical_geometry=GEOMETRY,
+        native_frame=acquisition_image,
+    )
+
+    for number in range(2, 136):
         before = len(observer.publications)
 
-        result = observer.process_frame(
-            source.load(number),
-            frame_id=number,
+        path = source.path(number)
+        image = source.load(number)
+
+        transaction = process_frame_transaction(
+            observer,
+            image,
+            path,
+            number,
+            state,
         )
-
-        quantitative_result = (
-            process_quantitative_frame(
-                observer,
-                settlement_gate,
-                result.events,
-            )
-        )
-
-        for event in result.events:
-            typ = event["type"]
-
-            if typ in {
-                "OPPONENT_CARDS_DISAPPEARED",
-                "HERO_CARDS_DISAPPEARED_PHYSICAL",
-            }:
-                observer.admit_card_disappearance(
-                    event["seat"],
-                    frame_id=number,
-                    physical_type=typ,
-                )
-
-            elif (
-                typ
-                == "STACK_QUANTITATIVE_OBSERVATION"
-            ):
-                # Quantitative authority is processed once per
-                # complete physical frame above through the same
-                # transaction used by production.
-                continue
-
-            elif typ in BOUNDARY_STREET:
-                street = BOUNDARY_STREET[typ]
-                card_observation = boards[number]
-
-                if (
-                    street == "FLOP"
-                    and card_observation["hero_cards"]
-                ):
-                    observer.hand.observe_hero_cards(
-                        list(
-                            card_observation[
-                                "hero_cards"
-                            ]
-                        )
-                    )
-
-                observer.admit_street_boundary(
-                    event,
-                    action_order=STREET_ORDER[
-                        street
-                    ],
-                    board=list(
-                        card_observation["board"]
-                    ),
-                    complete_pending=(
-                        street == "RIVER"
-                    ),
-                )
 
         for publication in observer.publications[
             before:
         ]:
             snapshots.append(
                 ProductSnapshot(
-                    frame=int(
-                        publication["frame"]
-                    ),
-                    street=str(
-                        publication["street"]
-                    ),
+                    frame=int(publication["frame"]),
+                    street=str(publication["street"]),
                     action_count=int(
-                        publication[
-                            "action_count"
-                        ]
+                        publication["action_count"]
                     ),
                     next_actor=publication[
                         "next_actor"
@@ -165,6 +112,66 @@ def run_july22():
                     text=publication["text"],
                 )
             )
+
+        if transaction.outcome != "CONTINUE":
+            break
+
+    # Finite replay must drain production async board ownership
+    # before final canonical state is inspected.
+    drain_deadline = time.monotonic() + 10.0
+
+    while (
+        state.board_identity_reader.future is not None
+        or state.pending_board_boundaries
+    ):
+        completed = (
+            state.board_identity_reader.collect_ready()
+        )
+
+        if completed is not None:
+            before = len(observer.publications)
+
+            finalize_async_board_identity_result(
+                observer,
+                state,
+                completed,
+                publication_frame="async_drain",
+            )
+
+            for publication in observer.publications[
+                before:
+            ]:
+                snapshots.append(
+                    ProductSnapshot(
+                        frame=publication["frame"],
+                        street=str(publication["street"]),
+                        action_count=int(
+                            publication["action_count"]
+                        ),
+                        next_actor=publication[
+                            "next_actor"
+                        ],
+                        text=publication["text"],
+                    )
+                )
+
+            continue
+
+        if (
+            state.board_identity_reader.future is None
+            and state.pending_board_boundaries
+        ):
+            submit_next_pending_board_boundary(
+                state
+            )
+            continue
+
+        if time.monotonic() >= drain_deadline:
+            raise RuntimeError(
+                "Synthetic Lab async board drain timed out"
+            )
+
+        time.sleep(0.01)
 
     final_actions = tuple(
         (
@@ -182,6 +189,8 @@ def run_july22():
         if observer.publications
         else ""
     )
+
+    state.board_identity_reader.close()
 
     return LabRun(
         scenario="july22_baseline",

@@ -27,8 +27,12 @@ from src.v017.pixel_lab.acr_truth_timeline import (
     compile_truth_timeline,
 )
 from src.v017.pixel_lab.acr_pixel_renderer import (
-    load_geometry,
     render_hand_progression,
+)
+
+from src.v017.run_live_observer import (
+    canonical_sensor_frame,
+    SENSOR_GEOMETRY,
 )
 
 
@@ -62,8 +66,6 @@ def main():
 
     truth = compile_truth_timeline(hand)
     seat_map = map_acr_seats(hand)
-    geometry = load_geometry()
-
     rendered = render_hand_progression(
         hand=hand,
         truth_frames=truth,
@@ -100,10 +102,26 @@ def main():
             if seat == "hero":
                 continue
 
+            # Validate the exact physical lane used by live
+            # production:
+            #
+            # native 3456x2168 PNG
+            #     -> canonical 934x696 sensor frame
+            #     -> canonical production hole-card ROI
+            #
+            # Direct native/maximized detection is insufficient:
+            # rendered evidence must survive the same downsampling
+            # consumed by FrameHandObserver.
+            sensor_image = canonical_sensor_frame(
+                image
+            )
+
             visible = bool(
                 opponent_cards_visible(
-                    image,
-                    geometry["hole_cards"][seat],
+                    sensor_image,
+                    SENSOR_GEOMETRY[
+                        "hole_cards"
+                    ][seat],
                 )
             )
 
