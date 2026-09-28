@@ -303,25 +303,26 @@ def main():
     # Every retained physical boundary is consumed exactly once.
     assert len(admitted_boundaries) == 3
 
-    # The entire backlog is reconciled inside the chronology-release
-    # publication transaction. The product must not expose transient
-    # FLOP-only or TURN-only states when those later physical streets
-    # were already known before release.
-    assert len(observer.publications) == 1, (
-        observer.publications
-    )
+    # Direct backlog reconciliation owns semantic mutation only.
+    # Publication belongs to process_frame_transaction(), so this
+    # observer-level unit contract must not create publications.
+    assert observer.publications == []
 
-    publication = observer.publications[0]
-
-    assert publication["street"] == "RIVER"
     # Six PREFLOP actions plus two objectively boundary-proven
     # zero-commitment actions:
     #
     # TURN proves Hero completed FLOP with CHECK.
     # RIVER proves Hero completed TURN with CHECK.
-    assert publication["action_count"] == 8
+    assert len(observer.hand.actions) == 8
 
-    text = publication["text"]
+    from src.v017.current_hand_renderer import (
+        render_current_hand,
+    )
+
+    text = render_current_hand(
+        observer.hand,
+        hand_id=observer.hand_id,
+    )
 
     assert "UTG folds" in text
     assert "HJ (Hero) raises to 2 BB" in text

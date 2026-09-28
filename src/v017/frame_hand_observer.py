@@ -1573,6 +1573,39 @@ class FrameHandObserver:
             )
             return ()
 
+        # Same-actor physical ownership collision:
+        #
+        # Card disappearance from this same physical frame was retained
+        # before quantitative semantic admission. If it belongs to the
+        # current authoritative actor, a settling quantitative candidate
+        # for that same seat must not consume the actor first.
+        #
+        # This is deliberately narrower than general card precedence.
+        # A different seat's quantitative action may still prove prior
+        # chronology and release retained card evidence normally.
+        observation_frame = observation.get("frame")
+
+        same_actor_card_disappearance = any(
+            retained.get("seat") == seat
+            and retained.get("frame_id")
+            == observation_frame
+            for retained
+            in self.pending_card_disappearances
+        )
+
+        if (
+            seat == self.hand.next_actor
+            and same_actor_card_disappearance
+        ):
+            print(
+                "[QUANTITATIVE_REJECT]",
+                f"frame={observation_frame}",
+                f"seat={seat}",
+                "reason=same_actor_card_disappearance",
+                flush=True,
+            )
+            return ()
+
         # Old observations cannot replay an already-consumed actor.
         if seat not in self.hand.pending_to_act:
             print(
@@ -2196,16 +2229,48 @@ class FrameHandObserver:
                         pending_seat
                     )
 
-            if blocked_pending:
-                self._retain_pending_street_boundary(
-                    observation,
-                    action_order=action_order,
-                    board=observed_board,
-                    complete_pending=complete_pending,
-                )
-                return ()
+            boundary_unknown = set(
+                blocked_pending
+            )
 
             for seat in pending:
+                if seat in boundary_unknown:
+                    self.hand.resolve_boundary_completed_actor(
+                        seat
+                    )
+
+                    completion = {
+                        "frame":
+                            observation.get("frame"),
+                        "type":
+                            "STREET_BOUNDARY_UNKNOWN_COMPLETION",
+                        "street":
+                            self.hand.street,
+                        "seat": seat,
+                        "proved_by":
+                            boundary_type,
+                        "semantic_action":
+                            None,
+                    }
+
+                    self.events.append(
+                        completion
+                    )
+                    emitted.append(
+                        completion
+                    )
+
+                    print(
+                        "[STREET_BOUNDARY_UNKNOWN_COMPLETION]",
+                        f"frame={observation.get('frame')}",
+                        f"street={self.hand.street}",
+                        f"seat={seat}",
+                        f"proved_by={boundary_type}",
+                        flush=True,
+                    )
+
+                    continue
+
                 action = (
                     self.hand
                     .observe_no_commitment(

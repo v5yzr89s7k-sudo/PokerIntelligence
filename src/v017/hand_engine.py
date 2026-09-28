@@ -364,6 +364,23 @@ class HandEngine:
         if self.pending_to_act:
             self.pending_to_act.pop(0)
 
+    def resolve_boundary_completed_actor(
+        self,
+        seat,
+    ):
+        """
+        Resolve chronology ownership proven complete by an
+        authoritative next-street boundary when the exact prior-street
+        poker action is not observable.
+
+        This operation deliberately appends no semantic action and
+        changes no fold, commitment, contribution, pot, or all-in state.
+        """
+        self._require_actor(seat)
+        self._advance_actor()
+        return seat
+
+
     def _is_actionable(self, seat):
         player = self.players[seat]
         return (
