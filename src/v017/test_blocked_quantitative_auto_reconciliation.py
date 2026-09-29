@@ -188,22 +188,13 @@ def main():
     assert observer.hand.current_price_bb == 2.0
     assert observer.hand.next_actor == "sb"
 
-    # UTG fold + already-known HJ/Hero raise must be published as
-    # one caught-up authoritative state. No transient publication
-    # may expose only the fold while withholding retained evidence.
-    assert len(observer.publications) == 1, (
-        observer.publications
-    )
-
-    publication = observer.publications[0]
-
-    assert publication["action_count"] == 4, publication
-    assert publication["next_actor"] == "sb", publication
-
-    text = publication["text"]
-
-    assert "UTG folds" in text, text
-    assert "HJ raises to 2 BB" in text, text
+    # Direct admission/reconciliation owns semantic mutation only.
+    #
+    # Publication belongs exclusively to the outer physical
+    # transaction. This observer-level contract therefore verifies
+    # the caught-up canonical HandEngine state and must not create
+    # an independent publication.
+    assert observer.publications == []
 
     actions = [
         row

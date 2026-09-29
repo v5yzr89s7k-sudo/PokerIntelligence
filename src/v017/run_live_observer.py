@@ -2110,9 +2110,8 @@ def process_frame_transaction(
     # Publication ownership follows authoritative product state, not
     # action-count growth alone. A street/board transition can change
     # current_hand.txt without appending a semantic poker action.
-    before_projection = render_current_hand(
-        observer.hand,
-        hand_id=observer.hand_id,
+    before_projection = (
+        observer.render_live_projection()
     )
 
     transaction_start_ns = time.perf_counter_ns()
@@ -2871,9 +2870,8 @@ def process_frame_transaction(
     # Commit whenever the authoritative product projection changed.
     # Action-count growth is insufficient: street/board/next-actor state
     # may change without fabricating a semantic poker action.
-    after_projection = render_current_hand(
-        observer.hand,
-        hand_id=observer.hand_id,
+    after_projection = (
+        observer.render_live_projection()
     )
 
     authoritative_projection_changed = (

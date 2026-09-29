@@ -361,10 +361,7 @@ class FrameHandObserver:
         successful admission has already mutated HandEngine.
         """
 
-        text = render_current_hand(
-            self.hand,
-            hand_id=self.hand_id,
-        )
+        text = self.render_live_projection()
 
         if text == self.previous_text:
             return None
@@ -879,6 +876,294 @@ class FrameHandObserver:
             f"value={retained.get('resolved_value')}",
             flush=True,
         )
+
+
+    def resolve_physical_evidence_timeline(self):
+        """
+        Return a read-only view of physical evidence that exists
+        beyond the current canonical HandEngine frontier.
+
+        This method owns no poker semantics.
+
+        It does not:
+        - mutate HandEngine,
+        - advance next_actor,
+        - classify an unresolved predecessor,
+        - consume retained evidence,
+        - update trusted stacks,
+        - create events,
+        - create publications.
+
+        next_actor is exposed only as the canonical frontier.
+        Independently retained physical evidence is exposed separately.
+        """
+
+        known_later_evidence = []
+
+        for evidence in self.pending_quantitative_evidence:
+            retained = dict(evidence)
+            retained["_timeline_frame"] = (
+                retained.get("frame")
+            )
+            retained["_timeline_type"] = (
+                retained.get("type")
+            )
+            known_later_evidence.append(
+                retained
+            )
+
+        for evidence in self.pending_card_disappearances:
+            retained = dict(evidence)
+            retained["_timeline_frame"] = (
+                retained.get("frame_id")
+            )
+            retained["_timeline_type"] = (
+                retained.get("physical_type")
+            )
+            known_later_evidence.append(
+                retained
+            )
+
+        def evidence_class(evidence):
+            typ = evidence.get(
+                "_timeline_type"
+            )
+
+            if (
+                typ
+                == "OPPONENT_CARDS_DISAPPEARED"
+            ):
+                return (
+                    0,
+                    "CARD_DISAPPEARANCE",
+                )
+
+            if (
+                typ
+                == "STACK_QUANTITATIVE_OBSERVATION"
+            ):
+                return (
+                    1,
+                    "QUANTITATIVE",
+                )
+
+            return (
+                2,
+                str(typ or "UNKNOWN"),
+            )
+
+        def frame_key(evidence):
+            frame = evidence.get(
+                "_timeline_frame"
+            )
+
+            priority, normalized_type = (
+                evidence_class(evidence)
+            )
+
+            try:
+                return (
+                    0,
+                    int(frame),
+                    priority,
+                    str(evidence.get("seat", "")),
+                    normalized_type,
+                )
+            except (TypeError, ValueError):
+                return (
+                    1,
+                    str(frame),
+                    priority,
+                    str(evidence.get("seat", "")),
+                    normalized_type,
+                )
+
+        known_later_evidence.sort(
+            key=frame_key
+        )
+
+        canonical_next_actor = (
+            self.hand.next_actor
+        )
+
+        physical_chronology = []
+
+        for evidence in known_later_evidence:
+            typ = evidence.get(
+                "_timeline_type"
+            )
+
+            frame = evidence.get(
+                "_timeline_frame"
+            )
+
+            if (
+                typ
+                == "STACK_QUANTITATIVE_OBSERVATION"
+            ):
+                row = {
+                    "frame": frame,
+                    "seat": evidence.get("seat"),
+                    "evidence_type": "QUANTITATIVE",
+                    "resolved_value":
+                        evidence.get("resolved_value"),
+                    "physical_status": "PROVEN",
+                    "canonical_status":
+                        "BLOCKED_BY_PREDECESSOR",
+                }
+
+            elif (
+                typ
+                == "OPPONENT_CARDS_DISAPPEARED"
+            ):
+                row = {
+                    "frame": frame,
+                    "seat": evidence.get("seat"),
+                    "evidence_type":
+                        "CARD_DISAPPEARANCE",
+                    "physical_action": "FOLD",
+                    "physical_status": "PROVEN",
+                    "canonical_status":
+                        "BLOCKED_BY_PREDECESSOR",
+                }
+
+            else:
+                row = {
+                    "frame": frame,
+                    "seat": evidence.get("seat"),
+                    "evidence_type":
+                        str(typ or "UNKNOWN"),
+                    "physical_status": "PROVEN",
+                    "canonical_status":
+                        "BLOCKED_BY_PREDECESSOR",
+                }
+
+            normalized_type = row[
+                "evidence_type"
+            ]
+
+            row["same_frame_group"] = frame
+            row["subframe_order_known"] = False
+            row["evidence_identity"] = (
+                normalized_type,
+                row.get("seat"),
+                frame,
+            )
+
+            physical_chronology.append(row)
+
+        return {
+            "canonical_next_actor":
+                canonical_next_actor,
+            "canonical_blocked": bool(
+                canonical_next_actor
+                and known_later_evidence
+            ),
+            "known_later_evidence":
+                tuple(known_later_evidence),
+            "physical_chronology":
+                tuple(physical_chronology),
+        }
+
+    def render_live_projection(self):
+        """
+        Render the canonical hand plus independently proven physical
+        evidence that is still blocked beyond the canonical frontier.
+
+        The pending section is presentation only.
+
+        It does not:
+        - mutate HandEngine,
+        - consume retained evidence,
+        - advance next_actor,
+        - assign poker semantics to blocked quantitative evidence,
+        - publish independently.
+        """
+
+        text = render_current_hand(
+            self.hand
+        )
+
+        state = (
+            self.resolve_physical_evidence_timeline()
+        )
+
+        chronology = state.get(
+            "physical_chronology",
+            (),
+        )
+
+        if not chronology:
+            return text
+
+        position_by_seat = {}
+
+        for player in self.hand.players.values():
+            seat = player.seat
+            position = player.position
+
+            if seat is not None and position:
+                position_by_seat[
+                    str(seat)
+                ] = str(position)
+
+        lines = [
+            text.rstrip(),
+            "",
+            "PHYSICALLY OBSERVED — CANONICAL ORDER PENDING",
+            "-" * 72,
+        ]
+
+        for row in chronology:
+            seat = str(
+                row.get("seat", "")
+            )
+
+            if seat == self.hero_seat:
+                label = "Hero"
+            else:
+                label = (
+                    position_by_seat.get(seat)
+                    or seat
+                )
+
+            evidence_type = row.get(
+                "evidence_type"
+            )
+
+            if (
+                evidence_type
+                == "CARD_DISAPPEARANCE"
+                and row.get("physical_action")
+                == "FOLD"
+            ):
+                lines.append(
+                    f"{label} folds"
+                )
+                continue
+
+            if evidence_type == "QUANTITATIVE":
+                value = row.get(
+                    "resolved_value"
+                )
+
+                lines.append(
+                    f"{label} stack observed at "
+                    f"{value:g} BB"
+                    if isinstance(
+                        value,
+                        (int, float),
+                    )
+                    else
+                    f"{label} stack change observed"
+                )
+                continue
+
+            lines.append(
+                f"{label} physical evidence observed"
+            )
+
+        return "\n".join(lines) + "\n"
 
 
     def reconcile_pending_evidence(
@@ -3144,6 +3429,25 @@ class FrameHandObserver:
                     and not confirmation_owned
                 ):
                     continue
+
+                # Diagnostic only. Expose every seat that crosses
+                # the synchronous quantitative OCR gate so live
+                # latency can be attributed without changing
+                # semantic authority or scheduling.
+                print(
+                    "[QUANTITATIVE_OCR_GATE]",
+                    f"frame={frame_id}",
+                    f"street={self.hand.street}",
+                    f"seat={seat}",
+                    f"next_actor={self.hand.next_actor}",
+                    f"wake={motion.wake}",
+                    f"changed_fraction={motion.changed_fraction:.6f}",
+                    f"mean_diff={motion.mean_diff:.6f}",
+                    f"max_diff={motion.max_diff}",
+                    f"retry_owned={retry_owned}",
+                    f"confirmation_owned={confirmation_owned}",
+                    flush=True,
+                )
 
                 prior = self.trusted_stacks[
                     seat

@@ -177,23 +177,11 @@ def main():
     assert len(admitted_btn) == 1
     assert admitted_btn[0]["frame"] == 13
 
-    # Atomic publication: no externally visible intermediate product
-    # may stop after Hero's raise while BTN's fold was already known.
-    assert len(observer.publications) == 1, (
-        observer.publications
-    )
-
-    publication = observer.publications[0]
-
-    assert publication["next_actor"] == "sb"
-
-    text = publication["text"]
-
-    # Presentation wording is not the semantic contract here.
-    # The authoritative assertions above already prove exact action,
-    # sizing, frontier advancement, retained frame identity, and one
-    # atomic publication. Keep only the stable fold projection check.
-    assert "BTN folds" in text
+    # Direct admission/reconciliation owns semantic mutation only.
+    # Publication belongs exclusively to the outer physical
+    # transaction. This observer-level contract therefore verifies
+    # canonical catch-up and must not publish independently.
+    assert observer.publications == []
 
     print()
     print(

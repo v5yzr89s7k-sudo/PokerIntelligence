@@ -261,22 +261,11 @@ def main():
         == []
     )
 
-    # Atomic publication: no transient product may stop at UTG
-    # or Hero when SB's physical fold was already known.
-    assert len(observer.publications) == 1, (
-        observer.publications
-    )
-
-    publication = observer.publications[0]
-
-    assert publication["next_actor"] == "bb"
-    assert publication["action_count"] == 5
-
-    text = publication["text"]
-
-    assert "UTG folds" in text
-    assert "HJ raises to 2 BB" in text
-    assert "SB folds" in text
+    # Direct admission/reconciliation owns semantic mutation only.
+    # Publication belongs exclusively to the outer physical
+    # transaction. This observer-level contract therefore verifies
+    # canonical catch-up and must not publish independently.
+    assert observer.publications == []
 
     print()
     print(
