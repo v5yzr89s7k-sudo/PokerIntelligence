@@ -3200,11 +3200,7 @@ class FrameHandObserver:
 
                     same_baseline_retry = bool(
                         resolved_same_baseline
-                        and (
-                            hero_completion_retry
-                            or retry_reason == "stack_motion"
-                            or fresh_motion_baseline
-                        )
+                        and hero_completion_retry
                     )
 
                     if same_baseline_retry:
