@@ -110,7 +110,15 @@ def main():
         )
 
         assert first.outcome == "CONTINUE"
-        assert observer.hand.street == "PREFLOP"
+
+        # Physical FLOP evidence must establish chronology immediately,
+        # while card identity remains asynchronous.
+        assert observer.hand.street == "FLOP", (
+            "physical FLOP boundary did not establish "
+            "street authority before board identity"
+        )
+
+        assert observer.hand.board == []
 
         second = live.process_frame_transaction(
             observer,
@@ -122,27 +130,19 @@ def main():
 
         assert second.outcome == "CONTINUE"
 
-        # Frame 11 must not enter stale PREFLOP semantic processing.
-        assert calls == [10], (
-            "post-boundary frame entered stale semantic processing "
-            "before board identity resolved"
-        )
-
-        assert len(
-            state.deferred_semantic_frames
-        ) == 1
-
-        deferred = state.deferred_semantic_frames[0]
-
-        assert deferred["frame_id"] == 11
-        assert deferred["frame_path"] == Path(
-            "/tmp/frame_11.png"
+        assert calls == [
+            10,
+            11,
+        ], (
+            "post-boundary frame did not execute immediately "
+            "under FLOP authority"
         )
 
         print("CAPTURE BLOCKED: NO")
         print("STALE PREFLOP SEMANTICS: NO")
-        print("POST-BOUNDARY FRAME DEFERRED: PASS")
-        print("V0.17 ASYNC BOUNDARY SEMANTIC BARRIER: PASS")
+        print("POST-BOUNDARY FRAME DEFERRED: NO")
+        print("POST-BOUNDARY SEMANTIC STREET: FLOP")
+        print("V0.17 PHYSICAL STREET FAST PATH: PASS")
 
     finally:
         observer.process_frame = original

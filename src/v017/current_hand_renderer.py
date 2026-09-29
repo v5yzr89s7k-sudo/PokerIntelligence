@@ -74,9 +74,8 @@ def _street_header(
 
     if street == "FLOP":
         if len(board) < 3:
-            raise ValueError(
-                "cannot render FLOP without three board cards"
-            )
+            return "FLOP: pending"
+
         return (
             "FLOP: "
             + " ".join(board[:3])
@@ -84,9 +83,8 @@ def _street_header(
 
     if street == "TURN":
         if len(board) < 4:
-            raise ValueError(
-                "cannot render TURN without four board cards"
-            )
+            return "TURN: pending"
+
         return (
             "TURN: "
             + board[3]
@@ -94,9 +92,7 @@ def _street_header(
 
     if street == "RIVER":
         if len(board) < 5:
-            raise ValueError(
-                "cannot render RIVER without five board cards"
-            )
+            return "RIVER: pending"
         return (
             "RIVER: "
             + board[4]

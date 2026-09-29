@@ -2135,9 +2135,20 @@ class FrameHandObserver:
 
         # Stale, duplicate, skipped, and backward physical evidence
         # has no semantic authority.
-        observed_board = list(board)
+        # Physical board count owns street chronology independently
+        # of slow card identity. None means identity is still pending.
+        board_identity_pending = board is None
 
-        if len(observed_board) != expected_count:
+        observed_board = (
+            None
+            if board_identity_pending
+            else list(board)
+        )
+
+        if (
+            observed_board is not None
+            and len(observed_board) != expected_count
+        ):
             raise ValueError(
                 "board identity length does not "
                 "match physical boundary: "

@@ -976,6 +976,72 @@ class HandEngine:
 
         return list(self.hero_cards)
 
+    def observe_board_identity(
+        self,
+        board,
+    ):
+        """
+        Attach validated community-card identity without advancing
+        street chronology.
+
+        Physical board count owns street progression. This primitive
+        owns card identity only and may extend, but never rewrite,
+        canonical board history.
+        """
+        cards = list(board)
+
+        expected_length = {
+            "PREFLOP": 0,
+            "FLOP": 3,
+            "TURN": 4,
+            "RIVER": 5,
+        }.get(self.street)
+
+        if expected_length is None:
+            raise ValueError(
+                f"invalid street for board identity: {self.street}"
+            )
+
+        if len(cards) > expected_length:
+            raise ValueError(
+                "board identity exceeds active street: "
+                f"street={self.street} "
+                f"cards={len(cards)} "
+                f"expected_max={expected_length}"
+            )
+
+        if len(cards) < len(self.board):
+            raise ValueError(
+                "board identity shorter than canonical history: "
+                f"canonical={self.board} "
+                f"observed={cards}"
+            )
+
+        if len(set(cards)) != len(cards):
+            raise ValueError(
+                "board cards must be distinct"
+            )
+
+        if any(
+            card in self.hero_cards
+            for card in cards
+        ):
+            raise ValueError(
+                "board duplicates Hero card"
+            )
+
+        if (
+            self.board
+            and cards[:len(self.board)] != self.board
+        ):
+            raise ValueError(
+                "board history cannot change"
+            )
+
+        self.board = cards
+
+        return list(self.board)
+
     def start_street(
         self,
         street,

@@ -1851,7 +1851,6 @@ class FrameTransactionState:
         self.board_identity_reader = AsyncBoardIdentityReader()
         self.pending_board_boundaries = []
         self.unresolved_board_boundary = None
-        self.deferred_semantic_frames = []
         self.hero_buttons_active = False
         self.hero_completion_pending_frame = None
 
@@ -1932,15 +1931,23 @@ def apply_async_board_identity_result(
     )
 
     if len(board) == expected_count:
-        observer.admit_street_boundary(
-            boundary,
-            action_order=postflop_action_order(
-                observer
-            ),
-            board=board,
-            complete_pending=True,
+        # Physical board count has already established street
+        # chronology. Async completion owns card identity only.
+        observer.hand.observe_board_identity(
+            board
+        )
+
+        print(
+            "[BOARD_IDENTITY_ATTACHED]",
+            f"frame={boundary_frame}",
+            f"type={typ}",
+            f"street={observer.hand.street}",
+            f"cards={board}",
+            flush=True,
         )
     else:
+        # A delayed read may observe a later street. Preserve the
+        # existing sequential catch-up path for that case.
         admit_board_catchup(
             observer,
             frame_id=boundary_frame,
@@ -2000,30 +2007,6 @@ def finalize_async_board_identity_result(
         }
 
     state.unresolved_board_boundary = None
-
-    deferred = list(
-        state.deferred_semantic_frames
-    )
-    state.deferred_semantic_frames.clear()
-
-    for item in deferred:
-        print(
-            "[SEMANTIC_FRAME_REPLAY]",
-            f"frame={item['frame_id']}",
-            f"street={observer.hand.street}",
-            flush=True,
-        )
-
-        process_frame_transaction(
-            observer,
-            item["image"],
-            item["frame_path"],
-            item["frame_id"],
-            state,
-            capture_complete_ns=(
-                item["capture_complete_ns"]
-            ),
-        )
 
     (
         reconciled_cards,
@@ -2157,34 +2140,6 @@ def process_frame_transaction(
             state,
             completed_board,
             publication_frame=frame_id,
-        )
-
-    outstanding_boundary = (
-        state.unresolved_board_boundary is not None
-    )
-
-    if outstanding_boundary:
-        state.deferred_semantic_frames.append(
-            {
-                "image": image.copy(),
-                "frame_path": frame_path,
-                "frame_id": frame_id,
-                "capture_complete_ns":
-                    int(capture_complete_ns),
-            }
-        )
-
-        print(
-            "[SEMANTIC_FRAME_DEFERRED]",
-            f"frame={frame_id}",
-            "reason=board_identity_pending",
-            f"queued={len(state.deferred_semantic_frames)}",
-            flush=True,
-        )
-
-        return FrameTransactionResult(
-            "CONTINUE",
-            (),
         )
 
     result = observer.process_frame(
@@ -2632,6 +2587,27 @@ def process_frame_transaction(
             "RIVER_BOUNDARY_PHYSICAL":
                 5,
         }[typ]
+
+        # Physical board count owns street chronology immediately.
+        # Slow board identity remains asynchronous and supplies only
+        # card values; it no longer owns the street transition.
+        observer.admit_street_boundary(
+            event,
+            action_order=postflop_action_order(
+                observer
+            ),
+            board=None,
+            complete_pending=True,
+        )
+
+        print(
+            "[PHYSICAL_STREET_ADMITTED]",
+            f"frame={frame_id}",
+            f"type={typ}",
+            f"street={observer.hand.street}",
+            "board_identity=pending",
+            flush=True,
+        )
 
         actions_before_board_submit = len(
             observer.hand.actions

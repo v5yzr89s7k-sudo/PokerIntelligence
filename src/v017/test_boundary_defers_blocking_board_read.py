@@ -247,8 +247,11 @@ def main():
         assert new_actions[0]["seat"] == "bb"
         assert new_actions[0]["action"] == "CALL"
 
-        # Action is canonical immediately.
-        assert observer.hand.street == "PREFLOP"
+        # Action is canonical immediately, and physical board
+        # evidence owns street chronology without waiting for the
+        # deliberately blocked identity reader.
+        assert observer.hand.street == "FLOP"
+        assert observer.hand.board == []
 
         # Slow board request still owns the physical boundary.
         assert (
@@ -320,11 +323,11 @@ def main():
         ]
 
         print(
-            "ASYNC BOUNDARY ADMISSION AFTER RESULT: PASS"
+            "ASYNC BOARD IDENTITY ATTACHMENT AFTER RESULT: PASS"
         )
 
         print(
-            "V0.17 ASYNC BOUNDARY DEFERRAL: PASS"
+            "V0.17 ASYNC BOARD FAST PATH: PASS"
         )
 
     finally:
