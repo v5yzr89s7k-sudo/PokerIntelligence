@@ -188,9 +188,22 @@ def hero_cards_visible(frame, geometry):
         ).get("hero", {})
     )
 
-    return cards_visible(
-        frame,
-        hero,
+    if len(hero) < 2:
+        return False
+
+    scores = [
+        card_presence_score(
+            crop(frame, rect)
+        )
+        for rect in hero.values()
+    ]
+
+    return (
+        len(scores) >= 2
+        and sum(
+            score > 0.35
+            for score in scores
+        ) >= 2
     )
 
 

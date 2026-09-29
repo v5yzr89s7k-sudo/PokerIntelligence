@@ -9,7 +9,9 @@ from openai import OpenAI
 
 
 ROOT = Path(__file__).resolve().parents[2]
-GEOMETRY_PATH = ROOT / "config/geometry.json"
+GEOMETRY_PATH = (
+    ROOT / "config/v017/geometry_maximized.json"
+)
 
 # Created once when api_hero_worker starts, then reused for every hand.
 CLIENT = OpenAI(timeout=45.0)
@@ -68,8 +70,6 @@ def _prepare_images(frame):
 
     if image is None:
         raise RuntimeError(f"could not read Hero frame: {frame}")
-
-    image = cv2.resize(image, (934, 696))
 
     with GEOMETRY_PATH.open() as f:
         geometry = json.load(f)
