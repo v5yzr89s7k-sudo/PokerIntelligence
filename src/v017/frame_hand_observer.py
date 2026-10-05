@@ -1791,10 +1791,22 @@ class FrameHandObserver:
 
         observation_frame = observation.get("frame")
 
+        settlement_first_frame = observation.get(
+            "settlement_first_frame"
+        )
+
+        predecessor_settlement_owned = bool(
+            boundary_frame is not None
+            and settlement_first_frame is not None
+            and int(settlement_first_frame)
+            <= int(boundary_frame)
+        )
+
         if (
             boundary_frame is not None
             and observation_frame is not None
             and int(observation_frame) > int(boundary_frame)
+            and not predecessor_settlement_owned
         ):
             print(
                 "[QUANTITATIVE_REJECT]",
@@ -2162,7 +2174,11 @@ class FrameHandObserver:
         retained = {
             "observation": dict(observation),
             "action_order": list(action_order),
-            "board": list(board),
+            "board": (
+                None
+                if board is None
+                else list(board)
+            ),
             "complete_pending": bool(
                 complete_pending
             ),
@@ -2206,8 +2222,10 @@ class FrameHandObserver:
                 existing["action_order"] = list(
                     action_order
                 )
-                existing["board"] = list(
-                    board
+                existing["board"] = (
+                    None
+                    if board is None
+                    else list(board)
                 )
 
                 if (
@@ -2322,8 +2340,10 @@ class FrameHandObserver:
             result = self.admit_street_boundary(
                 observation,
                 action_order=reconciled_order,
-                board=list(
-                    retained["board"]
+                board=(
+                    None
+                    if retained["board"] is None
+                    else list(retained["board"])
                 ),
                 complete_pending=bool(
                     retained["complete_pending"]
@@ -3507,7 +3527,10 @@ class FrameHandObserver:
                         and hero_completion_retry
                     )
 
-                    if same_baseline_retry:
+                    if (
+                        same_baseline_retry
+                        or fresh_motion_baseline
+                    ):
                         if fresh_motion_baseline:
                             retry_state = {
                                 "attempts": 0,

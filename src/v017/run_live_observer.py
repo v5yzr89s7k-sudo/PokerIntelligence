@@ -31,6 +31,7 @@ from src.capture.sck_frame_source import (
 from src.events.detectors.card_presence import (
     count_board_cards,
     hero_cards_visible,
+    hand_participant_presence,
 )
 from src.events.detectors.seat_occupancy_detector import (
     occupied_seats,
@@ -111,6 +112,41 @@ LATENCY_TRACE = Path(
     "runtime/live/v017_action_latency.jsonl"
 )
 
+HISTORY_DIR = Path(
+    "runtime/history"
+)
+
+
+def archive_completed_hand():
+    """
+    Archive the exact final live product.
+    """
+    text = CURRENT_HAND.read_text()
+
+    HISTORY_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    timestamp = time.strftime(
+        "%Y%m%d_%H%M%S"
+    )
+
+    destination = (
+        HISTORY_DIR
+        / f"hand_{timestamp}.txt"
+    )
+
+    destination.write_text(text)
+
+    print(
+        "[ARCHIVE]",
+        destination,
+        flush=True,
+    )
+
+    return destination
+
 
 def write_latency_trace(record):
     """
@@ -151,6 +187,11 @@ SCK_SOURCE = Path(
 
 SCK_BINARY = Path(
     "runtime/bin/poker_intelligence_sck_sampler"
+)
+
+SCK_HELPER_BINARY = Path(
+    "runtime/bin/PokerIntelligenceCapture.app/"
+    "Contents/MacOS/PokerIntelligenceCapture"
 )
 
 SCK_SOCKET = Path(
@@ -500,9 +541,52 @@ def build_sck_sampler():
         )
 
 
+
 def start_sck_capture():
     global _SCK_PROCESS
     global _SCK_FRAME_SOURCE
+
+    if _SCK_FRAME_SOURCE is not None:
+        return
+
+    external_capture = (
+        os.environ.get("POKER_SCK_EXTERNAL")
+        == "1"
+    )
+
+    if external_capture:
+        # ScreenCaptureKit is owned by the native application host.
+        # Python owns only the existing socket consumer.
+        deadline = time.monotonic() + 10.0
+
+        while time.monotonic() < deadline:
+            if SCK_SOCKET.exists():
+                break
+
+            time.sleep(0.05)
+        else:
+            raise RuntimeError(
+                "timed out waiting for external "
+                "ScreenCaptureKit socket"
+            )
+
+        _SCK_FRAME_SOURCE = SCKFrameSource(
+            socket_path=str(SCK_SOCKET),
+            width=NATIVE_FRAME_SIZE[0],
+            height=NATIVE_FRAME_SIZE[1],
+        )
+
+        _SCK_FRAME_SOURCE.connect()
+
+        print(
+            "[SCK_CAPTURE]",
+            "external native source connected",
+            f"size={NATIVE_FRAME_SIZE[0]}x"
+            f"{NATIVE_FRAME_SIZE[1]}",
+            flush=True,
+        )
+
+        return
 
     if _SCK_PROCESS is not None:
         return
@@ -523,10 +607,35 @@ def start_sck_capture():
         NATIVE_FRAME_SIZE[1]
     )
 
+    sck_log_path = Path(
+        "/tmp/poker_intelligence_sck_child.log"
+    )
+
+    sck_log = open(
+        sck_log_path,
+        "w",
+        encoding="utf-8",
+    )
+
+    sampler_binary = SCK_BINARY
+
+    if (
+        os.environ.get("POKER_STANDALONE_APP")
+        == "1"
+    ):
+        if not SCK_HELPER_BINARY.exists():
+            raise RuntimeError(
+                "authorized ScreenCaptureKit helper missing"
+            )
+
+        sampler_binary = SCK_HELPER_BINARY
+
     _SCK_PROCESS = subprocess.Popen(
-        [str(SCK_BINARY)],
+        [str(sampler_binary)],
         cwd=ROOT,
         env=environment,
+        stdout=sck_log,
+        stderr=subprocess.STDOUT,
         start_new_session=True,
     )
 
@@ -589,6 +698,13 @@ def stop_sck_capture():
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+
+    # An external native host owns the socket lifecycle.
+    if (
+        os.environ.get("POKER_SCK_EXTERNAL")
+        == "1"
+    ):
+        return
 
     try:
         SCK_SOCKET.unlink()
@@ -904,6 +1020,42 @@ def wait_for_hand(
                     f"streak={participant_freeze.streak}",
                     flush=True,
                 )
+
+            # Acquisition-frame dealt cards are direct physical
+            # participation evidence. Stack OCR may miss an occupied
+            # seat, but a visible opponent card back proves that seat
+            # was dealt into this hand.
+            card_presence = hand_participant_presence(
+                image,
+                GEOMETRY,
+                hero_is_dealt=True,
+            )
+
+            card_participants = {
+                seat
+                for seat, evidence
+                in card_presence.items()
+                if evidence.get("dealt_in")
+            }
+
+            merged_participants = (
+                set(frozen)
+                | card_participants
+            )
+
+            frozen = tuple(
+                seat
+                for seat in SEAT_ORDER
+                if seat in merged_participants
+            )
+
+            print(
+                "[ACQUISITION_PARTICIPANTS]",
+                f"stack_frozen={tuple(participant_freeze.participants or ())}",
+                f"cards={tuple(seat for seat in SEAT_ORDER if seat in card_participants)}",
+                f"final={frozen}",
+                flush=True,
+            )
 
             print(
                 "[HERO_ACQUISITION]",
@@ -2468,10 +2620,17 @@ def process_frame_transaction(
                 # Preserve the original physical observation as
                 # semantic input. The gate authorizes it; it does
                 # not rewrite its OCR metadata.
+                semantic_event = dict(event)
+
+                if first_seen_frame is not None:
+                    semantic_event[
+                        "settlement_first_frame"
+                    ] = first_seen_frame
+
                 admitted = (
                     observer
                     .admit_quantitative_observation(
-                        event
+                        semantic_event
                     )
                 )
 
@@ -2587,16 +2746,37 @@ def process_frame_transaction(
                 5,
         }[typ]
 
-        # Physical board count owns street chronology immediately.
-        # Slow board identity remains asynchronous and supplies only
-        # card values; it no longer owns the street transition.
+        # A newly observed quantitative transition requires an
+        # independent later-frame confirmation.  The physical board
+        # boundary must survive, but may not overtake that unresolved
+        # predecessor-street quantitative ownership.
+        quantitative_pending = bool(
+            state.settlement_gate.pending
+        )
+
+        if quantitative_pending:
+            print(
+                "[BOUNDARY_WAITING_FOR_QUANTITATIVE_SETTLEMENT]",
+                f"frame={frame_id}",
+                f"type={typ}",
+                "pending="
+                f"{tuple(state.settlement_gate.pending)}",
+                flush=True,
+            )
+
+        # Without unresolved quantitative ownership, physical board
+        # count may close otherwise-unresolved prior-street actors.
+        # With ownership pending, retain the boundary and let normal
+        # quantitative -> boundary reconciliation preserve chronology.
         observer.admit_street_boundary(
             event,
             action_order=postflop_action_order(
                 observer
             ),
             board=None,
-            complete_pending=True,
+            complete_pending=(
+                not quantitative_pending
+            ),
         )
 
         print(
@@ -3159,18 +3339,37 @@ def main():
         flush=True,
     )
 
-    window = find_acr_table_window()
-
-    if window is None:
-        raise RuntimeError(
-            "ACR table window not found"
+    standalone_mode = (
+        os.environ.get(
+            "POKER_STANDALONE_APP"
         )
-
-    print(
-        "[WINDOW]",
-        window.title,
-        flush=True,
+        == "1"
     )
+
+    if standalone_mode:
+        # The packaged Finder app must not depend on System Events /
+        # AppleScript window discovery. ScreenCaptureKit owns native
+        # ACR table discovery in standalone mode.
+        window = None
+
+        print(
+            "[WINDOW]",
+            "standalone_sck_discovery",
+            flush=True,
+        )
+    else:
+        window = find_acr_table_window()
+
+        if window is None:
+            raise RuntimeError(
+                "ACR table window not found"
+            )
+
+        print(
+            "[WINDOW]",
+            window.title,
+            flush=True,
+        )
 
     start_sck_capture()
 
@@ -3203,6 +3402,8 @@ def main():
             window,
             observer,
         )
+
+        archive_completed_hand()
 
         print(
             "[NEXT_HAND] waiting...",
