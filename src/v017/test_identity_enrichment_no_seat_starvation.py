@@ -27,14 +27,21 @@ class Observer:
         self.hand = Hand()
 
 
+CALLS = []
+
+
 def reader(frame, dealt_in_seats):
+    seats = tuple(dealt_in_seats)
+    CALLS.append(seats)
+
     # Deliberately resolve nobody.
     return {
         "players": [
             {
-                "seat": dealt_in_seats[0],
+                "seat": seat,
                 "name": "",
             }
+            for seat in seats
         ]
     }
 
@@ -58,45 +65,77 @@ def main():
 
     enricher = TemporalIdentityEnricher(
         reader=reader,
-        retry_frames=1,
+        retry_frames=8,
     )
 
-    frame = Path("/tmp/identity_fairness.png")
+    frame = Path(
+        "/tmp/identity_fairness.png"
+    )
+
+    expected = (
+        "seat_top",
+        "seat_mid_right",
+        "seat_lower_right",
+    )
 
     try:
-        attempted = []
-
-        for frame_id in (1, 2, 3):
-            assert enricher.submit_if_needed(
-                observer,
-                frame,
-                frame_id,
-            )
-
-            attempted.append(
-                enricher.seat
-            )
-
-            result = collect(enricher)
-
-            assert result["name"] == ""
-
-        print("attempted =", attempted)
-
-        assert attempted == [
-            "seat_top",
-            "seat_mid_right",
-            "seat_lower_right",
-        ], (
-            "identity scheduler did not provide "
-            "deterministic round-robin fairness"
+        # All unresolved seats receive the same fresh-frame
+        # opportunity. No early unresolved seat can starve another.
+        assert enricher.submit_if_needed(
+            observer,
+            frame,
+            1,
         )
+
+        result = collect(enricher)
+
+        assert CALLS == [expected]
+
+        players = result.get("players") or []
+
+        assert tuple(
+            row["seat"]
+            for row in players
+        ) == expected
+
+        assert all(
+            row["name"] == ""
+            for row in players
+        )
+
+        # Cooldown applies independently to every seat in the batch.
+        assert not enricher.submit_if_needed(
+            observer,
+            frame,
+            2,
+        )
+
+        assert not enricher.submit_if_needed(
+            observer,
+            frame,
+            8,
+        )
+
+        # At frame 9 all remain unresolved and become eligible
+        # together again.
+        assert enricher.submit_if_needed(
+            observer,
+            frame,
+            9,
+        )
+
+        collect(enricher)
+
+        assert CALLS == [
+            expected,
+            expected,
+        ]
 
         print(
             "FAILED SEAT BLOCKS LATER SEATS: NO"
         )
         print(
-            "IDENTITY ROUND-ROBIN PROGRESS: PASS"
+            "IDENTITY SAME-FRAME BATCH FAIRNESS: PASS"
         )
         print(
             "V0.17 IDENTITY NO-SEAT-STARVATION: PASS"

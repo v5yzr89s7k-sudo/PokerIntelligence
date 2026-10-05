@@ -272,6 +272,10 @@ class TemporalIdentityEnricher:
     """
     One-worker asynchronous fresh-frame opponent identity recovery.
 
+    One worker job owns all currently eligible unresolved opponents
+    from the same physical frame. The underlying identity reader
+    performs its per-seat API reads in parallel.
+
     The worker owns external identity acquisition only. It never
     mutates HandEngine and never publishes. Canonical application is
     performed by the live acquisition thread.
@@ -295,14 +299,9 @@ class TemporalIdentityEnricher:
             max_workers=1
         )
         self.future = None
-        self.seat = None
+        self.seats = ()
         self.submitted_frame = None
         self.next_retry_frame = {}
-
-        # Fair scheduling cursor for unresolved identities.
-        # A repeatedly unresolved early seat must never starve later
-        # unresolved seats.
-        self.last_submitted_seat = None
 
     def unresolved_seats(
         self,
@@ -328,45 +327,57 @@ class TemporalIdentityEnricher:
             return None
 
         future = self.future
-        seat = self.seat
+        seats = tuple(self.seats)
         submitted_frame = self.submitted_frame
 
         self.future = None
-        self.seat = None
+        self.seats = ()
         self.submitted_frame = None
 
         try:
             result = future.result()
         except Exception as exc:
+            error = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
             return {
-                "seat": seat,
-                "name": "",
+                "players": [
+                    {
+                        "seat": seat,
+                        "name": "",
+                        "error": error,
+                    }
+                    for seat in seats
+                ],
                 "submitted_frame": submitted_frame,
-                "error": (
-                    f"{type(exc).__name__}: {exc}"
-                ),
             }
 
-        name = ""
-
-        for player in (
-            result.get("players")
-            or []
-        ):
-            if player.get("seat") != seat:
-                continue
-
-            name = str(
+        returned = {
+            str(player.get("seat")): str(
                 player.get("name")
                 or ""
             ).strip()
-            break
+            for player in (
+                result.get("players")
+                or []
+            )
+            if player.get("seat") in seats
+        }
 
         return {
-            "seat": seat,
-            "name": name,
+            "players": [
+                {
+                    "seat": seat,
+                    "name": returned.get(
+                        seat,
+                        "",
+                    ),
+                    "error": None,
+                }
+                for seat in seats
+            ],
             "submitted_frame": submitted_frame,
-            "error": None,
         }
 
     def submit_if_needed(
@@ -396,57 +407,37 @@ class TemporalIdentityEnricher:
         if not eligible:
             return False
 
-        # Preserve observer seat order, but continue after the most
-        # recently submitted seat. This provides deterministic
-        # round-robin fairness while retaining retry cooldowns.
-        seat = eligible[0]
+        # All eligible unresolved identities are sampled from the
+        # same immutable physical frame. This preserves temporal
+        # coherence and lets the reader use its existing per-seat
+        # parallel request path.
+        seats = tuple(eligible)
 
-        if self.last_submitted_seat in unresolved:
-            start = (
-                unresolved.index(
-                    self.last_submitted_seat
-                )
-                + 1
-            )
-
-            rotated = (
-                unresolved[start:]
-                + unresolved[:start]
-            )
-
-            for candidate in rotated:
-                if candidate in eligible:
-                    seat = candidate
-                    break
-
-        self.last_submitted_seat = seat
-
-        # Materialization occurs on the acquisition thread before
-        # submission. The expensive external identity read itself
-        # remains entirely off the semantic transaction path.
         frame_path = require_frame_path(
             frame_reference
         )
 
-        self.seat = seat
+        self.seats = seats
         self.submitted_frame = int(
             frame_id
         )
-        self.next_retry_frame[seat] = (
-            int(frame_id)
-            + self.retry_frames
-        )
+
+        for seat in seats:
+            self.next_retry_frame[seat] = (
+                int(frame_id)
+                + self.retry_frames
+            )
 
         self.future = self.executor.submit(
             self.reader,
             frame_path,
-            dealt_in_seats=[seat],
+            dealt_in_seats=list(seats),
         )
 
         print(
             "[IDENTITY_ENRICHMENT_SUBMITTED]",
             f"frame={frame_id}",
-            f"seat={seat}",
+            f"seats={seats}",
             flush=True,
         )
 
@@ -471,7 +462,7 @@ class TemporalIdentityEnricher:
         )
 
         self.future = None
-        self.seat = None
+        self.seats = ()
         self.submitted_frame = None
 
 
@@ -3252,49 +3243,64 @@ def run_hand(
             )
 
             if identity_result is not None:
-                seat = identity_result["seat"]
-                name = identity_result["name"]
-                error = identity_result["error"]
+                identity_changed = False
 
-                if error:
-                    print(
-                        "[IDENTITY_ENRICHMENT_FAILED]",
-                        f"frame={frame_id}",
-                        f"seat={seat}",
-                        f"error={error}",
-                        flush=True,
-                    )
-                elif name:
-                    changed = (
-                        observer.hand
-                        .enrich_player_identity(
-                            seat,
-                            name,
-                        )
-                    )
+                for identity_player in (
+                    identity_result.get("players")
+                    or []
+                ):
+                    seat = identity_player["seat"]
+                    name = identity_player["name"]
+                    error = identity_player["error"]
 
-                    if changed:
-                        observer.publish_authoritative_state(
-                            frame_id
-                        )
-                        publish_new(
-                            observer,
-                            len(observer.publications) - 1,
-                        )
-
+                    if error:
                         print(
-                            "[IDENTITY_ENRICHMENT_APPLIED]",
+                            "[IDENTITY_ENRICHMENT_FAILED]",
                             f"frame={frame_id}",
                             f"seat={seat}",
-                            f"name={name!r}",
+                            f"error={error}",
                             flush=True,
                         )
-                else:
-                    print(
-                        "[IDENTITY_ENRICHMENT_UNRESOLVED]",
-                        f"frame={frame_id}",
-                        f"seat={seat}",
-                        flush=True,
+                    elif name:
+                        changed = (
+                            observer.hand
+                            .enrich_player_identity(
+                                seat,
+                                name,
+                            )
+                        )
+
+                        identity_changed = bool(
+                            identity_changed
+                            or changed
+                        )
+
+                        if changed:
+                            print(
+                                "[IDENTITY_ENRICHMENT_APPLIED]",
+                                f"frame={frame_id}",
+                                f"seat={seat}",
+                                f"name={name!r}",
+                                flush=True,
+                            )
+                    else:
+                        print(
+                            "[IDENTITY_ENRICHMENT_UNRESOLVED]",
+                            f"frame={frame_id}",
+                            f"seat={seat}",
+                            flush=True,
+                        )
+
+                # Publish the complete same-frame identity batch
+                # atomically rather than one intermediate roster per
+                # resolved opponent.
+                if identity_changed:
+                    observer.publish_authoritative_state(
+                        frame_id
+                    )
+                    publish_new(
+                        observer,
+                        len(observer.publications) - 1,
                     )
 
             identity_enricher.submit_if_needed(

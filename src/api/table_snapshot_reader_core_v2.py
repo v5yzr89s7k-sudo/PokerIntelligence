@@ -975,22 +975,13 @@ def read_player_identities_v2(
                 continue
 
         else:
-            identity, _ = (
-                IDENTITY_MANAGER.cache_lookup(
-                    cache=cache_snapshot,
-                    seat=seat,
-                    fingerprint=fingerprint,
-                    lookup_fn=cache_lookup,
-                )
+            # Opponent identity must come from the current physical
+            # frame. Seat-local persistent cache fingerprints are not
+            # sufficiently discriminative to authorize name reuse
+            # across hands/tables.
+            identity = IDENTITY_MANAGER.unresolved(
+                seat=seat,
             )
-
-            if identity.resolved:
-                players_by_seat[seat] = {
-                    "seat": seat,
-                    "name": identity.name,
-                    "is_hero": False,
-                }
-                continue
 
         missing.append(card)
 

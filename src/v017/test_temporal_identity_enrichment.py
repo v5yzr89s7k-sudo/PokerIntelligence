@@ -3,16 +3,17 @@ Temporal identity enrichment integration contract.
 
 Proves:
   * unresolved opponents only;
-  * one in-flight request maximum;
+  * one in-flight batch maximum;
   * fresh submitted frame ownership;
   * worker never mutates HandEngine;
   * result is data-only;
   * retry spacing is deterministic;
-  * same verified result is applied canonically by caller;
+  * verified results are applied canonically by caller;
   * close is nonblocking.
 """
 
 import time
+from pathlib import Path
 
 from src.v017.hand_engine import HandEngine
 from src.v017.run_live_observer import (
@@ -72,12 +73,32 @@ def reader(
     }
 
 
+def collect(enricher):
+    deadline = time.monotonic() + 2.0
+
+    while time.monotonic() < deadline:
+        result = enricher.collect_ready()
+
+        if result is not None:
+            return result
+
+        time.sleep(0.01)
+
+    raise AssertionError(
+        "identity worker did not complete"
+    )
+
+
 def main():
     observer = Observer()
 
     enricher = TemporalIdentityEnricher(
         reader=reader,
         retry_frames=8,
+    )
+
+    frame = Path(
+        "/tmp/fresh_frame.png"
     )
 
     try:
@@ -87,46 +108,37 @@ def main():
             "seat_upper_left"
         ]
 
-        # Plain Path is already a valid fresh-frame reference.
-        from pathlib import Path
-        frame = Path(
-            "/tmp/fresh_frame.png"
-        )
-
         assert enricher.submit_if_needed(
             observer,
             frame,
             10,
         )
 
-        # Exactly one in-flight request.
+        # Exactly one in-flight batch.
         assert not enricher.submit_if_needed(
             observer,
             frame,
             11,
         )
 
-        deadline = time.monotonic() + 2.0
-        result = None
+        result = collect(enricher)
 
-        while time.monotonic() < deadline:
-            result = enricher.collect_ready()
+        players = result.get("players") or []
 
-            if result is not None:
-                break
+        assert len(players) == 1
 
-            time.sleep(0.01)
+        player = players[0]
 
-        assert result is not None
-        assert result["seat"] == (
+        assert player["seat"] == (
             "seat_upper_left"
         )
-        assert result["name"] == (
+        assert player["name"] == (
             "VerifiedOpponent"
         )
-        assert result["error"] is None
+        assert player["error"] is None
+        assert result["submitted_frame"] == 10
 
-        # Worker returned data only. Canonical model is unchanged.
+        # Worker returned data only.
         assert (
             observer.hand
             .players["seat_upper_left"]
@@ -136,8 +148,8 @@ def main():
 
         # Caller/acquisition thread owns canonical application.
         assert observer.hand.enrich_player_identity(
-            result["seat"],
-            result["name"],
+            player["seat"],
+            player["name"],
         )
 
         assert (
@@ -147,7 +159,6 @@ def main():
             == "VerifiedOpponent"
         )
 
-        # Resolved seat is no longer queried.
         assert enricher.unresolved_seats(
             observer
         ) == []
@@ -166,7 +177,8 @@ def main():
         assert elapsed < 0.5
 
     print(
-        "TEMPORAL IDENTITY ENRICHMENT CONTRACT: PASS"
+        "TEMPORAL IDENTITY ENRICHMENT "
+        "BATCH CONTRACT: PASS"
     )
 
 
