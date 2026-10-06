@@ -73,7 +73,8 @@ Read the visible player name from this single ACR physical-seat crop.
 Return RAW JSON ONLY:
 
 {
-  "name": ""
+  "name": "",
+  "sitting_out": false
 }
 
 Rules:
@@ -84,7 +85,10 @@ Rules:
 - Ignore stack text, chip counts, bets, buttons, dealer markers, board cards,
   hole cards, and all other table information.
 - Ignore transient action text such as CHECK, FOLD, CALL, BET, RAISE,
-  ALL IN, POST SB, POST BB, ANTE, MUCK, SHOW, SITTING OUT, and SIT OUT.
+  ALL IN, POST SB, POST BB, ANTE, MUCK, and SHOW.
+- If the nameplate visibly says SITTING OUT or SIT OUT, return
+  "sitting_out": true and keep "name": "".
+- Otherwise return "sitting_out": false.
 - Never use transient action text as a player name.
 - Use an empty string when the name cannot be read confidently.
 - Do not infer hidden or partially obscured text.
@@ -328,9 +332,14 @@ def _request_cards_api(cards, dealer):
         data.get("name")
     )
 
+    sitting_out = bool(
+        data.get("sitting_out")
+    )
+
     player = {
         "seat": seat,
         "name": name,
+        "sitting_out": sitting_out,
         "stack_text": "",
         "stack_bb": None,
         "is_hero": seat == "hero",
@@ -688,6 +697,13 @@ def retry_unresolved_opponent_names(
                 break
 
         if recovered is None:
+            print(
+                "[SNAPSHOT_NAME_RETRY_UNRESOLVED] "
+                f"seat={seat} "
+                f"players={result.get('players')!r} "
+                f"api_ms={result.get('api_ms')!r}",
+                flush=True,
+            )
             still_blank.append(seat)
             continue
 
@@ -1000,13 +1016,21 @@ def read_player_identities_v2(
                 player.get("name")
             )
 
+            sitting_out = bool(
+                player.get("sitting_out")
+            )
+
             if (
                 seat
-                and name
+                and (
+                    name
+                    or sitting_out
+                )
             ):
                 players_by_seat[seat] = {
                     "seat": seat,
                     "name": name,
+                    "sitting_out": sitting_out,
                     "is_hero": (
                         seat == "hero"
                     ),
@@ -1020,6 +1044,10 @@ def read_player_identities_v2(
                     card["seat"],
                     {}
                 ).get("name")
+                or players_by_seat.get(
+                    card["seat"],
+                    {}
+                ).get("sitting_out")
             )
             and card["seat"] != "hero"
         ]
@@ -1037,6 +1065,7 @@ def read_player_identities_v2(
                     {
                         "seat": card["seat"],
                         "name": "",
+                        "sitting_out": False,
                         "is_hero": False,
                     },
                 )
@@ -1071,6 +1100,7 @@ def read_player_identities_v2(
             {
                 "seat": seat,
                 "name": "",
+                "sitting_out": False,
                 "is_hero": seat == "hero",
             },
         )
@@ -1079,6 +1109,9 @@ def read_player_identities_v2(
             "seat": seat,
             "name": _normalize_name(
                 player.get("name")
+            ),
+            "sitting_out": bool(
+                player.get("sitting_out")
             ),
             "is_hero": seat == "hero",
         })

@@ -61,6 +61,7 @@ def main():
     observer = FrameHandObserver(
         players=players,
         action_order=[
+            "btn",
             "bb",
         ],
         small_blind_seat="sb",
@@ -83,14 +84,21 @@ def main():
         hand_id="terminal-physical-baseline",
     )
 
-    # BB is deliberately the sole actionable seat.
-    #
-    # HandEngine has already posted its 1 BB blind, so a confirmed
-    # additional 0.12 BB physical decrease reaches commitment
-    # preflight directly and must be terminally rejected as
-    # below_current_price rather than retained behind predecessors.
+    # BTN first establishes a 3 BB authoritative price.
+    assert observer.hand.next_actor == "btn"
+
+    raised = observer.admit_quantitative_observation(
+        observation(
+            9,
+            "btn",
+            50.0,
+            47.0,
+        )
+    )
+
+    assert raised
+    assert observer.hand.current_price_bb == 3.0
     assert observer.hand.next_actor == "bb"
-    assert observer.hand.current_price_bb == 1.0
     assert (
         observer.hand.players["bb"].street_commitment_bb
         == 1.0
@@ -100,11 +108,10 @@ def main():
         observer.hand.semantic_actions()
     )
 
-    # BB has already posted 1 BB semantically. A small additional
-    # confirmed physical decrease cannot satisfy the current 1 BB
-    # price and is therefore terminally rejected as a betting action.
-    #
-    # It nevertheless proves the visible physical stack is now 59.88.
+    # BB already owns 1 BB. A further 0.12 BB physical decrease
+    # reaches only 1.12 BB total, below the authoritative 3 BB price.
+    # It must therefore be rejected semantically while still becoming
+    # the newest generic physical stack baseline.
     emitted = observer.admit_quantitative_observation(
         observation(
             10,

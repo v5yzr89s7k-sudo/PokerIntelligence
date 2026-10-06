@@ -52,7 +52,21 @@ def main():
     # canonical Hero sensor is visible.
     assert "clear_confirmed=False" in wait
     assert "[HERO_ACQUISITION]" in wait
-    assert "return image, path" in wait
+    # Acquisition returns the exact Hero-visible frame together
+    # with participant and starting-stack authority owned by that
+    # acquisition boundary.
+    assert "image," in wait
+    assert "path," in wait
+    assert "tuple(frozen)," in wait
+    assert "participant_freeze.trusted_stacks" in wait
+
+    # Bootstrap must consume and forward that same acquisition-owned
+    # participant/stack authority rather than reconstructing it from
+    # a later frame.
+    assert "frozen_participants," in bootstrap
+    assert "frozen_stack_authority," in bootstrap
+    assert "frozen_participants=" in bootstrap
+    assert "frozen_stack_authority=" in bootstrap
 
     # Bootstrap forwards the lifecycle ownership fact.
     assert "clear_confirmed=False" in bootstrap

@@ -77,17 +77,28 @@ def main():
         complete_pending=True,
     )
 
-    assert emitted == ()
-    assert observer.hand.street == "PREFLOP"
-    assert observer.hand.next_actor == "utg"
-    assert (
+    assert emitted
+    assert observer.hand.street == "FLOP"
+    assert not observer.pending_street_boundaries
+
+    after_actions = list(
         observer.hand.semantic_actions()
-        == before_actions
     )
-    assert observer.events == before_events
+
+    added = after_actions[len(before_actions):]
+
+    assert not any(
+        row.get("action") in {"CALL", "FOLD"}
+        for row in added
+    ), (
+        "physical boundary guessed CALL/FOLD"
+    )
 
     print(
-        "V0.17 BLOCKED STREET BOUNDARY: PASS"
+        "PRICED ACTOR CLOSED AS UNKNOWN: PASS"
+    )
+    print(
+        "V0.17 AUTHORITATIVE STREET BOUNDARY: PASS"
     )
 
 

@@ -1084,6 +1084,13 @@ class FrameHandObserver:
             self.hand
         )
 
+        # Authoritative terminal state owns presentation completely.
+        # Retained physical evidence may remain internally for
+        # diagnostics/reconciliation, but it must never append a
+        # contradictory pending section to a completed canonical hand.
+        if self.hand.hand_complete:
+            return text
+
         state = (
             self.resolve_physical_evidence_timeline()
         )
@@ -2079,6 +2086,40 @@ class FrameHandObserver:
                 flush=True,
             )
 
+            retry_state = (
+                self.quantitative_retry_pending.get(seat)
+            )
+
+            hero_completion_owned = bool(
+                seat == self.hero_seat
+                and retry_state is not None
+                and retry_state.get("reason")
+                == "hero_action_completion"
+            )
+
+            if hero_completion_owned:
+                # Hero completion proves that an action occurred and
+                # owns a bounded follow-up measurement opportunity.
+                # A below-price intermediate reading may therefore be
+                # only part of the resulting commitment. Preserve the
+                # older physical baseline so the completed movement
+                # remains measurable cumulatively.
+                print(
+                    "[PHYSICAL_STACK_BASELINE_RETAINED]",
+                    f"frame={observation.get('frame')}",
+                    f"seat={seat}",
+                    f"prior={prior}",
+                    f"value={value}",
+                    "reason=hero_completion_below_current_price",
+                    flush=True,
+                )
+
+                return tuple(emitted)
+
+            # Without Hero-completion ownership this is a terminally
+            # rejected quantitative observation. It has no betting
+            # authority, but it does establish the newest confirmed
+            # physical stack baseline.
             self._advance_physical_stack_baseline(
                 seat,
                 value,
@@ -2278,6 +2319,46 @@ class FrameHandObserver:
         )
 
 
+    def retire_quantitative_evidence_before_boundary(
+        self,
+        boundary_frame,
+    ):
+        """
+        Retire retained quantitative evidence belonging exclusively
+        to a predecessor street after that street boundary has
+        successfully crossed.
+        """
+        boundary_frame = int(boundary_frame)
+
+        kept = []
+        retired = []
+
+        for observation in self.pending_quantitative_evidence:
+            frame = observation.get("frame")
+
+            if frame is None:
+                kept.append(observation)
+                continue
+
+            if int(frame) <= boundary_frame:
+                retired.append(observation)
+
+                print(
+                    "[PRIOR_STREET_QUANTITATIVE_RETIRED]",
+                    f"frame={frame}",
+                    f"seat={observation.get('seat')}",
+                    f"boundary_frame={boundary_frame}",
+                    flush=True,
+                )
+                continue
+
+            kept.append(observation)
+
+        self.pending_quantitative_evidence = kept
+
+        return tuple(retired)
+
+
     def reconcile_pending_street_boundaries(
         self,
     ):
@@ -2352,6 +2433,10 @@ class FrameHandObserver:
 
             if result:
                 emitted.extend(result)
+
+                self.retire_quantitative_evidence_before_boundary(
+                    observation.get("frame")
+                )
 
                 print(
                     "[STREET_BOUNDARY_RECONCILED]",

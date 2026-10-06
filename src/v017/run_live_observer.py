@@ -90,6 +90,10 @@ from src.v017.frame_hand_observer import (
 from src.v017.live_product_sink import (
     publish_current_hand_text,
 )
+from src.v017.live_publication_recorder import (
+    record_publication,
+    reset_publication_progression,
+)
 
 
 ROOT = Path(".")
@@ -302,6 +306,7 @@ class TemporalIdentityEnricher:
         self.seats = ()
         self.submitted_frame = None
         self.next_retry_frame = {}
+        self.terminal_identity_seats = set()
 
     def unresolved_seats(
         self,
@@ -312,10 +317,35 @@ class TemporalIdentityEnricher:
             for seat, player
             in observer.hand.players.items()
             if seat != observer.hero_seat
+            and seat not in self.terminal_identity_seats
             and not str(
                 player.name or ""
             ).strip()
         ]
+
+    def mark_terminal_identity_seat(
+        self,
+        seat,
+        *,
+        reason,
+    ):
+        seat = str(seat)
+
+        self.terminal_identity_seats.add(
+            seat
+        )
+
+        self.next_retry_frame.pop(
+            seat,
+            None,
+        )
+
+        print(
+            "[IDENTITY_ENRICHMENT_TERMINAL]",
+            f"seat={seat}",
+            f"reason={reason}",
+            flush=True,
+        )
 
     def collect_ready(
         self,
@@ -354,10 +384,15 @@ class TemporalIdentityEnricher:
             }
 
         returned = {
-            str(player.get("seat")): str(
-                player.get("name")
-                or ""
-            ).strip()
+            str(player.get("seat")): {
+                "name": str(
+                    player.get("name")
+                    or ""
+                ).strip(),
+                "sitting_out": bool(
+                    player.get("sitting_out")
+                ),
+            }
             for player in (
                 result.get("players")
                 or []
@@ -369,9 +404,18 @@ class TemporalIdentityEnricher:
             "players": [
                 {
                     "seat": seat,
-                    "name": returned.get(
-                        seat,
+                    "name": (
+                        returned.get(seat)
+                        or {}
+                    ).get(
+                        "name",
                         "",
+                    ),
+                    "sitting_out": bool(
+                        (
+                            returned.get(seat)
+                            or {}
+                        ).get("sitting_out")
                     ),
                     "error": None,
                 }
@@ -1510,6 +1554,24 @@ def publish_new(
 
         sink_complete_ns = time.perf_counter_ns()
 
+        # Diagnostic-only mirror of the exact authoritative product
+        # that already crossed the current_hand.txt sink.
+        #
+        # Recorder failure must never acquire publication, semantic,
+        # scheduling, or observer-liveness authority.
+        try:
+            record_publication(
+                publication,
+                sink_complete_ns,
+            )
+        except Exception as exc:
+            print(
+                "[PUBLICATION_RECORDER_FAILED]",
+                f"frame={publication.get('frame')}",
+                f"error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
         completed.append(
             {
                 "publication": publication,
@@ -1961,6 +2023,171 @@ def retain_frame_card_disappearances(
     return tuple(retained)
 
 
+def retire_orphan_settlement_candidates(
+    observer,
+    state,
+    *,
+    current_frame,
+):
+    """
+    Retire StackSettlementGate candidates that can no longer receive
+    physical confirmation while an objective next-street boundary is
+    retained.
+
+    A candidate remains authoritative while either observer-level
+    confirmation or retry ownership exists. Once both bounded physical
+    owners are gone, retaining the gate candidate would deadlock the
+    prior semantic street forever.
+    """
+
+    if not observer.pending_street_boundaries:
+        return ()
+
+    boundary_frames = [
+        (
+            row.get("observation")
+            or {}
+        ).get("frame")
+        for row in observer.pending_street_boundaries
+    ]
+
+    boundary_frames = [
+        int(frame)
+        for frame in boundary_frames
+        if frame is not None
+    ]
+
+    if not boundary_frames:
+        return ()
+
+    earliest_boundary_frame = min(
+        boundary_frames
+    )
+
+    retired = []
+
+    for seat, candidate in list(
+        state.settlement_gate.pending.items()
+    ):
+        first_frame = candidate.first_frame
+
+        if first_frame is None:
+            continue
+
+        try:
+            predecessor_owned = (
+                int(first_frame)
+                <= earliest_boundary_frame
+            )
+        except (TypeError, ValueError):
+            continue
+
+        if not predecessor_owned:
+            continue
+
+        # A newly armed candidate must survive its source frame.
+        # StackSettlementGate requires an independent later physical
+        # frame for temporal confirmation, so same-frame retirement
+        # would destroy legitimate settlement ownership.
+        first_seen_frame = (
+            state.quantitative_first_seen_frame.get(
+                str(seat)
+            )
+        )
+
+        if first_seen_frame is None:
+            continue
+
+        try:
+            later_frame_opportunity = (
+                int(current_frame)
+                > int(first_seen_frame)
+            )
+        except (TypeError, ValueError):
+            continue
+
+        if not later_frame_opportunity:
+            continue
+
+        if (
+            seat
+            in observer.quantitative_confirmation_pending
+        ):
+            continue
+
+        if (
+            seat
+            in observer.quantitative_retry_pending
+        ):
+            continue
+
+        state.settlement_gate.clear_seat(
+            seat
+        )
+
+        state.quantitative_first_seen_ns.pop(
+            str(seat),
+            None,
+        )
+        state.quantitative_first_seen_frame.pop(
+            str(seat),
+            None,
+        )
+
+        retired.append(seat)
+
+        print(
+            "[ORPHAN_SETTLEMENT_RETIRED]",
+            f"seat={seat}",
+            f"first_frame={first_frame}",
+            f"boundary_frame={earliest_boundary_frame}",
+            flush=True,
+        )
+
+    if retired:
+        remaining_predecessor_ownership = [
+            seat
+            for seat, candidate
+            in state.settlement_gate.pending.items()
+            if (
+                candidate.first_frame is not None
+                and int(candidate.first_frame)
+                <= earliest_boundary_frame
+            )
+        ]
+
+        if not remaining_predecessor_ownership:
+            for retained_boundary in (
+                observer.pending_street_boundaries
+            ):
+                observation = (
+                    retained_boundary.get("observation")
+                    or {}
+                )
+
+                boundary_frame = observation.get("frame")
+
+                if (
+                    boundary_frame is not None
+                    and int(boundary_frame)
+                    == earliest_boundary_frame
+                ):
+                    retained_boundary[
+                        "complete_pending"
+                    ] = True
+
+                    print(
+                        "[STREET_BOUNDARY_AUTHORITY_UPGRADED]",
+                        f"frame={boundary_frame}",
+                        f"type={observation.get('type')}",
+                        "complete_pending=True",
+                        "reason=settlement_ownership_exhausted",
+                        flush=True,
+                    )
+
+    return tuple(retired)
+
+
 def reconcile_frame_evidence(
     observer,
 ):
@@ -1994,6 +2221,13 @@ class FrameTransactionState:
         self.board_identity_reader = AsyncBoardIdentityReader()
         self.pending_board_boundaries = []
         self.unresolved_board_boundary = None
+
+        # A completed board identity remains owned by its immutable
+        # physical boundary until that boundary's semantic street is
+        # active. This prevents slow identity from outrunning retained
+        # prior-street chronology.
+        self.pending_board_identity_result = None
+
         self.hero_buttons_active = False
         self.hero_completion_pending_frame = None
 
@@ -2132,24 +2366,88 @@ def finalize_async_board_identity_result(
             "publication": None,
         }
 
-    applied = apply_async_board_identity_result(
-        observer,
-        completed,
+    # A completed identity may arrive before its physical boundary
+    # becomes the active semantic street. Preserve the completed
+    # result instead of discarding it or violating HandEngine's
+    # street/board invariant.
+    if state.pending_board_identity_result is None:
+        state.pending_board_identity_result = completed
+    elif state.pending_board_identity_result is not completed:
+        raise RuntimeError(
+            "multiple completed board identities awaiting "
+            "semantic ownership"
+        )
+
+    pending_completed = (
+        state.pending_board_identity_result
     )
 
-    submit_next_pending_board_boundary(
-        state
+    request = pending_completed["request"]
+    expected_count = int(
+        request["expected_count"]
     )
 
-    if not applied:
+    active_board_capacity = {
+        "PREFLOP": 0,
+        "FLOP": 3,
+        "TURN": 4,
+        "RIVER": 5,
+    }.get(observer.hand.street)
+
+    if active_board_capacity is None:
+        raise RuntimeError(
+            "invalid semantic street while finalizing "
+            f"board identity: {observer.hand.street}"
+        )
+
+    if expected_count > active_board_capacity:
+        boundary = request["boundary_event"]
+
+        print(
+            "[BOARD_IDENTITY_DEFERRED_FOR_STREET]",
+            f"frame={boundary.get('frame')}",
+            f"type={boundary.get('type')}",
+            f"active_street={observer.hand.street}",
+            f"expected={expected_count}",
+            flush=True,
+        )
+
         return {
             "applied": False,
+            "deferred": True,
             "reconciled_cards": (),
             "reconciled_quantitative": (),
             "publication": None,
         }
 
+    applied = apply_async_board_identity_result(
+        observer,
+        pending_completed,
+    )
+
+    if not applied:
+        # Failed/unusable identity is consumed; transport may continue
+        # with a later queued physical boundary.
+        state.pending_board_identity_result = None
+
+        submit_next_pending_board_boundary(
+            state
+        )
+
+        return {
+            "applied": False,
+            "deferred": False,
+            "reconciled_cards": (),
+            "reconciled_quantitative": (),
+            "publication": None,
+        }
+
+    state.pending_board_identity_result = None
     state.unresolved_board_boundary = None
+
+    submit_next_pending_board_boundary(
+        state
+    )
 
     (
         reconciled_cards,
@@ -2205,6 +2503,12 @@ def submit_next_pending_board_boundary(
         return False
 
     if state.board_identity_reader.future is not None:
+        return False
+
+    # A completed result awaiting its semantic street still owns the
+    # single board-identity transport lane. Do not allow a later
+    # boundary to overtake it.
+    if state.pending_board_identity_result is not None:
         return False
 
     item = state.pending_board_boundaries[0]
@@ -2267,6 +2571,17 @@ def process_frame_transaction(
     state.capture_complete_ns_by_frame[
         frame_id
     ] = int(capture_complete_ns)
+
+    # A completed identity may be waiting for retained chronology to
+    # activate its street. Re-attempt it before collecting any newly
+    # completed transport result.
+    if state.pending_board_identity_result is not None:
+        finalize_async_board_identity_result(
+            observer,
+            state,
+            state.pending_board_identity_result,
+            publication_frame=frame_id,
+        )
 
     # Board transport must be polled before enforcing the semantic
     # barrier. Otherwise an unresolved boundary prevents this transaction
@@ -2469,10 +2784,29 @@ def process_frame_transaction(
             # enter semantic chronology.
             seat = event.get("seat")
 
+            retry_state = (
+                observer.quantitative_retry_pending.get(
+                    str(seat)
+                )
+                if seat
+                else None
+            )
+
             has_commitment_evidence = bool(
                 seat
-                and seat
-                in observer.confirmed_bet_regions
+                and (
+                    seat
+                    in observer.confirmed_bet_regions
+                    or (
+                        retry_state is not None
+                        and bool(
+                            retry_state.get(
+                                "commitment_seen",
+                                False,
+                            )
+                        )
+                    )
+                )
             )
 
             resolved_value = event.get(
@@ -2864,6 +3198,12 @@ def process_frame_transaction(
             publication_frame=frame_id,
         )
 
+    retire_orphan_settlement_candidates(
+        observer,
+        state,
+        current_frame=frame_id,
+    )
+
     reconciled_cards, reconciled_quantitative = (
         reconcile_frame_evidence(
             observer
@@ -3252,6 +3592,22 @@ def run_hand(
                     seat = identity_player["seat"]
                     name = identity_player["name"]
                     error = identity_player["error"]
+                    sitting_out = bool(
+                        identity_player.get("sitting_out")
+                    )
+
+                    if sitting_out:
+                        identity_enricher.mark_terminal_identity_seat(
+                            seat,
+                            reason="sitting_out",
+                        )
+
+                        print(
+                            "[IDENTITY_ENRICHMENT_SITTING_OUT]",
+                            f"frame={frame_id}",
+                            f"seat={seat}",
+                            flush=True,
+                        )
 
                     if error:
                         print(
@@ -3374,6 +3730,15 @@ def main():
         print(
             "[WINDOW]",
             window.title,
+            flush=True,
+        )
+
+    try:
+        reset_publication_progression()
+    except Exception as exc:
+        print(
+            "[PUBLICATION_RECORDER_RESET_FAILED]",
+            f"error={type(exc).__name__}: {exc}",
             flush=True,
         )
 

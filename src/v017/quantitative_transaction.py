@@ -73,10 +73,29 @@ def process_quantitative_frame(
     for event in eligible:
         seat = event.get("seat")
 
+        retry_state = (
+            observer.quantitative_retry_pending.get(
+                str(seat)
+            )
+            if seat
+            else None
+        )
+
         has_commitment_evidence = bool(
             seat
-            and seat
-            in observer.confirmed_bet_regions
+            and (
+                seat
+                in observer.confirmed_bet_regions
+                or (
+                    retry_state is not None
+                    and bool(
+                        retry_state.get(
+                            "commitment_seen",
+                            False,
+                        )
+                    )
+                )
+            )
         )
 
         resolved_value = event.get(
