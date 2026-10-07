@@ -2287,6 +2287,40 @@ class FrameHandObserver:
             retained
         )
 
+        # Physical observations from one sampled frame may prove
+        # multiple street boundaries at once (for example 0 -> 5).
+        # Reconciliation can re-retain still-blocked boundaries.
+        # Preserve objective chronology deterministically by physical
+        # frame first and poker street second.
+        boundary_rank = {
+            "FLOP_BOUNDARY_PHYSICAL": 0,
+            "TURN_BOUNDARY_PHYSICAL": 1,
+            "RIVER_BOUNDARY_PHYSICAL": 2,
+        }
+
+        self.pending_street_boundaries.sort(
+            key=lambda row: (
+                int(
+                    row["observation"].get(
+                        "frame",
+                        -1,
+                    )
+                ),
+                boundary_rank.get(
+                    row["observation"].get(
+                        "type"
+                    ),
+                    99,
+                ),
+            )
+        )
+
+        boundary_rank = {
+            "FLOP_BOUNDARY_PHYSICAL": 0,
+            "TURN_BOUNDARY_PHYSICAL": 1,
+            "RIVER_BOUNDARY_PHYSICAL": 2,
+        }
+
         self.pending_street_boundaries.sort(
             key=lambda row: (
                 int(
@@ -2300,11 +2334,12 @@ class FrameHandObserver:
                     ).get("frame") is not None
                     else -1
                 ),
-                str(
+                boundary_rank.get(
                     (
                         row.get("observation")
                         or {}
-                    ).get("type", "")
+                    ).get("type"),
+                    99,
                 ),
             )
         )

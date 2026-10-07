@@ -1437,6 +1437,67 @@ def reconcile_board_identity_prefix(
     return reconciled
 
 
+def expand_physical_board_boundaries(
+    *,
+    previous_board_count,
+    current_board_count,
+    frame_id,
+):
+    """
+    Expand one sampled physical board-count jump into exact
+    chronological street-boundary observations.
+
+    FrameHandObserver remains strict: every emitted boundary owns
+    exactly the board count required by its street.
+    """
+    try:
+        previous = int(previous_board_count)
+        current = int(current_board_count)
+    except (TypeError, ValueError):
+        return ()
+
+    if current <= previous:
+        return ()
+
+    contracts = (
+        (
+            3,
+            "FLOP_BOUNDARY_PHYSICAL",
+        ),
+        (
+            4,
+            "TURN_BOUNDARY_PHYSICAL",
+        ),
+        (
+            5,
+            "RIVER_BOUNDARY_PHYSICAL",
+        ),
+    )
+
+    emitted = []
+
+    for count, boundary_type in contracts:
+        if (
+            previous < count
+            and current >= count
+        ):
+            emitted.append({
+                "frame": int(frame_id),
+                "type": boundary_type,
+                "board_count": count,
+                "previous_board_count": (
+                    0
+                    if count == 3
+                    else count - 1
+                ),
+                "observed_board_count": current,
+                "proved_by":
+                    "physical_board_count_catchup",
+            })
+
+    return tuple(emitted)
+
+
 def admit_board_catchup(
     observer,
     *,
@@ -2645,11 +2706,43 @@ def process_frame_transaction(
         not in boundary_types
     )
 
-    boundary_events = tuple(
+    raw_boundary_events = tuple(
         event
         for event in result.events
         if event.get("type")
         in boundary_types
+    )
+
+    expanded_boundary_events = []
+
+    for event in raw_boundary_events:
+        expanded = expand_physical_board_boundaries(
+            previous_board_count=event.get(
+                "previous_board_count"
+            ),
+            current_board_count=event.get(
+                "board_count"
+            ),
+            frame_id=event.get(
+                "frame",
+                frame_id,
+            ),
+        )
+
+        if expanded:
+            expanded_boundary_events.extend(
+                expanded
+            )
+        else:
+            # Preserve strict downstream validation for malformed
+            # individual boundary observations. Expansion is only
+            # authority for a valid forward physical count jump.
+            expanded_boundary_events.append(
+                event
+            )
+
+    boundary_events = tuple(
+        expanded_boundary_events
     )
 
     for event in non_boundary_events:
