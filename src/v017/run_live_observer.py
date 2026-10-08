@@ -52,7 +52,9 @@ from src.api.position_engine import (
 from src.bootstrap.hero_bootstrap import (
     bootstrap_local_stacks,
 )
-from src.api.table_snapshot_reader_core_v2 import read_player_identities_v2
+from src.api.table_snapshot_reader_core_v2 import (
+    read_table_snapshot_v2,
+)
 from src.vision.winner_detector import (
     detect_winner,
 )
@@ -1099,9 +1101,56 @@ def wait_for_hand(
                 flush=True,
             )
 
+            # Dealer ownership defines every positional label.
+            # A single acquisition frame is insufficient authority:
+            # the physical recording demonstrated transient false
+            # dealer ownership. Require two consecutive observations
+            # of the same dealer seat before releasing acquisition.
+            first_dealer = detect_dealer_button(image)
+
+            if not first_dealer.get("found"):
+                time.sleep(BOOTSTRAP_POLL_SECONDS)
+                continue
+
+            time.sleep(BOOTSTRAP_POLL_SECONDS)
+
+            confirm_image, confirm_path = capture_image(
+                window
+            )
+
+            confirm_dealer = detect_dealer_button(
+                confirm_image
+            )
+
+            if (
+                not confirm_dealer.get("found")
+                or confirm_dealer[
+                    "dealer_button_seat"
+                ]
+                != first_dealer[
+                    "dealer_button_seat"
+                ]
+            ):
+                print(
+                    "[DEALER_CONFIRMATION_REJECTED]",
+                    "first="
+                    f"{first_dealer.get('dealer_button_seat')}",
+                    "second="
+                    f"{confirm_dealer.get('dealer_button_seat')}",
+                    flush=True,
+                )
+                continue
+
+            print(
+                "[DEALER_CONFIRMED]",
+                "seat="
+                f"{confirm_dealer['dealer_button_seat']}",
+                flush=True,
+            )
+
             return (
-                image,
-                path,
+                confirm_image,
+                confirm_path,
                 tuple(frozen),
                 participant_freeze.trusted_stacks,
             )
@@ -1704,18 +1753,25 @@ def build_observer_from_frame(
             "Hero not present in occupied roster"
         )
 
-    dealer = detect_dealer_button(
-        image
+    # One acquisition frame owns bootstrap physical context.
+    #
+    # Frozen participant topology remains authoritative for who was
+    # dealt in. Snapshot V2 reads dealer, visible identities, and
+    # starting stacks from that SAME physical frame.
+    snapshot, snapshot_timings = read_table_snapshot_v2(
+        frame_path,
+        dealt_in_seats=seats,
     )
 
-    if not dealer.get("found"):
-        raise RuntimeError(
-            "dealer button unresolved"
-        )
+    dealer_seat = str(
+        snapshot.get("dealer_button_seat")
+        or ""
+    )
 
-    dealer_seat = dealer[
-        "dealer_button_seat"
-    ]
+    if not dealer_seat:
+        raise RuntimeError(
+            "snapshot dealer button unresolved"
+        )
 
     positions = assign_positions(
         [
@@ -1726,53 +1782,29 @@ def build_observer_from_frame(
         preserve_physical_slots=False,
     )
 
-    local_players = (
-        bootstrap_local_stacks(
-            canonical_image=image,
-            frozen_participants=seats,
-            geometry=GEOMETRY,
-            crop_geometry_region=
-                crop_geometry_region,
-            stack_reader=read_stack_native_fast,
+    snapshot_players = {
+        row.get("seat"): row
+        for row in (
+            snapshot.get("players")
+            or []
         )
-    )
-
-    # Acquisition-frame stack evidence owns the quantitative baseline.
-    #
-    # frozen_stack_authority contains observations made strictly before
-    # Hero-card acquisition. Those observations remain useful diagnostic
-    # evidence, but they cannot be promoted across acquisition because
-    # antes/blinds may have changed a player's stack in the meantime.
-    #
-    # If acquisition-frame OCR is unresolved, leave that seat
-    # quantitatively unknown until current/post-acquisition physical
-    # evidence establishes a valid baseline.
-    frozen_stack_authority = {
-        str(seat): float(value)
-        for seat, value
-        in (
-            frozen_stack_authority
-            or {}
-        ).items()
+        if row.get("seat")
     }
 
-    if frozen_stack_authority:
-        for row in local_players:
-            seat = row["seat"]
+    local_players = []
 
-            if (
-                row.get("stack_bb")
-                is None
-                and seat
-                in frozen_stack_authority
-            ):
-                print(
-                    "[BOOTSTRAP_PREACQUISITION_STACK_REJECTED]",
-                    f"seat={seat}",
-                    "reason=acquisition_frame_unresolved",
-                    f"prior_value={frozen_stack_authority[seat]}",
-                    flush=True,
-                )
+    for seat in seats:
+        row = snapshot_players.get(
+            seat,
+            {}
+        )
+
+        local_players.append({
+            "seat": seat,
+            "stack_bb": row.get(
+                "stack_bb"
+            ),
+        })
 
     unresolved = [
         row["seat"]
@@ -1784,7 +1816,7 @@ def build_observer_from_frame(
         print(
             "[BOOTSTRAP_STACK_UNKNOWN]",
             f"seats={unresolved}",
-            "continuing_without_quantitative_authority",
+            "source=snapshot_v2",
             flush=True,
         )
 
@@ -1800,16 +1832,28 @@ def build_observer_from_frame(
         )
         return None
 
-    identity_snapshot = (
-        read_player_identities_v2(
-            frame_path,
-            dealt_in_seats=seats,
+    identities = [
+        {
+            "seat": row.get("seat"),
+            "name": row.get("name") or "",
+            "is_hero": bool(
+                row.get("is_hero")
+            ),
+        }
+        for row in (
+            snapshot.get("players")
+            or []
         )
-    )
+        if row.get("seat")
+    ]
 
-    identities = (
-        identity_snapshot.get("players")
-        or []
+    print(
+        "[BOOTSTRAP_SNAPSHOT_AUTHORITY]",
+        f"dealer={dealer_seat}",
+        f"players={len(identities)}",
+        "snapshot_ms="
+        f"{snapshot_timings.get('total_ms', 0.0):.1f}",
+        flush=True,
     )
 
     players = player_records(
@@ -3874,8 +3918,10 @@ def main():
             flush=True,
         )
 
-        # Require Hero cards to clear before
-        # accepting the next hand.
+        # Require temporal confirmation that Hero cards have
+        # physically cleared before accepting another hand.
+        clear_streak = 0
+
         while True:
             image, _ = capture_image(
                 window
@@ -3885,9 +3931,15 @@ def main():
                 image,
                 GEOMETRY,
             ):
+                clear_streak += 1
+            else:
+                clear_streak = 0
+
+            if clear_streak >= 3:
                 print(
                     "[HERO_CLEAR_CONFIRMED]",
                     f"after_hand={hand_number}",
+                    f"streak={clear_streak}",
                     flush=True,
                 )
                 break

@@ -308,6 +308,19 @@ class FrameHandObserver:
         self.quantitative_confirmation_pending = {}
         self.quantitative_confirmation_max_attempts = 3
 
+        # Physical stack-motion provenance observed at/before a
+        # retained next-street boundary.
+        #
+        # ACR may expose the next board before its stack text finishes
+        # rendering the final prior-street value. Retry ownership may
+        # legitimately resolve against the unchanged baseline during
+        # that animation. Preserve the earlier physical-motion frame
+        # independently so later settled OCR can retain predecessor
+        # temporal ownership.
+        #
+        # This state grants no poker-semantic authority by itself.
+        self.pre_boundary_stack_motion = {}
+
         # Resolved physical stack evidence that is valid but cannot
         # yet cross the authoritative chronology frontier.
         #
@@ -1809,11 +1822,59 @@ class FrameHandObserver:
             <= int(boundary_frame)
         )
 
+        motion_provenance = (
+            self.pre_boundary_stack_motion.get(
+                str(seat)
+            )
+        )
+
+        predecessor_motion_owned = False
+
+        if (
+            boundary_frame is not None
+            and motion_provenance is not None
+            and self.hand.next_actor == seat
+            and str(
+                motion_provenance.get("street")
+            ) == str(self.hand.street)
+        ):
+            try:
+                predecessor_motion_owned = bool(
+                    int(
+                        motion_provenance.get("frame")
+                    )
+                    <= int(boundary_frame)
+                    and int(
+                        motion_provenance.get(
+                            "boundary_frame"
+                        )
+                    )
+                    == int(boundary_frame)
+                )
+            except (TypeError, ValueError):
+                predecessor_motion_owned = False
+
+        if predecessor_motion_owned:
+            self.pre_boundary_stack_motion.pop(
+                str(seat),
+                None,
+            )
+
+            print(
+                "[PRE_BOUNDARY_STACK_MOTION_CONSUMED]",
+                f"frame={observation_frame}",
+                f"seat={seat}",
+                f"boundary_frame={boundary_frame}",
+                f"street={self.hand.street}",
+                flush=True,
+            )
+
         if (
             boundary_frame is not None
             and observation_frame is not None
             and int(observation_frame) > int(boundary_frame)
             and not predecessor_settlement_owned
+            and not predecessor_motion_owned
         ):
             print(
                 "[QUANTITATIVE_REJECT]",
@@ -3548,6 +3609,31 @@ class FrameHandObserver:
                 # including measurements that do not wake OCR.
                 #
                 # This grants no semantic authority and changes no gate.
+                if (
+                    boundary_type is not None
+                    and motion.wake
+                    and seat == self.hand.next_actor
+                ):
+                    self.pre_boundary_stack_motion[
+                        str(seat)
+                    ] = {
+                        "frame": frame_id,
+                        "street": str(
+                            self.hand.street
+                        ),
+                        "boundary_frame": frame_id,
+                        "boundary_type": boundary_type,
+                    }
+
+                    print(
+                        "[PRE_BOUNDARY_STACK_MOTION]",
+                        f"frame={frame_id}",
+                        f"seat={seat}",
+                        f"street={self.hand.street}",
+                        f"boundary={boundary_type}",
+                        flush=True,
+                    )
+
                 if seat == self.hand.next_actor:
                     print(
                         "[NEXT_ACTOR_STACK_MOTION]",

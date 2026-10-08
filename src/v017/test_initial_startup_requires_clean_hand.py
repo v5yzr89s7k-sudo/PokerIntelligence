@@ -8,25 +8,41 @@ def main():
         ("MID_HAND", "/tmp/mid.png"),
         ("CLEAR", "/tmp/clear.png"),
         ("NEW_HAND", "/tmp/new.png"),
+        (
+            "NEW_HAND_CONFIRM",
+            "/tmp/new_confirm.png",
+        ),
     ])
 
     def capture(_window):
         return next(captures)
 
     def cards_visible(image, _geometry):
-        return image in ("MID_HAND", "NEW_HAND")
+        return image in (
+            "MID_HAND",
+            "NEW_HAND",
+            "NEW_HAND_CONFIRM",
+        )
 
     def board_count(image, _geometry):
         return {
             "MID_HAND": 3,
             "CLEAR": 0,
             "NEW_HAND": 0,
+            "NEW_HAND_CONFIRM": 0,
         }[image]
 
     with patch.object(
         live,
         "capture_image",
         side_effect=capture,
+    ), patch.object(
+        live,
+        "detect_dealer_button",
+        return_value={
+            "found": True,
+            "dealer_button_seat": "villain",
+        },
     ), patch.object(
         live,
         "native_occupied_seats",
@@ -65,9 +81,11 @@ def main():
             clear_confirmed=False,
         )
 
-    assert image == "NEW_HAND", (
+    assert image == "NEW_HAND_CONFIRM", (
         "initial startup accepted Hero-visible "
-        "mid-hand frame before clean-hand synchronization"
+        "mid-hand frame before clean-hand synchronization "
+        "or failed to return the temporally confirmed "
+        "acquisition frame"
     )
 
     print("MID-HAND STARTUP ACCEPTED: NO")
