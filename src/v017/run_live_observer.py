@@ -53,6 +53,7 @@ from src.bootstrap.hero_bootstrap import (
     bootstrap_local_stacks,
 )
 from src.api.table_snapshot_reader_core_v2 import (
+    read_player_identities_v2,
     read_table_snapshot_v2,
 )
 from src.vision.winner_detector import (
