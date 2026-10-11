@@ -62,6 +62,7 @@ def main():
             "acquisition-stale-authority-regression",
         frozen_participants=participants,
         frozen_stack_authority=stale,
+        confirmed_dealer_seat="seat_lower_left",
     )
 
     assert observer is not None

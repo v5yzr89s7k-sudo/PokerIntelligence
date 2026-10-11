@@ -58,6 +58,7 @@ def main():
         hand_id="native-acquisition-baseline",
         frozen_participants=PARTICIPANTS,
         frozen_stack_authority=AUTHORITY,
+        confirmed_dealer_seat="seat_lower_left",
     )
 
     assert observer is not None

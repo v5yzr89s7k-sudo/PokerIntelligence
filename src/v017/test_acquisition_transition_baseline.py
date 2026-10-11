@@ -31,6 +31,7 @@ def main():
         image,
         FRAME,
         hand_id="acquisition-baseline-contract",
+        confirmed_dealer_seat="seat_upper_left",
     )
 
     assert observer is not None

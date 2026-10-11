@@ -765,6 +765,36 @@ def crop_geometry_region(
     ]
 
 
+def reset_hand_frame_storage():
+    """
+    Start one live hand with an isolated materialized-frame namespace.
+
+    Materialized PNGs are transient hand-local evidence only. They must
+    never survive into the next hand or share numbering with another hand.
+    """
+    global _SCK_CAPTURE_SEQUENCE
+
+    if SCK_MATERIALIZED_FRAME_DIR.exists():
+        for path in SCK_MATERIALIZED_FRAME_DIR.glob(
+            "sck_frame_*.png"
+        ):
+            path.unlink()
+
+    SCK_MATERIALIZED_FRAME_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    _SCK_CAPTURE_SEQUENCE = 0
+
+    print(
+        "[HAND_FRAME_STORAGE_RESET]",
+        "sequence=0",
+        "materialized=0",
+        flush=True,
+    )
+
+
 def capture_image(window):
     global _SCK_CAPTURE_SEQUENCE
 
@@ -1154,6 +1184,9 @@ def wait_for_hand(
                 confirm_path,
                 tuple(frozen),
                 participant_freeze.trusted_stacks,
+                confirm_dealer[
+                    "dealer_button_seat"
+                ],
             )
 
         # Before clean-hand synchronization, only cheap physical
@@ -1709,6 +1742,7 @@ def build_observer_from_frame(
     *,
     frozen_participants=None,
     frozen_stack_authority=None,
+    confirmed_dealer_seat=None,
 ):
     frame_path = require_frame_path(
         frame_path
@@ -1765,13 +1799,29 @@ def build_observer_from_frame(
     )
 
     dealer_seat = str(
-        snapshot.get("dealer_button_seat")
+        confirmed_dealer_seat
         or ""
     )
 
     if not dealer_seat:
         raise RuntimeError(
-            "snapshot dealer button unresolved"
+            "confirmed physical dealer authority missing"
+        )
+
+    snapshot_dealer = str(
+        snapshot.get("dealer_button_seat")
+        or ""
+    )
+
+    if (
+        snapshot_dealer
+        and snapshot_dealer != dealer_seat
+    ):
+        print(
+            "[SNAPSHOT_DEALER_IGNORED]",
+            f"physical={dealer_seat}",
+            f"snapshot={snapshot_dealer}",
+            flush=True,
         )
 
     positions = assign_positions(
@@ -2026,11 +2076,14 @@ def bootstrap_observer(
     clear_confirmed=False,
     participant_freeze=None,
 ):
+    reset_hand_frame_storage()
+
     (
         image,
         frame_path,
         frozen_participants,
         frozen_stack_authority,
+        confirmed_dealer_seat,
     ) = wait_for_hand(
         window,
         clear_confirmed=clear_confirmed,
@@ -2045,6 +2098,8 @@ def bootstrap_observer(
             frozen_participants,
         frozen_stack_authority=
             frozen_stack_authority,
+        confirmed_dealer_seat=
+            confirmed_dealer_seat,
     )
 
     if observer is None:
