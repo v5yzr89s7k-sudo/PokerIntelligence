@@ -173,23 +173,90 @@ final class LatestFrameStreamer: NSObject, SCStreamOutput {
             socketPath
         )
 
-        clientFD = Darwin.accept(
+        acceptConsumer()
+    }
+
+    private func acceptConsumer() {
+        if clientFD >= 0 {
+            Darwin.close(clientFD)
+            clientFD = -1
+        }
+
+        print(
+            "[SCK] waiting for Python consumer:",
+            socketPath
+        )
+
+        let accepted = Darwin.accept(
             serverFD,
             nil,
             nil
         )
 
-        guard clientFD >= 0 else {
-            fatalError("accept() failed")
+        guard accepted >= 0 else {
+            fatalError(
+                "accept() failed errno=\(errno)"
+            )
         }
 
-        print("[SCK] Python consumer connected")
+        var noSigPipe: Int32 = 1
+
+        let optionResult = setsockopt(
+            accepted,
+            SOL_SOCKET,
+            SO_NOSIGPIPE,
+            &noSigPipe,
+            socklen_t(
+                MemoryLayout<Int32>.size
+            )
+        )
+
+        guard optionResult == 0 else {
+            Darwin.close(accepted)
+            fatalError(
+                "SO_NOSIGPIPE failed errno=\(errno)"
+            )
+        }
+
+        clientFD = accepted
+
+        print(
+            "[SCK] Python consumer connected",
+            "fd=\(clientFD)"
+        )
+    }
+
+    private func retireConsumer(
+        phase: String
+    ) {
+        let failureErrno = errno
+
+        print(
+            "[SCK_SEND_FAILURE]",
+            "phase=\(phase)",
+            "fd=\(clientFD)",
+            "errno=\(failureErrno)",
+            String(
+                cString: strerror(
+                    failureErrno
+                )
+            )
+        )
+
+        if clientFD >= 0 {
+            Darwin.close(clientFD)
+            clientFD = -1
+        }
     }
 
     private func sendAll(
         _ pointer: UnsafeRawPointer,
         count: Int
     ) -> Bool {
+        guard clientFD >= 0 else {
+            return false
+        }
+
         var sent = 0
 
         while sent < count {
@@ -200,7 +267,15 @@ final class LatestFrameStreamer: NSObject, SCStreamOutput {
                 0
             )
 
-            if n <= 0 {
+            if n < 0 {
+                if errno == EINTR {
+                    continue
+                }
+
+                return false
+            }
+
+            if n == 0 {
                 return false
             }
 
@@ -302,14 +377,26 @@ final class LatestFrameStreamer: NSObject, SCStreamOutput {
             }
 
         guard headerOK else {
+            retireConsumer(
+                phase: "header"
+            )
+            acceptConsumer()
             return
         }
 
         if bytesPerRow == width * bytesPerPixel {
-            _ = sendAll(
+            let payloadOK = sendAll(
                 base,
                 count: payloadSize
             )
+
+            if !payloadOK {
+                retireConsumer(
+                    phase: "payload"
+                )
+                acceptConsumer()
+                return
+            }
         } else {
             for row in 0..<height {
                 let rowPtr =
@@ -324,6 +411,10 @@ final class LatestFrameStreamer: NSObject, SCStreamOutput {
                 )
 
                 if !ok {
+                    retireConsumer(
+                        phase: "payload_row_\(row)"
+                    )
+                    acceptConsumer()
                     return
                 }
             }
