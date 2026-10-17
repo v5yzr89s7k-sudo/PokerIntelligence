@@ -15,13 +15,9 @@ EXPECTED = [
     ("RAISE", "seat_lower_right", None, 2.0),
     ("CALL", "hero", 1.5, None),
     ("CALL", "seat_lower_left", 1.0, None),
-    ("CHECK", "hero", None, None),
     ("BET", "seat_lower_left", 3.37, None),
     ("FOLD", "seat_lower_right", None, None),
     ("CALL", "hero", 3.37, None),
-    ("CHECK", "hero", None, None),
-    ("CHECK", "seat_lower_left", None, None),
-    ("CHECK", "hero", None, None),
     ("BET", "seat_lower_left", 6.75, None),
     ("FOLD", "hero", None, None),
 ]
@@ -151,7 +147,7 @@ def main():
             if (
                 row.get("frame") == 127
                 and row.get("type")
-                == "CHRONOLOGY_COMPLETION"
+                == "CHRONOLOGY_UNKNOWN_COMPLETION"
                 and row.get("seat")
                 == "hero"
             )
@@ -170,7 +166,7 @@ def main():
             hero_check[0][
                 "semantic_action"
             ]
-            == "CHECK"
+            is None
         )
 
         # ----------------------------------------------------
@@ -227,7 +223,7 @@ def main():
         ]
 
         assert len(folds) == 1
-        assert folds[0]["frame"] == 135
+        assert folds[0]["frame"] == 131
         assert folds[0]["seat"] == "hero"
 
         assert (
@@ -252,9 +248,9 @@ def main():
             / "frame_0127_current_hand.txt"
         ).read_text()
 
-        f135 = (
+        f131 = (
             root
-            / "frame_0135_current_hand.txt"
+            / "frame_0131_current_hand.txt"
         ).read_text()
 
         assert "RIVER: 7h" in f115
@@ -286,7 +282,7 @@ def main():
 
         assert (
             "SB (poker5068) checks"
-            in river127
+            not in river127
         )
 
         assert (
@@ -304,29 +300,39 @@ def main():
             in f127
         )
 
-        river135 = f135.split(
+        river131 = f131.split(
             "RIVER: 7h",
             1,
         )[1]
 
         assert (
             "SB (poker5068) checks"
-            in river135
+            not in river131
         )
 
         assert (
             "BB (Birkam) bets 6.75 BB"
-            in river135
+            in river131
         )
 
         assert (
             "SB (poker5068) folds"
-            in river135
+            in river131
         )
 
         assert (
-            "Betting round complete"
-            in f135
+            "Hand complete"
+            in f131
+        )
+
+        assert (
+            "Completion: UNCONTESTED"
+            in f131
+        )
+
+        assert (
+            "Winner: BB (Birkam)"
+            in f131
         )
 
         print(

@@ -38,10 +38,11 @@ def main():
         side_effect=capture,
     ), patch.object(
         live,
-        "detect_dealer_button",
+        "detect_native_dealer",
         return_value={
-            "found": True,
+            "confidence": 0.90,
             "dealer_button_seat": "villain",
+            "owners": [("villain", 0)],
         },
     ), patch.object(
         live,

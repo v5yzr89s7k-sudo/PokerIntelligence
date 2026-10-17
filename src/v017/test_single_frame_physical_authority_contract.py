@@ -27,7 +27,7 @@ def main():
 
     # Snapshot may still observe dealer metadata, but it is not
     # authoritative for topology or position assignment.
-    assert "detect_dealer_button(" in live
+    assert "detect_native_dealer(" in live
     assert "detect_dealer_button(" in snapshot
 
     start = live.index("def build_observer_from_frame(")

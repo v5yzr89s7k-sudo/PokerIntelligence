@@ -590,6 +590,59 @@ class FrameHandObserver:
         )
 
 
+    def invalidate_retained_hero_disappearance(
+        self,
+        *,
+        frame_id=None,
+        reason="hero_active_physical",
+    ):
+        """
+        Retire stale retained Hero-card disappearance evidence after
+        later positive physical evidence proves Hero remains active.
+
+        This has no HandEngine authority and never creates an action.
+        Opponent disappearance ownership is untouched.
+        """
+        retained = []
+        invalidated = []
+
+        for row in self.pending_card_disappearances:
+            row_frame = row.get("frame_id")
+
+            is_older = (
+                frame_id is None
+                or row_frame is None
+                or int(row_frame) < int(frame_id)
+            )
+
+            if (
+                row.get("seat") == self.hero_seat
+                and row.get("physical_type")
+                == "HERO_CARDS_DISAPPEARED_PHYSICAL"
+                and is_older
+            ):
+                invalidated.append(row)
+                continue
+
+            retained.append(row)
+
+        if not invalidated:
+            return ()
+
+        self.pending_card_disappearances = retained
+
+        for row in invalidated:
+            print(
+                "[HERO_RETAINED_DISAPPEARANCE_INVALIDATED]",
+                f"retained_frame={row.get('frame_id')}",
+                f"active_frame={frame_id}",
+                f"reason={reason}",
+                flush=True,
+            )
+
+        return tuple(invalidated)
+
+
     def retain_card_disappearance(
         self,
         seat: str,
@@ -762,6 +815,19 @@ class FrameHandObserver:
         Out-of-order evidence is retained until its seat reaches the
         authoritative actor frontier.
         """
+
+        # Card disappearance observed while betting is already
+        # closed has no future betting-action authority. This commonly
+        # occurs during all-in/showdown card removal and must never be
+        # carried into a later street and reinterpreted as FOLD.
+        if self.hand.next_actor is None:
+            print(
+                "[CARD_DISAPPEARANCE_CLOSED_BETTING_IGNORED]",
+                f"frame={frame_id}",
+                f"seat={seat}",
+                flush=True,
+            )
+            return None
 
         if seat != self.hand.next_actor:
             self._retain_pending_card_disappearance(
@@ -1221,23 +1287,35 @@ class FrameHandObserver:
                 self.hand.current_price_bb
             )
 
-            if (
-                retained_price is not None
-                and abs(
-                    float(retained_price)
-                    - current_price
-                ) > 0.02
-            ):
-                print(
-                    "[STALE_QUANTITATIVE_RETIRED]",
-                    f"frame={observation.get('frame')}",
-                    f"seat={seat}",
-                    f"retained_price={retained_price}",
-                    f"current_price={current_price}",
-                    "reason=betting_price_changed",
-                    flush=True,
+            retained_after_boundary_frame = (
+                observation.get(
+                    "retained_after_boundary_frame"
                 )
-                continue
+            )
+
+            boundary_still_pending = False
+
+            if retained_after_boundary_frame is not None:
+                boundary_still_pending = any(
+                    (
+                        retained.get("observation")
+                        or {}
+                    ).get("frame")
+                    == retained_after_boundary_frame
+                    for retained
+                    in self.pending_street_boundaries
+                )
+
+            # Evidence retained because semantic predecessors were
+            # unresolved remains owned by its original physical
+            # observation. A later predecessor reconciliation may
+            # legitimately change the betting price before this actor
+            # becomes authoritative.
+            #
+            # Do not destroy that confirmed physical evidence merely
+            # because current_price_bb has advanced. Normal admission
+            # below remains responsible for validating it against the
+            # now-authoritative betting state.
 
             before_stack = (
                 self.trusted_stacks.get(seat)
@@ -1876,11 +1954,26 @@ class FrameHandObserver:
             and not predecessor_settlement_owned
             and not predecessor_motion_owned
         ):
+            # This observation belongs physically after an unresolved
+            # street boundary. It is valid evidence for the next physical
+            # street, not the current semantic street. Preserve explicit
+            # boundary ownership so the old street's betting price cannot
+            # later retire it when that exact boundary crosses.
+            post_boundary_observation = dict(
+                observation
+            )
+            post_boundary_observation[
+                "retained_after_boundary_frame"
+            ] = int(boundary_frame)
+
+            self._retain_blocked_quantitative_evidence(
+                post_boundary_observation
+            )
+
             print(
-                "[QUANTITATIVE_REJECT]",
+                "[QUANTITATIVE_RETAINED_AFTER_BOUNDARY]",
                 f"frame={observation_frame}",
                 f"seat={seat}",
-                "reason=after_pending_street_boundary",
                 f"boundary_frame={boundary_frame}",
                 f"street={self.hand.street}",
                 flush=True,
@@ -2003,6 +2096,22 @@ class FrameHandObserver:
                 self.hand.observe_terminal_physical_commitment(
                     seat,
                     physical_delta,
+                )
+
+            # A betting action may already have been consumed before
+            # its final zero-stack measurement settles. Independent
+            # all-in authority still owns persistent player state even
+            # though this observation has no authority to create a
+            # second betting action.
+            if all_in_confirmed:
+                player = self.hand.players[seat]
+                player.all_in = True
+
+                print(
+                    "[CONSUMED_ACTOR_ALL_IN_CONFIRMED]",
+                    f"frame={observation.get('frame')}",
+                    f"seat={seat}",
+                    flush=True,
                 )
 
             return ()
@@ -3418,6 +3527,17 @@ class FrameHandObserver:
             self.previous_action_buttons_visible
         )
 
+        # Positive Hero-turn evidence supersedes an older retained
+        # Hero-card disappearance. The live 2026-10-15 regression
+        # retained a transient disappearance while next_actor=None,
+        # then later observed Hero action buttons before the stale
+        # disappearance was incorrectly reconciled as FOLD.
+        if action_buttons_are_visible:
+            self.invalidate_retained_hero_disappearance(
+                frame_id=frame_id,
+                reason="action_buttons_visible",
+            )
+
         if self.hand.next_actor == self.hero_seat:
             print(
                 "[HERO_BUTTON_STATE]",
@@ -3426,6 +3546,41 @@ class FrameHandObserver:
                 f"current={action_buttons_are_visible}",
                 flush=True,
             )
+
+            # Diagnostic only: preserve native Hero-turn frames so the
+            # physical action-button detector can be calibrated from
+            # real live evidence. No poker-semantic authority.
+            try:
+                from pathlib import Path
+                import cv2
+
+                debug_dir = Path(
+                    "runtime/debug/hero_button_samples"
+                )
+                debug_dir.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+                sample_path = (
+                    debug_dir
+                    / (
+                        f"frame_{int(frame_id):06d}_"
+                        f"visible_{int(action_buttons_are_visible)}.png"
+                    )
+                )
+
+                cv2.imwrite(
+                    str(sample_path),
+                    physical_frame,
+                )
+            except Exception as exc:
+                print(
+                    "[HERO_BUTTON_SAMPLE_FAILED]",
+                    f"frame={frame_id}",
+                    f"error={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
 
         if (
             previous_action_buttons_visible
@@ -3523,9 +3678,58 @@ class FrameHandObserver:
         # state is available at the settlement boundary.
         # ----------------------------------------------------
 
-        self.observe_bet_regions(
+        bet_transitions = self.observe_bet_regions(
             frame,
         )
+
+        # A debounced physical chip appearance for the current
+        # authoritative actor opens bounded quantitative measurement
+        # ownership even when stack-region motion missed the visual
+        # transition.
+        #
+        # This is measurement authority only. Bet-region occupancy
+        # never assigns CALL/BET/RAISE/ALL_IN and never mutates
+        # HandEngine. Quantitative OCR and temporal settlement remain
+        # mandatory before poker semantics can be admitted.
+        next_actor = self.hand.next_actor
+
+        if (
+            next_actor is not None
+            and next_actor in self.quantitative_seats
+            and next_actor in self.trusted_stacks
+            and next_actor
+            not in self.quantitative_retry_pending
+            and next_actor
+            not in self.quantitative_confirmation_pending
+        ):
+            transition = (
+                bet_transitions.get(
+                    next_actor,
+                    {},
+                )
+                or {}
+            )
+
+            if transition.get("appeared"):
+                self.quantitative_retry_pending[
+                    next_actor
+                ] = {
+                    "attempts": 0,
+                    "first_frame": frame_id,
+                    "last_frame": frame_id,
+                    "commitment_seen": True,
+                    "reason": "bet_region_appearance",
+                }
+
+                print(
+                    "[QUANTITATIVE_RETRY_ARMED]",
+                    f"frame={frame_id}",
+                    f"seat={next_actor}",
+                    "attempt=0",
+                    "commitment=True",
+                    "reason=bet_region_appearance",
+                    flush=True,
+                )
 
         # ----------------------------------------------------
         # Cheap stack motion -> targeted OCR -> prior-aware
@@ -3594,15 +3798,14 @@ class FrameHandObserver:
                         "commitment_seen",
                         False,
                     ):
-                        # Commitment was independently confirmed
-                        # and has now disappeared. This physical
-                        # transition no longer owns retry work.
-                        self.quantitative_retry_pending.pop(
-                            seat,
-                            None,
-                        )
-                        retry_state = None
-                        retry_owned = False
+                        # Physical commitment may clear before ACR's
+                        # post-action stack text has settled. Preserve
+                        # the already-established quantitative owner;
+                        # normal bounded retry exhaustion or successful
+                        # quantitative resolution owns termination.
+                        retry_state[
+                            "commitment_cleared"
+                        ] = True
 
                 # Diagnostic only: expose the physical stack-motion
                 # measurement for the authoritative chronology frontier,
@@ -3728,9 +3931,20 @@ class FrameHandObserver:
                         and resolved_same_baseline
                     )
 
+                    # A resolved OCR value equal to the trusted
+                    # baseline does not resolve an already-owned
+                    # physical stack transition.
+                    #
+                    # ACR may move chips / expose commitment before the
+                    # displayed stack text updates. Preserve the bounded
+                    # retry owner for any existing quantitative retry,
+                    # not only the hero-completion special case.
                     same_baseline_retry = bool(
                         resolved_same_baseline
-                        and hero_completion_retry
+                        and (
+                            retry_state is not None
+                            or hero_completion_retry
+                        )
                     )
 
                     if (
@@ -4061,7 +4275,20 @@ class FrameHandObserver:
             action_buttons_are_visible
         )
 
-        self.previous_board_count = board_count
+        # Physical community-card chronology is monotonic within a
+        # hand. A transient single-frame card-presence miss must not
+        # rewind established street ownership and later fabricate a
+        # duplicate boundary (for example 3 -> 2 -> 3).
+        #
+        # Preserve the raw board_count above for diagnostics; only the
+        # chronology baseline is monotonic.
+        if self.previous_board_count is None:
+            self.previous_board_count = board_count
+        else:
+            self.previous_board_count = max(
+                int(self.previous_board_count),
+                int(board_count),
+            )
 
         self.previous_frame = frame
 

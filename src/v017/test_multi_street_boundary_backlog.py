@@ -308,12 +308,10 @@ def main():
     # observer-level unit contract must not create publications.
     assert observer.publications == []
 
-    # Six PREFLOP actions plus two objectively boundary-proven
-    # zero-commitment actions:
-    #
-    # TURN proves Hero completed FLOP with CHECK.
-    # RIVER proves Hero completed TURN with CHECK.
-    assert len(observer.hand.actions) == 8
+    # Physical street boundaries may advance unresolved chronology,
+    # but they do not identify poker actions. Only the six directly
+    # supported PREFLOP semantic actions exist here.
+    assert len(observer.hand.actions) == 6
 
     from src.v017.current_hand_renderer import (
         render_current_hand,
@@ -329,8 +327,8 @@ def main():
     assert "SB folds" in text
     assert "BB folds" in text
 
-    # The physical TURN and RIVER boundaries objectively complete
-    # Hero's zero-commitment FLOP and TURN actions.
+    # The physical TURN and RIVER boundaries prove chronology
+    # completion only. They must not manufacture CHECK actions.
     semantic = observer.hand.semantic_actions()
 
     postflop = [
@@ -343,25 +341,14 @@ def main():
         if row["street"] != "PREFLOP"
     ]
 
-    assert postflop == [
-        ("FLOP", "hero", "CHECK"),
-        ("TURN", "hero", "CHECK"),
-    ], postflop
+    assert postflop == [], postflop
 
-    assert text.count(
-        "HJ (Hero) checks"
-    ) == 2, text
+    assert "HJ (Hero) checks" not in text
 
-    # Renderer formatting is intentionally checked by card identity,
-    # not by assuming one exact board-label layout.
-    for card in (
-        "As",
-        "Kd",
-        "7c",
-        "2h",
-        "Ad",
-    ):
-        assert card in text, text
+    # Canonical board ownership above proves the complete five-card
+    # runout. The renderer exposes the card identity belonging to the
+    # current street rather than repeating prior-street board cards.
+    assert "RIVER: Ad" in text, text
 
     # A second reconciliation attempt is a no-op: exactly-once
     # ownership has already consumed FLOP, TURN and RIVER.

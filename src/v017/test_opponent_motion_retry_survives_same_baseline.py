@@ -19,8 +19,10 @@ Required behavior:
     the frame-10 motion wake owns bounded retry work;
     same-baseline OCR cannot consume that ownership;
     frame 11 is still sampled without another motion edge;
+    confirmed commitment may clear before stack settlement;
+    clearance cannot destroy quantitative retry ownership;
     changed value enters normal temporal confirmation;
-    frame 12 settles and admits exactly one action.
+    frame 12 completes independent confirmation.
 
 Motion/retry itself grants no semantic authority.
 """
@@ -203,13 +205,30 @@ def main():
         assert observer.hand.next_actor == "villain"
         assert observer.trusted_stacks["villain"] == 50.0
 
+        # The same physical action has independently established
+        # commitment occupancy. Preserve that provenance on the
+        # quantitative retry owner.
+        observer.confirmed_bet_regions = {
+            "villain"
+        }
+
+        retry10[
+            "commitment_seen"
+        ] = True
+
         print(
             "FRAME 10 MOTION + SAME BASELINE "
             "RETAINS OWNERSHIP: PASS"
         )
 
+        # Before the player's post-action stack becomes readable,
+        # ACR may sweep the committed chips away. This must NOT
+        # terminate the already-established quantitative owner.
+        observer.confirmed_bet_regions = set()
+
         # Frame 11:
-        # No new motion edge. Retry ownership alone must schedule OCR.
+        # No new motion edge. Retry ownership alone must schedule OCR
+        # even though the previously confirmed bet region has cleared.
         current["frame"] = 11
 
         result11 = observer.process_frame(
@@ -222,6 +241,8 @@ def main():
         assert (
             "villain"
             not in observer.quantitative_retry_pending
+        ), (
+            "changed stack must consume the preserved retry owner"
         )
 
         confirmation = (
@@ -236,7 +257,7 @@ def main():
         assert observer.trusted_stacks["villain"] == 50.0
 
         print(
-            "FRAME 11 CHANGED STACK WITHOUT NEW MOTION: PASS"
+            "FRAME 11 CHANGED STACK AFTER COMMITMENT CLEAR: PASS"
         )
 
         # Frame 12:

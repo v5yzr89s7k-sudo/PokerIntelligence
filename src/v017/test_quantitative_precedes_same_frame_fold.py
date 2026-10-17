@@ -222,12 +222,6 @@ def main():
 
     assert observed == [
         (
-            "bb",
-            "CHECK",
-            None,
-            None,
-        ),
-        (
             "hero",
             "BET",
             2.12,
@@ -257,7 +251,7 @@ def main():
         for event in observer.events
         if (
             event.get("type")
-            == "CHRONOLOGY_COMPLETION"
+            == "CHRONOLOGY_UNKNOWN_COMPLETION"
         )
     ]
 
@@ -274,7 +268,7 @@ def main():
         chronology[0][
             "semantic_action"
         ]
-        == "CHECK"
+        is None
     )
 
     reconciled_fold = [
@@ -298,7 +292,7 @@ def main():
 
     print()
     print(
-        "ZERO-PRICE PREDECESSOR -> CHECK: PASS"
+        "ZERO-PRICE PREDECESSOR -> UNKNOWN COMPLETION: PASS"
     )
     print(
         "LATER QUANTITATIVE -> BET: PASS"
@@ -307,7 +301,7 @@ def main():
         "RETAINED SAME-FRAME CARDS -> FOLD: PASS"
     )
     print(
-        "CHECK -> BET -> FOLD ORDER: PASS"
+        "UNKNOWN COMPLETION -> BET -> FOLD ORDER: PASS"
     )
     print(
         "RETAINED FRAME IDENTITY: PASS"
@@ -317,7 +311,7 @@ def main():
     )
     print()
     print(
-        "V0.17 SAME-FRAME CHECK BET FOLD: PASS"
+        "V0.17 SAME-FRAME UNKNOWN BET FOLD: PASS"
     )
 
 

@@ -176,6 +176,26 @@ def main():
     assert observer.hand.street == "PREFLOP"
     assert observer.hand.next_actor == "utg"
 
+    # The post-boundary observation is not prior-street semantic
+    # authority, but it is still valid physical evidence. It must
+    # survive until the retained boundary advances the semantic
+    # street and the observation can be reconsidered there.
+    retained = [
+        row
+        for row in observer.pending_quantitative_evidence
+        if (
+            row.get("frame") == 20
+            and row.get("seat") == "utg"
+        )
+    ]
+
+    assert len(retained) == 1, (
+        "RED: valid post-boundary quantitative evidence "
+        "was discarded instead of retained"
+    )
+
+    assert retained[0]["resolved_value"] == 48.0
+
     print(
         "POST-BOUNDARY QUANTITATIVE AUTHORITY: PASS"
     )

@@ -14,7 +14,6 @@ EXPECTED = [
     ("RAISE", "seat_lower_right", None, 2.0),
     ("CALL", "hero", 1.5, None),
     ("CALL", "seat_lower_left", 1.0, None),
-    ("CHECK", "hero", None, None),
     ("BET", "seat_lower_left", 3.37, None),
     ("FOLD", "seat_lower_right", None, None),
     ("CALL", "hero", 3.37, None),
@@ -96,7 +95,7 @@ def main():
             for event in events
             if (
                 event.get("type")
-                == "CHRONOLOGY_COMPLETION"
+                == "CHRONOLOGY_UNKNOWN_COMPLETION"
                 and event.get("seat")
                 == "hero"
                 and event.get("frame")
@@ -104,7 +103,7 @@ def main():
                 and event.get(
                     "semantic_action"
                 )
-                == "CHECK"
+                is None
             )
         ]
 

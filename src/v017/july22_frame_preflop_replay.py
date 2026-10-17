@@ -491,23 +491,24 @@ def replay(
                             )
 
                             for predecessor in predecessors:
-                                action = (
-                                    hand.observe_no_commitment(
-                                        predecessor
-                                    )
+                                # Later physical action proves only that
+                                # this predecessor completed first. It
+                                # cannot identify CHECK/FOLD/CALL.
+                                hand.resolve_boundary_completed_actor(
+                                    predecessor
                                 )
 
                                 events.append(
                                     {
                                         "frame": number,
                                         "type":
-                                            "CHRONOLOGY_COMPLETION",
+                                            "CHRONOLOGY_UNKNOWN_COMPLETION",
                                         "seat":
                                             predecessor,
                                         "proved_by":
                                             seat,
                                         "semantic_action":
-                                            action,
+                                            None,
                                     }
                                 )
 
@@ -790,23 +791,23 @@ def replay(
             )
 
             for seat in remaining:
-                action = (
-                    hand.observe_no_commitment(
-                        seat
-                    )
+                # River appearance proves TURN chronology completed,
+                # but does not identify the missing poker action.
+                hand.resolve_boundary_completed_actor(
+                    seat
                 )
 
                 events.append(
                     {
                         "frame": number,
                         "type":
-                            "STREET_BOUNDARY_COMPLETION",
+                            "STREET_BOUNDARY_UNKNOWN_COMPLETION",
                         "street": "TURN",
                         "seat": seat,
                         "proved_by":
                             "RIVER_BOUNDARY",
                         "semantic_action":
-                            action,
+                            None,
                     }
                 )
 

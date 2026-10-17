@@ -14,12 +14,9 @@ EXPECTED = [
     ("RAISE", "seat_lower_right", None, 2.0),
     ("CALL", "hero", 1.5, None),
     ("CALL", "seat_lower_left", 1.0, None),
-    ("CHECK", "hero", None, None),
     ("BET", "seat_lower_left", 3.37, None),
     ("FOLD", "seat_lower_right", None, None),
     ("CALL", "hero", 3.37, None),
-    ("CHECK", "hero", None, None),
-    ("CHECK", "seat_lower_left", None, None),
 ]
 
 
@@ -51,7 +48,7 @@ def main():
             if (
                 row.get("frame", 0) >= 103
                 or row.get("type")
-                == "STREET_BOUNDARY_COMPLETION"
+                == "STREET_BOUNDARY_UNKNOWN_COMPLETION"
             ):
                 print(row)
 
@@ -105,19 +102,19 @@ def main():
             )
             for row in events
             if row.get("type")
-            == "STREET_BOUNDARY_COMPLETION"
+            == "STREET_BOUNDARY_UNKNOWN_COMPLETION"
         ]
 
         assert completions == [
             (
                 115,
                 "hero",
-                "CHECK",
+                None,
             ),
             (
                 115,
                 "seat_lower_left",
-                "CHECK",
+                None,
             ),
         ], completions
 

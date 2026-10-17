@@ -1141,7 +1141,12 @@ def read_player_identities_v2(
             "snapshot_v3_identity_only",
     }
 
-def read_table_snapshot_v2(frame, dealt_in_seats=None):
+def read_table_snapshot_v2(
+    frame,
+    dealt_in_seats=None,
+    *,
+    retry_unresolved_names=True,
+):
     total_t0 = perf_counter()
 
     frame_path = Path(
@@ -1312,7 +1317,10 @@ def read_table_snapshot_v2(frame, dealt_in_seats=None):
             ].get("name")
         ]
 
-        if missing_name_cards:
+        if (
+            missing_name_cards
+            and retry_unresolved_names
+        ):
             retry_result = retry_unresolved_opponent_names(
                 fresh_players,
                 missing_name_cards,
@@ -1354,6 +1362,21 @@ def read_table_snapshot_v2(frame, dealt_in_seats=None):
                     },
                     flush=True,
                 )
+
+        elif missing_name_cards:
+            still_blank = preserve_unresolved_opponent_names(
+                fresh_players,
+                missing_name_cards,
+            )
+
+            print(
+                "[SNAPSHOT_NAME_RETRY_SKIPPED]",
+                {
+                    "requested": still_blank,
+                    "policy": "live_bootstrap_nonblocking",
+                },
+                flush=True,
+            )
 
         # Hero identity is stable across hands. A changing visual fingerprint
         # must not erase a previously confirmed Hero name.

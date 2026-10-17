@@ -1150,11 +1150,23 @@ class HandEngine:
 
         self.street = street
         self.action_order = order
-        self.pending_to_act = [
+
+        actionable = [
             seat
             for seat in order
             if self._is_actionable(seat)
         ]
+
+        # Future-street betting requires at least two players who can
+        # still wager against one another. If exactly one non-folded,
+        # non-all-in player remains alongside one or more all-in
+        # players, there is no legal betting opponent and the board
+        # runs out automatically.
+        if len(actionable) < 2:
+            self.pending_to_act = []
+        else:
+            self.pending_to_act = actionable
+
         self.current_price_bb = 0.0
 
         if board is not None:

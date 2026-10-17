@@ -43,8 +43,8 @@ from src.v017.native_seat_occupancy import (
 from src.v017.participant_freeze import (
     ParticipantFreeze,
 )
-from src.vision.dealer_detector import (
-    detect_dealer_button,
+from src.v017.native_dealer_detector import (
+    detect_native_dealer,
 )
 from src.api.position_engine import (
     assign_positions,
@@ -122,6 +122,88 @@ LATENCY_TRACE = Path(
 HISTORY_DIR = Path(
     "runtime/history"
 )
+
+
+LIVE_VALIDATION_HANDS_DIR = Path(
+    "runtime/debug/live_validation_hands"
+)
+
+
+def archive_live_validation_hand(
+    *,
+    hand_id,
+    hand_number,
+    current_hand_path=CURRENT_HAND,
+    progression_path=Path(
+        "runtime/live/v017_publication_progression.jsonl"
+    ),
+    root=LIVE_VALIDATION_HANDS_DIR,
+):
+    """
+    Preserve one completed hand as an immutable diagnostic unit.
+
+    This function has no perception, semantic, scheduling, settlement,
+    or publication authority.
+    """
+    current_hand_path = Path(current_hand_path)
+    progression_path = Path(progression_path)
+    root = Path(root)
+
+    hand_dir = root / str(hand_id)
+
+    if hand_dir.exists():
+        raise RuntimeError(
+            f"live validation hand already archived: {hand_dir}"
+        )
+
+    hand_dir.mkdir(
+        parents=True,
+        exist_ok=False,
+    )
+
+    (
+        hand_dir / "final_current_hand.txt"
+    ).write_text(
+        current_hand_path.read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+
+    (
+        hand_dir / "publication_progression.jsonl"
+    ).write_text(
+        progression_path.read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+
+    metadata = {
+        "hand_id": str(hand_id),
+        "hand_number": int(hand_number),
+    }
+
+    (
+        hand_dir / "metadata.json"
+    ).write_text(
+        json.dumps(
+            metadata,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    print(
+        "[LIVE_VALIDATION_HAND_ARCHIVED]",
+        f"hand_id={hand_id}",
+        f"path={hand_dir}",
+        flush=True,
+    )
+
+    return hand_dir
 
 
 def archive_completed_hand():
@@ -1021,6 +1103,14 @@ def wait_for_hand(
             GEOMETRY,
         )
 
+        print(
+            "[ACQUISITION_GATE]",
+            f"hero_visible={hero_visible}",
+            f"board_count={board_count}",
+            f"clean_hand_seen={clean_hand_seen}",
+            flush=True,
+        )
+
         if (
             not hero_visible
             and board_count == 0
@@ -1132,14 +1222,48 @@ def wait_for_hand(
                 flush=True,
             )
 
+            debug_dir = (
+                Path(__file__).resolve().parents[2]
+                / "runtime/debug/bootstrap_acquisition"
+            )
+            debug_dir.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            debug_path = (
+                debug_dir
+                / "latest_acquisition.png"
+            )
+
+            cv2.imwrite(
+                str(debug_path),
+                image,
+            )
+
+            print(
+                "[BOOTSTRAP_FRAME_PRESERVED]",
+                f"path={debug_path}",
+                flush=True,
+            )
+
             # Dealer ownership defines every positional label.
             # A single acquisition frame is insufficient authority:
             # the physical recording demonstrated transient false
             # dealer ownership. Require two consecutive observations
             # of the same dealer seat before releasing acquisition.
-            first_dealer = detect_dealer_button(image)
+            first_dealer = detect_native_dealer(image)
 
-            if not first_dealer.get("found"):
+            print(
+                "[NATIVE_DEALER_FIRST]",
+                first_dealer,
+                flush=True,
+            )
+
+            if (
+                first_dealer.get("dealer_button_seat") is None
+                or first_dealer.get("confidence", 0.0) < 0.80
+            ):
                 time.sleep(BOOTSTRAP_POLL_SECONDS)
                 continue
 
@@ -1149,12 +1273,19 @@ def wait_for_hand(
                 window
             )
 
-            confirm_dealer = detect_dealer_button(
+            confirm_dealer = detect_native_dealer(
                 confirm_image
             )
 
+            print(
+                "[NATIVE_DEALER_CONFIRM]",
+                confirm_dealer,
+                flush=True,
+            )
+
             if (
-                not confirm_dealer.get("found")
+                confirm_dealer.get("dealer_button_seat") is None
+                or confirm_dealer.get("confidence", 0.0) < 0.80
                 or confirm_dealer[
                     "dealer_button_seat"
                 ]
@@ -1179,11 +1310,38 @@ def wait_for_hand(
                 flush=True,
             )
 
+            # Starting stacks belong to the confirmed acquisition
+            # frame. Never carry stack authority collected while waiting
+            # for the hand into the new hand.
+            acquisition_stack_rows = bootstrap_local_stacks(
+                canonical_image=confirm_image,
+                frozen_participants=tuple(frozen),
+                geometry=GEOMETRY,
+                crop_geometry_region=crop_geometry_region,
+                stack_reader=read_stack_native_fast,
+            )
+
+            acquisition_stack_authority = {
+                row["seat"]: row
+                for row in acquisition_stack_rows
+                if row.get("stack_bb") is not None
+            }
+
+            print(
+                "[ACQUISITION_STACK_AUTHORITY]",
+                {
+                    seat: row.get("stack_bb")
+                    for seat, row
+                    in acquisition_stack_authority.items()
+                },
+                flush=True,
+            )
+
             return (
                 confirm_image,
                 confirm_path,
                 tuple(frozen),
-                participant_freeze.trusted_stacks,
+                acquisition_stack_authority,
                 confirm_dealer[
                     "dealer_button_seat"
                 ],
@@ -1796,6 +1954,7 @@ def build_observer_from_frame(
     snapshot, snapshot_timings = read_table_snapshot_v2(
         frame_path,
         dealt_in_seats=seats,
+        retry_unresolved_names=False,
     )
 
     dealer_seat = str(
@@ -1842,17 +2001,24 @@ def build_observer_from_frame(
         if row.get("seat")
     }
 
+    # Starting-stack authority belongs exclusively to the
+    # confirmed physical acquisition frame. Snapshot V2 may enrich
+    # identity, but it must never replace quantitative stack authority.
+    acquisition_stacks = dict(
+        frozen_stack_authority or {}
+    )
+
     local_players = []
 
     for seat in seats:
-        row = snapshot_players.get(
+        authority = acquisition_stacks.get(
             seat,
             {}
         )
 
         local_players.append({
             "seat": seat,
-            "stack_bb": row.get(
+            "stack_bb": authority.get(
                 "stack_bb"
             ),
         })
@@ -1867,7 +2033,7 @@ def build_observer_from_frame(
         print(
             "[BOOTSTRAP_STACK_UNKNOWN]",
             f"seats={unresolved}",
-            "source=snapshot_v2",
+            "source=acquisition_frame",
             flush=True,
         )
 
@@ -2366,11 +2532,25 @@ def reconcile_frame_evidence(
     )
 
     observer.reconcile_pending_card_disappearances()
+
+    # A retained street boundary can advance the semantic street.
+    # Quantitative evidence physically observed after that boundary
+    # was deliberately retained while the prior street remained
+    # authoritative. Once the boundary crosses, immediately give that
+    # evidence its authority opportunity on the new street rather than
+    # stranding it until an unrelated future event.
     observer.reconcile_pending_street_boundaries()
+
+    post_boundary_quantitative = (
+        observer.reconcile_pending_evidence()
+    )
+
+    observer.reconcile_pending_card_disappearances()
 
     return (
         tuple(card_rows),
-        tuple(quantitative_rows),
+        tuple(quantitative_rows)
+        + tuple(post_boundary_quantitative),
     )
 
 
@@ -2686,6 +2866,45 @@ def submit_next_pending_board_boundary(
         state.pending_board_boundaries.pop(0)
 
     return bool(submitted)
+
+
+
+def board_identity_transport_pending(state):
+    """
+    True while already-observed physical board identity still owns
+    asynchronous transport or queued semantic ownership.
+    """
+    return bool(
+        state.pending_board_boundaries
+        or state.pending_board_identity_result is not None
+        or state.board_identity_reader.future is not None
+    )
+
+
+def terminal_publication_ready(
+    observer,
+    state,
+):
+    """
+    Do not finalize a contested river while identity for the already
+    observed physical board is still outstanding.
+
+    This is a publication/finalization barrier only. It never waits
+    synchronously for the board worker.
+    """
+    if not observer.hand.hand_complete:
+        return False
+
+    if (
+        observer.hand.completion_reason == "CONTESTED"
+        and observer.hand.street == "RIVER"
+        and len(observer.hand.board) < 5
+    ):
+        return not board_identity_transport_pending(
+            state
+        )
+
+    return True
 
 
 def process_frame_transaction(
@@ -3148,7 +3367,10 @@ def process_frame_transaction(
                 admitted = (
                     observer
                     .admit_quantitative_observation(
-                        semantic_event
+                        semantic_event,
+                        all_in_confirmed=(
+                            all_in_confirmed
+                        ),
                     )
                 )
 
@@ -3523,7 +3745,10 @@ def process_frame_transaction(
         image
     )
 
-    if winner_result.get("visible"):
+    if (
+        winner_result.get("visible")
+        and not observer.hand.hand_complete
+    ):
         terminal_events = (
             observer.admit_terminal_boundary(
                 {
@@ -3732,12 +3957,35 @@ def process_frame_transaction(
         )
 
     if observer.hand.hand_complete:
+        if not terminal_publication_ready(
+            observer,
+            state,
+        ):
+            print(
+                "[HAND_COMPLETE_WAITING_FOR_BOARD_IDENTITY]",
+                f"frame={frame_id}",
+                f"street={observer.hand.street}",
+                f"board_count={len(observer.hand.board)}",
+                f"queued={len(state.pending_board_boundaries)}",
+                "inflight="
+                f"{state.board_identity_reader.future is not None}",
+                "completed_pending="
+                f"{state.pending_board_identity_result is not None}",
+                flush=True,
+            )
+
+            return FrameTransactionResult(
+                "CONTINUE",
+                result.events,
+            )
+
         print(
             "[HAND_COMPLETE]",
             f"actions="
             f"{len(observer.hand.actions)}",
             flush=True,
         )
+
         return FrameTransactionResult(
             "HAND_COMPLETE",
             result.events,
@@ -3947,6 +4195,11 @@ def main():
             stable_required=3
         )
 
+        # One diagnostic progression file owns exactly one hand.
+        # Reset before bootstrap so the existing bootstrap publication
+        # is recorded naturally and exactly once.
+        reset_publication_progression()
+
         while observer is None:
             observer = bootstrap_observer(
                 window,
@@ -3968,6 +4221,11 @@ def main():
         )
 
         archive_completed_hand()
+
+        archive_live_validation_hand(
+            hand_id=observer.hand_id,
+            hand_number=hand_number,
+        )
 
         print(
             "[NEXT_HAND] waiting...",
