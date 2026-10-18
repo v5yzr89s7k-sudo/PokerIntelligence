@@ -88,10 +88,19 @@ def process_quantitative_frame(
                 in observer.confirmed_bet_regions
                 or (
                     retry_state is not None
-                    and bool(
-                        retry_state.get(
-                            "commitment_seen",
-                            False,
+                    and (
+                        bool(
+                            retry_state.get(
+                                "commitment_seen",
+                                False,
+                            )
+                        )
+                        or (
+                            seat == observer.hero_seat
+                            and retry_state.get(
+                                "reason"
+                            )
+                            == "hero_action_completion"
                         )
                     )
                 )

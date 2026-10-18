@@ -295,6 +295,13 @@ class FrameHandObserver:
         #   - bounded attempts;
         #   - cleared immediately after quantitative resolution.
         self.quantitative_retry_pending = {}
+
+        # A bounded OCR retry may exhaust without disproving the
+        # physical stack-motion wake that created it.  Preserve that
+        # unresolved physical evidence separately from retry
+        # scheduling so a retained card disappearance cannot become
+        # FOLD merely because measurement attempts ended.
+        self.unresolved_quantitative_motion = {}
         self.quantitative_retry_max_attempts = 8
 
         # Independent settlement-confirmation ownership.
@@ -756,6 +763,80 @@ class FrameHandObserver:
                     break
 
             if match_index is None:
+                break
+
+            # Card disappearance cannot become FOLD while the same
+            # authoritative actor still owns unresolved quantitative
+            # settlement. Stack motion proves that chip commitment may
+            # be in flight; preserve both evidence classes until the
+            # quantitative lane resolves or relinquishes ownership.
+            quantitative_owned = bool(
+                next_actor
+                in self.quantitative_retry_pending
+                or next_actor
+                in self.quantitative_confirmation_pending
+            )
+
+            unresolved_motion = bool(
+                next_actor
+                in self.unresolved_quantitative_motion
+            )
+
+            if quantitative_owned or unresolved_motion:
+                print(
+                    "[CARD_DISAPPEARANCE_WAITING_FOR_QUANTITATIVE]",
+                    f"seat={next_actor}",
+                    f"retry_owned={quantitative_owned}",
+                    f"unresolved_motion={unresolved_motion}",
+                    flush=True,
+                )
+                break
+
+            # If another live player is already independently
+            # confirmed all-in and this is the only remaining
+            # actionable opponent, disappearance of that opponent's
+            # cards is not sufficient authority for FOLD after the
+            # quantitative lane exhausts.  In a called-all-in race,
+            # showdown/runout cleanup can remove the cards before a
+            # readable final stack settlement exists.
+            #
+            # Preserve the physical evidence.  A subsequent board
+            # boundary can prove that the confrontation remained
+            # contested.  Normal folds remain authoritative whenever
+            # there is more than one non-all-in opponent still able
+            # to act.
+            all_in_contenders = [
+                seat
+                for seat, player in self.hand.players.items()
+                if (
+                    getattr(player, "dealt_in", True)
+                    and not getattr(player, "folded", False)
+                    and getattr(player, "all_in", False)
+                )
+            ]
+
+            actionable_contenders = [
+                seat
+                for seat, player in self.hand.players.items()
+                if (
+                    getattr(player, "dealt_in", True)
+                    and not getattr(player, "folded", False)
+                    and not getattr(player, "all_in", False)
+                )
+            ]
+
+            called_allin_race = bool(
+                all_in_contenders
+                and actionable_contenders == [next_actor]
+            )
+
+            if called_allin_race:
+                print(
+                    "[CARD_DISAPPEARANCE_WAITING_FOR_ALLIN_RUNOUT]",
+                    f"seat={next_actor}",
+                    f"all_in={all_in_contenders}",
+                    flush=True,
+                )
                 break
 
             retained = (
@@ -1380,6 +1461,13 @@ class FrameHandObserver:
 
         seat = str(seat)
 
+        unresolved_motion = (
+            self.unresolved_quantitative_motion.pop(
+                seat,
+                None,
+            )
+        )
+
         retry = self.quantitative_retry_pending.pop(
             seat,
             None,
@@ -1395,6 +1483,7 @@ class FrameHandObserver:
         if (
             retry is not None
             or confirmation is not None
+            or unresolved_motion is not None
         ):
             print(
                 "[QUANTITATIVE_OWNERSHIP_CLEARED]",
@@ -3314,6 +3403,25 @@ class FrameHandObserver:
 
         boundary_type = None
 
+        # A raw 5 -> 0 transition after the physical river is objective
+        # hand-lifecycle evidence.  It is deliberately not poker-result
+        # authority: no action, winner, or HandEngine completion is
+        # inferred here.
+        if (
+            previous_board_count is not None
+            and int(previous_board_count) >= 5
+            and board_count == 0
+        ):
+            frame_events.append(
+                {
+                    "frame": frame_id,
+                    "type": "RIVER_BOARD_CLEARED_PHYSICAL",
+                    "board_count": board_count,
+                    "previous_board_count":
+                        previous_board_count,
+                }
+            )
+
         if previous_board_count is not None:
             if (
                 previous_board_count < 3
@@ -4002,12 +4110,37 @@ class FrameHandObserver:
 
                             retry_state = None
 
+                            self.unresolved_quantitative_motion[
+                                str(seat)
+                            ] = {
+                                "first_frame": (
+                                    retry_state or {}
+                                ).get(
+                                    "first_frame",
+                                    frame_id,
+                                ),
+                                "last_frame": frame_id,
+                                "reason": retry_reason,
+                                "commitment_seen": bool(
+                                    (
+                                        retry_state
+                                        or {}
+                                    ).get(
+                                        "commitment_seen",
+                                        False,
+                                    )
+                                    or seat
+                                    in self.confirmed_bet_regions
+                                ),
+                            }
+
                             print(
                                 "[QUANTITATIVE_RETRY_EXHAUSTED]",
                                 f"frame={frame_id}",
                                 f"seat={seat}",
                                 f"attempts={attempts}",
                                 f"reason={retry_reason}",
+                                "physical_motion_retained=True",
                                 flush=True,
                             )
 
@@ -4108,11 +4241,42 @@ class FrameHandObserver:
                             None,
                         )
 
+                        self.unresolved_quantitative_motion[
+                            str(seat)
+                        ] = {
+                            "first_frame": (
+                                retry_state or {}
+                            ).get(
+                                "first_frame",
+                                frame_id,
+                            ),
+                            "last_frame": frame_id,
+                            "reason": (
+                                (
+                                    retry_state
+                                    or {}
+                                ).get("reason")
+                                or "stack_motion"
+                            ),
+                            "commitment_seen": bool(
+                                (
+                                    retry_state
+                                    or {}
+                                ).get(
+                                    "commitment_seen",
+                                    False,
+                                )
+                                or seat
+                                in self.confirmed_bet_regions
+                            ),
+                        }
+
                         print(
                             "[QUANTITATIVE_RETRY_EXHAUSTED]",
                             f"frame={frame_id}",
                             f"seat={seat}",
                             f"attempts={attempts}",
+                            "physical_motion_retained=True",
                             flush=True,
                         )
 

@@ -2452,6 +2452,16 @@ def retire_orphan_settlement_candidates(
             seat
         )
 
+        # Orphan settlement retirement is the terminal owner for this
+        # quantitative episode.  Retry/confirmation ownership has
+        # already ended, and the objective next-street boundary proves
+        # that predecessor chronology cannot remain physically pending.
+        # Clear the matching observer-side unresolved-motion provenance
+        # so it cannot permanently fence semantic reconciliation.
+        observer.clear_quantitative_ownership(
+            seat
+        )
+
         state.quantitative_first_seen_ns.pop(
             str(seat),
             None,
@@ -3012,6 +3022,26 @@ def process_frame_transaction(
         for event in frame_card_events
     )
 
+    physical_hand_ended = any(
+        event.get("type")
+        == "RIVER_BOARD_CLEARED_PHYSICAL"
+        for event in result.events
+    )
+
+    if physical_hand_ended:
+        print(
+            "[PHYSICAL_HAND_END_PROBE]",
+            f"frame={frame_id}",
+            f"street={observer.hand.street}",
+            f"board={list(observer.hand.board)}",
+            f"board_len={len(observer.hand.board)}",
+            f"hand_complete={observer.hand.hand_complete}",
+            f"next_actor={observer.hand.next_actor}",
+            "event_types="
+            f"{tuple(event.get('type') for event in result.events)}",
+            flush=True,
+        )
+
     boundary_types = {
         "FLOP_BOUNDARY_PHYSICAL",
         "TURN_BOUNDARY_PHYSICAL",
@@ -3211,10 +3241,19 @@ def process_frame_transaction(
                     in observer.confirmed_bet_regions
                     or (
                         retry_state is not None
-                        and bool(
-                            retry_state.get(
-                                "commitment_seen",
-                                False,
+                        and (
+                            bool(
+                                retry_state.get(
+                                    "commitment_seen",
+                                    False,
+                                )
+                            )
+                            or (
+                                seat == observer.hero_seat
+                                and retry_state.get(
+                                    "reason"
+                                )
+                                == "hero_action_completion"
                             )
                         )
                     )
@@ -3956,6 +3995,25 @@ def process_frame_transaction(
             flush=True,
         )
 
+    if (
+        physical_hand_ended
+        and observer.hand.street == "RIVER"
+        and len(observer.hand.board) == 5
+        and not observer.hand.hand_complete
+    ):
+        print(
+            "[PHYSICAL_HAND_ENDED]",
+            f"frame={frame_id}",
+            "reason=river_board_cleared",
+            f"next_actor={observer.hand.next_actor}",
+            flush=True,
+        )
+
+        return FrameTransactionResult(
+            "PHYSICAL_HAND_ENDED",
+            result.events,
+        )
+
     if observer.hand.hand_complete:
         if not terminal_publication_ready(
             observer,
@@ -4129,7 +4187,7 @@ def run_hand(
             )
 
             if transaction.outcome != "CONTINUE":
-                return
+                return transaction.outcome
     finally:
         identity_enricher.close()
         state.board_identity_reader.close()
@@ -4215,17 +4273,46 @@ def main():
                     BOOTSTRAP_POLL_SECONDS
                 )
 
-        run_hand(
+        hand_outcome = run_hand(
             window,
             observer,
         )
 
-        archive_completed_hand()
+        if hand_outcome == "HAND_COMPLETE":
+            archive_completed_hand()
 
-        archive_live_validation_hand(
-            hand_id=observer.hand_id,
-            hand_number=hand_number,
-        )
+        elif hand_outcome == "PHYSICAL_HAND_ENDED":
+            print(
+                "[PHYSICAL_HAND_RETIRED]",
+                f"hand_id={observer.hand_id}",
+                "canonical_complete=False",
+                flush=True,
+            )
+
+        else:
+            raise RuntimeError(
+                "unexpected hand outcome: "
+                f"{hand_outcome!r}"
+            )
+
+        # Preserve both canonical completions and physically retired
+        # incomplete hands as diagnostic evidence.  Only canonical
+        # HAND_COMPLETE enters runtime/history.
+        try:
+            archive_live_validation_hand(
+                hand_id=observer.hand_id,
+                hand_number=hand_number,
+            )
+        except RuntimeError as exc:
+            # Diagnostic archival has no production authority.
+            # A duplicate directory from a prior application launch
+            # must never terminate live hand observation.
+            print(
+                "[LIVE_VALIDATION_ARCHIVE_FAILED]",
+                f"hand_id={observer.hand_id}",
+                f"error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
         print(
             "[NEXT_HAND] waiting...",

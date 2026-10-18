@@ -222,6 +222,12 @@ def main():
 
     assert observed == [
         (
+            "bb",
+            "CHECK",
+            None,
+            None,
+        ),
+        (
             "hero",
             "BET",
             2.12,
@@ -255,21 +261,7 @@ def main():
         )
     ]
 
-    assert len(chronology) == 1, chronology
-
-    assert chronology[0]["seat"] == "bb"
-
-    assert (
-        chronology[0]["proved_by"]
-        == "hero"
-    )
-
-    assert (
-        chronology[0][
-            "semantic_action"
-        ]
-        is None
-    )
+    assert chronology == [], chronology
 
     reconciled_fold = [
         event

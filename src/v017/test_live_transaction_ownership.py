@@ -77,6 +77,7 @@ def main():
     # never require a second observer.process_frame() call.
     for outcome in (
         "HAND_COMPLETE",
+        "PHYSICAL_HAND_ENDED",
         "CONTINUE",
     ):
         assert (
@@ -84,16 +85,29 @@ def main():
             in transaction
         )
 
+    # Hero-card disappearance still has no hand-end authority.
+    # The distinct PHYSICAL_HAND_ENDED lifecycle outcome is authorized
+    # only by objective river-board clear evidence.
     assert (
         '"PHYSICAL_HAND_END"'
         not in transaction
     )
 
     assert (
+        '"RIVER_BOARD_CLEARED_PHYSICAL"'
+        in transaction
+    )
+
+    assert (
+        '"PHYSICAL_HAND_ENDED"'
+        in transaction
+    )
+
+    assert (
         transaction.count(
             "return FrameTransactionResult("
         )
-        == 2
+        == 4
     )
 
     assert (
