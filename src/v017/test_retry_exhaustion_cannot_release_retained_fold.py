@@ -143,6 +143,15 @@ def main():
             in observer.unresolved_quantitative_motion
         ), observer.unresolved_quantitative_motion
 
+        provenance = observer.unresolved_quantitative_motion["villain"]
+
+        assert provenance["first_frame"] == 10, provenance
+        assert provenance["last_frame"] == final_frame, provenance
+        assert provenance["reason"] == "stack_motion", provenance
+        assert provenance["commitment_seen"] is False, provenance
+
+        print("RETRY EXHAUSTION PROVENANCE: PASS")
+
         before = list(observer.hand.semantic_actions())
 
         observer.reconcile_pending_card_disappearances()

@@ -4108,8 +4108,8 @@ class FrameHandObserver:
                                 None,
                             )
 
-                            retry_state = None
-
+                            # Preserve retry provenance before clearing
+                            # the active retry owner.
                             self.unresolved_quantitative_motion[
                                 str(seat)
                             ] = {
