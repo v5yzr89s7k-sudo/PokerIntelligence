@@ -19,8 +19,87 @@ private let SCK_HEIGHT = Int(
 
 
 private var engineProcess: Process?
+private let engineLifecycleLock = NSRecursiveLock()
+private var engineShutdownRequested = false
+
+private func stopSemanticEngine() {
+    engineLifecycleLock.lock()
+    defer { engineLifecycleLock.unlock() }
+
+    engineShutdownRequested = true
+
+    guard let process = engineProcess else {
+        return
+    }
+
+    let pid = process.processIdentifier
+
+    guard process.isRunning else {
+        engineProcess = nil
+        return
+    }
+
+    print("[HOST] stopping semantic engine pid=\\(pid)")
+
+    process.terminate()
+
+    let deadline = Date().addingTimeInterval(3.0)
+
+    while process.isRunning && Date() < deadline {
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+
+    if process.isRunning {
+        print("[HOST] engine termination timeout pid=\\(pid)")
+        Darwin.kill(pid, SIGKILL)
+    }
+
+    process.waitUntilExit()
+    engineProcess = nil
+
+    print("[HOST] semantic engine stopped pid=\\(pid)")
+}
+
+private var shutdownSources: [DispatchSourceSignal] = []
+
+private let shutdownQueue = DispatchQueue(
+    label: "poker.intelligence.engine.shutdown"
+)
+
+private func installShutdownHandlers() {
+    for signalNumber in [SIGINT, SIGTERM] {
+        Darwin.signal(signalNumber, SIG_IGN)
+
+        let source = DispatchSource.makeSignalSource(
+            signal: signalNumber,
+            queue: shutdownQueue
+        )
+
+        source.setEventHandler {
+            print("[HOST] shutdown requested signal=\\(signalNumber)")
+            stopSemanticEngine()
+            Darwin.exit(0)
+        }
+
+        source.resume()
+        shutdownSources.append(source)
+    }
+}
 
 private func launchSemanticEngine() {
+    engineLifecycleLock.lock()
+    defer { engineLifecycleLock.unlock() }
+
+    guard !engineShutdownRequested else {
+        print("[HOST] engine launch rejected: shutdown requested")
+        return
+    }
+
+    guard engineProcess == nil else {
+        print("[HOST] duplicate engine launch rejected")
+        return
+    }
+
     let process = Process()
 
     guard let resourcesURL =
@@ -426,6 +505,8 @@ final class LatestFrameStreamer: NSObject, SCStreamOutput {
 @main
 struct Main {
     static func main() async throws {
+        installShutdownHandlers()
+
         print(
             "POKER INTELLIGENCE — FAST SAMPLER V1"
         )
