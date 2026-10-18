@@ -3319,6 +3319,28 @@ def process_frame_transaction(
 
                 pending_before = None
 
+            # An unchanged trusted stack is not a new quantitative
+            # transition. Do not recreate settlement ownership after
+            # retiring a stale candidate.
+            if (
+                seat
+                and event.get("resolved")
+                and resolved_value is not None
+                and seat in observer.trusted_stacks
+                and abs(
+                    float(resolved_value)
+                    - float(observer.trusted_stacks[seat])
+                ) <= 0.01
+            ):
+                print(
+                    "[BASELINE_EQUAL_SETTLEMENT_SKIPPED]",
+                    f"frame={frame_id}",
+                    f"seat={seat}",
+                    f"value={resolved_value}",
+                    flush=True,
+                )
+                continue
+
             settled = state.settlement_gate.observe(
                 event,
                 phase=observer.hand.street,
