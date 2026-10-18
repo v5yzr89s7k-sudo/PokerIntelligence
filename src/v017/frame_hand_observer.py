@@ -564,6 +564,7 @@ class FrameHandObserver:
             "seat": seat,
             "frame_id": frame_id,
             "physical_type": physical_type,
+            "street": self.hand.street,
         }
 
         for existing in self.pending_card_disappearances:
@@ -744,6 +745,27 @@ class FrameHandObserver:
 
         admitted_events = []
 
+        # Retire evidence owned by an earlier semantic street,
+        # regardless of the current authoritative actor.
+        current_street = self.hand.street
+        retained_current = []
+
+        for row in self.pending_card_disappearances:
+            original_street = row.get("street", current_street)
+
+            if original_street != current_street:
+                print(
+                    "[STALE_CARD_EVIDENCE_RETIRED]",
+                    f"seat={row.get('seat')}",
+                    f"original_street={original_street}",
+                    f"current_street={current_street}",
+                    flush=True,
+                )
+            else:
+                retained_current.append(row)
+
+        self.pending_card_disappearances = retained_current
+
         while self.pending_card_disappearances:
             next_actor = self.hand.next_actor
 
@@ -764,6 +786,24 @@ class FrameHandObserver:
 
             if match_index is None:
                 break
+
+            retained = self.pending_card_disappearances[match_index]
+
+            if (
+                retained.get("street", self.hand.street)
+                != self.hand.street
+            ):
+                stale = self.pending_card_disappearances.pop(
+                    match_index
+                )
+                print(
+                    "[STALE_CARD_EVIDENCE_RETIRED]",
+                    f"seat={next_actor}",
+                    f"original_street={stale.get('street')}",
+                    f"current_street={self.hand.street}",
+                    flush=True,
+                )
+                continue
 
             # Card disappearance cannot become FOLD while the same
             # authoritative actor still owns unresolved quantitative
