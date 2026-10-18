@@ -115,6 +115,19 @@ def main():
                     ),
                 )
 
+        # Simulate the outer transaction's publication boundary.
+        # All semantic admissions for this frame are complete.
+        observer.publish_authoritative_state(number)
+
+        # Preserve the exact authoritative sequence at publication time.
+        if observer.publications:
+            latest = observer.publications[-1]
+            if latest["frame"] == number:
+                latest["semantic_snapshot"] = [
+                    semantic_action.copy()
+                    for semantic_action in observer.hand.semantic_actions()
+                ]
+
     publications = observer.publications
 
     print("===== PUBLICATION SEQUENCE =====")
@@ -151,6 +164,20 @@ def main():
     ]
 
     assert counts == sorted(counts), counts
+
+    # Every published sequence must be an exact prefix of the
+    # final authoritative hand. Counts alone cannot detect rewrites.
+    for publication in publications:
+        snapshot = publication["semantic_snapshot"]
+        count = publication["action_count"]
+
+        assert len(snapshot) == count
+        assert snapshot == final_actions[:count], (
+            "TRANSIENT SEMANTIC PUBLICATION VIOLATION: "
+            f"frame={publication['frame']}"
+        )
+
+    print("PUBLICATION SEMANTIC PREFIX: PASS")
     assert counts[-1] == 17, counts
 
     # Required active-street publications.
@@ -206,7 +233,9 @@ def main():
     # Final publication must contain the complete final product.
     final = publications[-1]
 
-    assert final["frame"] == 135
+    # Final semantic action occurs at frame 131.
+    # Unchanged frames 132-135 must not create duplicate publications.
+    assert final["frame"] == 131
     assert final["action_count"] == 17
     assert final["street"] == "RIVER"
     assert final["next_actor"] is None
