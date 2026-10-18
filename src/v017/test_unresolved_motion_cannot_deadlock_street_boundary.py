@@ -118,14 +118,14 @@ def main():
 
     assert not any(
         row.get("seat") == "villain"
-        and row.get("action") in {"CALL", "FOLD"}
+        and row.get("action") in {"CALL", "FOLD", "CHECK", "BET", "RAISE"}
         for row in added
     ), (
         "RED: street-boundary liveness guessed "
-        "ambiguous villain CALL/FOLD"
+        "ambiguous villain semantic action"
     )
 
-    print("UNRESOLVED MOTION FABRICATED CALL/FOLD: NO")
+    print("UNRESOLVED MOTION FABRICATED ACTION: NO")
     print("OBJECTIVE STREET BOUNDARY DEADLOCKED: NO")
     print(
         "V0.17 UNRESOLVED MOTION STREET "

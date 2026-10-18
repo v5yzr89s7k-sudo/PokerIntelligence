@@ -2968,6 +2968,29 @@ class FrameHandObserver:
                 blocked_pending
             )
 
+            # Retained card disappearance plus unresolved quantitative
+            # ownership cannot authorize CHECK at a street boundary.
+            # Motion alone is insufficient to suppress a boundary CHECK.
+            retained_card_seats = {
+                row.get("seat")
+                for row in self.pending_card_disappearances
+                if row.get("street", self.hand.street)
+                == self.hand.street
+            }
+
+            boundary_unknown.update(
+                seat
+                for seat in pending
+                if (
+                    seat in retained_card_seats
+                    and (
+                        seat in self.unresolved_quantitative_motion
+                        or seat in self.quantitative_retry_pending
+                        or seat in self.quantitative_confirmation_pending
+                    )
+                )
+            )
+
             for seat in pending:
                 if seat in boundary_unknown:
                     self.hand.resolve_boundary_completed_actor(
