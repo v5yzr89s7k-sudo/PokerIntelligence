@@ -34,22 +34,7 @@ from src.v017.july22_frame_preflop_replay import (
 )
 
 
-EXPECTED_PUBLICATION_FRAMES = [
-    38,
-    40,
-    40,
-    42,
-    48,
-    51,
-    52,
-    90,
-    97,
-    101,
-    103,
-    115,
-    127,
-    135,
-]
+EXPECTED_PUBLICATION_FRAMES = [1, 39, 41, 42, 48, 51, 52, 90, 98, 101, 103, 115, 127, 131]
 
 
 def build():
@@ -155,6 +140,9 @@ def main():
                             street == "RIVER"
                         ),
                     )
+
+            # Publish after all frame admissions.
+            observer.publish_authoritative_state(number)
 
             new_publications = (
                 observer.publications[
