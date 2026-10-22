@@ -3341,6 +3341,54 @@ def process_frame_transaction(
                 )
                 continue
 
+            # A confirmed physical transition already retained behind
+            # unresolved chronology must not establish another
+            # settlement epoch for the identical stack movement.
+            #
+            # Retention owns the original evidence. This guard grants
+            # no semantic authority and never advances trusted stacks.
+            retained_settlement = next(
+                (
+                    row
+                    for row in observer.pending_quantitative_evidence
+                    if (
+                        row.get("seat") == seat
+                        and row.get("settlement_confirmed") is True
+                        and row.get("resolved_value") is not None
+                        and resolved_value is not None
+                        and row.get("prior") is not None
+                        and event.get("prior") is not None
+                        and abs(
+                            float(row["resolved_value"])
+                            - float(resolved_value)
+                        ) <= 0.01
+                        and abs(
+                            float(row["prior"])
+                            - float(event["prior"])
+                        ) <= 0.01
+                        and row.get("frame") is not None
+                        and event.get("frame") is not None
+                        and int(row["frame"]) < int(event["frame"])
+                        and row.get("retained_street")
+                        == str(observer.hand.street)
+                    )
+                ),
+                None,
+            )
+
+            if retained_settlement is not None:
+                state.settlement_gate.clear_seat(seat)
+
+                print(
+                    "[RETAINED_SETTLEMENT_DUPLICATE_SKIPPED]",
+                    f"frame={frame_id}",
+                    f"seat={seat}",
+                    f"original_frame={retained_settlement.get('frame')}",
+                    f"value={resolved_value}",
+                    flush=True,
+                )
+                continue
+
             settled = state.settlement_gate.observe(
                 event,
                 phase=observer.hand.street,

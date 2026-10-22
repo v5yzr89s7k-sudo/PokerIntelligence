@@ -141,51 +141,36 @@ def run_once():
         timeline,
     )
 
-    unresolved = [
+    # Improved native OCR resolves the original physical wake
+    # at frame 12. A later independent frame must confirm the
+    # same quantitative value.
+    resolved = [
         row
         for row in timeline
-        if (
-            row[0] >= 12
-            and not row[1]
-        )
+        if row[1]
+        and row[2] is not None
+        and abs(float(row[2]) - 86.75) < 0.01
     ]
 
-    # Frame 12 is the original physical wake. Commitment is not
-    # debounced until the following frame, but ownership must
-    # already exist rather than losing the transition.
+    assert resolved, "UTG STACK TRANSITION LOST"
+
+    assert resolved[0][0] == 12, (
+        "EXPECTED EARLY NATIVE OCR RESOLUTION",
+        resolved,
+    )
+
     assert any(
-        row[0] == 12
-        and not row[1]
-        for row in timeline
-    )
+        row[0] == 13
+        and row[1]
+        and abs(float(row[2]) - 86.75) < 0.01
+        for row in resolved
+    ), "INDEPENDENT FRAME CONFIRMATION MISSING"
 
-    recovered = [
-        row
-        for row in timeline
-        if (
-            row[0] >= 17
-            and row[1]
-            and row[2] is not None
-            and abs(
-                float(row[2]) - 86.75
-            ) < 0.01
-        )
-    ]
-
-    assert unresolved, (
-        "expected unresolved OCR during physical transition"
-    )
-
-    assert recovered, (
-        "retry ownership failed to recover stable 86.75"
-    )
-
-    first_recovered = recovered[0]
-
-    assert first_recovered[0] == 17, (
-        "expected first stable recovery at saved frame 17: "
-        f"{first_recovered}"
-    )
+    assert all(
+        row[2] is not None
+        and abs(float(row[2]) - 86.75) < 0.01
+        for row in resolved
+    ), "CONTRADICTORY QUANTITATIVE VALUE"
 
     assert (
         "seat_upper_right"

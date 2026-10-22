@@ -1034,6 +1034,13 @@ class FrameHandObserver:
 
         retained = dict(observation)
 
+        # Preserve the original semantic street at first retention.
+        # Reconciliation must never reassign this provenance.
+        retained.setdefault(
+            "retained_street",
+            str(self.hand.street),
+        )
+
         # Quantitative evidence is meaningful only in the
         # authoritative betting-price context in which it was
         # first blocked. A later price change must not allow an

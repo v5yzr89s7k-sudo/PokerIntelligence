@@ -263,13 +263,23 @@ def main():
         len(seen)
     )
 
-    assert [
-        row[0]
-        for row in seen
-    ] == [
-        25,
-        30,
+    # The gate receives both candidate and independent
+    # confirmation frames. It does not own semantic consumption.
+    assert [row[0] for row in seen] == [
+        25, 26, 30, 31,
     ], seen
+
+    assert seen[0][2] is None
+    assert seen[1][2] is not None
+    assert seen[2][2] is None
+    assert seen[3][2] is not None
+
+    for index in (1, 3):
+        settled = seen[index][2]
+        assert settled.seat == "seat_mid_right"
+        assert abs(settled.prior - 22.94) < 0.01
+        assert abs(settled.value) < 0.01
+        assert abs(settled.delta_bb - 22.94) < 0.01
 
     first = seen[0][1]
     second = seen[1][1]

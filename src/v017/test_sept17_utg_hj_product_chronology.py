@@ -181,6 +181,20 @@ def run_once():
                 and abs(float(value)) <= 0.02
             )
 
+            # Match production baseline-equality ownership.
+            # An already-consumed physical stack value cannot
+            # establish another settlement candidate.
+            if (
+                seat in observer.trusted_stacks
+                and value is not None
+                and abs(
+                    float(value)
+                    - float(observer.trusted_stacks[seat])
+                ) <= 0.01
+            ):
+                gate.clear_seat(seat)
+                continue
+
             settled = gate.observe(
                 event,
                 phase=observer.hand.street,
@@ -282,7 +296,7 @@ def run_once():
 
     assert settlements == [
         (
-            18,
+            13,
             "seat_upper_right",
             92.75,
             86.75,
@@ -329,7 +343,7 @@ def run_once():
         == "seat_lower_right"
     )
 
-    text = observer.previous_text or ""
+    text = observer.render_live_projection()
 
     utg = "UTG raises to 6 BB"
     hj = "HJ raises to 22.94 BB"

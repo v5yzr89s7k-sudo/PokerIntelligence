@@ -284,10 +284,23 @@ def run_once():
         )
     ]
 
-    assert len(target) == 1, (
-        f"expected exactly one 22.94->0 settlement, "
-        f"observed={settlements}"
+    # This test exercises StackSettlementGate independently.
+    # The gate confirms physical candidate epochs but does not own
+    # semantic consumption or retained-evidence deduplication.
+    #
+    # Exactly-once production ownership is independently enforced by
+    # test_sept17_full_production_transaction.
+    assert target, (
+        "physical 22.94->0 settlement was never confirmed",
+        settlements,
     )
+
+    assert all(
+        abs(row[2] - 22.94) < 0.01
+        and abs(row[3]) < 0.01
+        and abs(row[4] - 22.94) < 0.01
+        for row in target
+    ), target
 
     print()
     print(

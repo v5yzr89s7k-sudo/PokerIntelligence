@@ -765,7 +765,7 @@ def read_stack_native_fast(crop) -> Dict[str, Any]:
 
     reading = {
         "variant": "native_green_psm7",
-        **_ocr(green),
+        **_ocr(green[80:, :]),
     }
 
     # Native ACR stack displays legitimately use either one or
