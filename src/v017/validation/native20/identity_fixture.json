@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "acquisition_frame_sha256": "a9a40800527e848a4ff389d4f2499b40d19e5d5040965bee6c02e9066d2b77eb",
+  "frame_size": [
+    3456,
+    2168
+  ],
+  "source": "native20_replay_identity_audit",
+  "players": [
+    {
+      "seat": "seat_top",
+      "name": "Savlar"
+    },
+    {
+      "seat": "seat_upper_right",
+      "name": "Jecksaw"
+    },
+    {
+      "seat": "seat_mid_right",
+      "name": "Luxzt"
+    },
+    {
+      "seat": "seat_lower_right",
+      "name": "Sabetzki"
+    },
+    {
+      "seat": "hero",
+      "name": "poker5068"
+    },
+    {
+      "seat": "seat_upper_left",
+      "name": "",
+      "candidate_name": "TopRiver23",
+      "verification_status": "pending"
+    }
+  ]
+}

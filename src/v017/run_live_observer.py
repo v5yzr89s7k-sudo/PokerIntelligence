@@ -3362,8 +3362,12 @@ def process_frame_transaction(
 
             if (
                 seat
-                and pending_before is None
                 and pending_after is not None
+                and (
+                    pending_before is None
+                    or pending_before.first_frame
+                    != pending_after.first_frame
+                )
             ):
                 state.quantitative_first_seen_ns[
                     str(seat)
@@ -3419,6 +3423,10 @@ def process_frame_transaction(
                 # semantic input. The gate authorizes it; it does
                 # not rewrite its OCR metadata.
                 semantic_event = dict(event)
+
+                # Only StackSettlementGate may authorize this marker.
+                # It records physical settlement, not poker semantics.
+                semantic_event["settlement_confirmed"] = True
 
                 if first_seen_frame is not None:
                     semantic_event[
@@ -3551,8 +3559,20 @@ def process_frame_transaction(
         # independent later-frame confirmation.  The physical board
         # boundary must survive, but may not overtake that unresolved
         # predecessor-street quantitative ownership.
+        predecessor_confirmations = {
+            seat: confirmation
+            for seat, confirmation
+            in observer.quantitative_confirmation_pending.items()
+            if (
+                confirmation.get("first_frame") is not None
+                and int(confirmation["first_frame"]) <= int(frame_id)
+                and confirmation.get("street") == observer.hand.street
+            )
+        }
+
         quantitative_pending = bool(
             state.settlement_gate.pending
+            or predecessor_confirmations
         )
 
         if quantitative_pending:
@@ -4093,6 +4113,21 @@ def run_hand(
             image, frame_path = (
                 capture_image(window)
             )
+
+            if frame_id == 1:
+                # Bootstrap may have spent several seconds resolving
+                # table authority after its acquisition frame.
+                # Rebase only the stack-motion comparison.
+                #
+                # Do not reset card visibility, board chronology,
+                # quantitative ownership, or HandEngine.
+                observer.previous_frame = image.copy()
+
+                print(
+                    "[LIVE_STACK_BASELINE_REFRESHED]",
+                    "frame=1",
+                    flush=True,
+                )
 
             # Capture latency ends at authoritative frame acquisition.
             # Temporal identity collection/materialization is auxiliary

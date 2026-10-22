@@ -822,6 +822,10 @@ class FrameHandObserver:
                 in self.unresolved_quantitative_motion
             )
 
+            # Retry exhaustion does not prove that physical
+            # stack motion was irrelevant to chip commitment.
+            # Preserve unresolved ownership until independent
+            # evidence or authoritative chronology resolves it.
             if quantitative_owned or unresolved_motion:
                 print(
                     "[CARD_DISAPPEARANCE_WAITING_FOR_QUANTITATIVE]",
@@ -2300,12 +2304,12 @@ class FrameHandObserver:
                 return ()
 
             for predecessor in predecessors:
-                action = (
-                    self.hand
-                    .observe_no_commitment(
-                        predecessor
-                    )
+                # Later actor evidence proves predecessor chronology,
+                # not the predecessor's exact poker action.
+                self.hand.resolve_boundary_completed_actor(
+                    predecessor
                 )
+                action = None
 
                 event = {
                     "frame":
@@ -2313,7 +2317,7 @@ class FrameHandObserver:
                             "frame"
                         ),
                     "type":
-                        "CHRONOLOGY_COMPLETION",
+                        "CHRONOLOGY_UNKNOWN_COMPLETION",
                     "seat": predecessor,
                     "proved_by": seat,
                     "semantic_action":
@@ -2396,7 +2400,19 @@ class FrameHandObserver:
                 == "hero_action_completion"
             )
 
-            if hero_completion_owned:
+            opponent_commitment_owned = bool(
+                seat != self.hero_seat
+                and retry_state is not None
+                and retry_state.get("commitment_seen") is True
+                and retry_state.get("street") == self.hand.street
+                and retry_state.get("actor_at_first_motion") == seat
+                and int(retry_state.get("attempts", 0))
+                < self.quantitative_retry_max_attempts
+                and seat in self.hand.pending_to_act
+                and self.hand.next_actor == seat
+            )
+
+            if hero_completion_owned or opponent_commitment_owned:
                 # Hero completion proves that an action occurred and
                 # owns a bounded follow-up measurement opportunity.
                 # A below-price intermediate reading may therefore be
@@ -2409,7 +2425,12 @@ class FrameHandObserver:
                     f"seat={seat}",
                     f"prior={prior}",
                     f"value={value}",
-                    "reason=hero_completion_below_current_price",
+                    "reason="
+                    + (
+                        "hero_completion_below_current_price"
+                        if hero_completion_owned
+                        else "opponent_commitment_below_current_price"
+                    ),
                     flush=True,
                 )
 
@@ -2676,6 +2697,21 @@ class FrameHandObserver:
 
             if int(frame) <= boundary_frame:
                 retired.append(observation)
+
+                # Terminally retired predecessor evidence may
+                # advance physical accounting, never poker semantics.
+                # Unresolved or unconfirmed OCR has no authority.
+                if (
+                    observation.get("resolved") is True
+                    and observation.get("resolved_value") is not None
+                    and observation.get("settlement_confirmed") is True
+                ):
+                    self._advance_physical_stack_baseline(
+                        observation.get("seat"),
+                        observation["resolved_value"],
+                        frame=frame,
+                        reason="prior_street_quantitative_retired",
+                    )
 
                 print(
                     "[PRIOR_STREET_QUANTITATIVE_RETIRED]",
@@ -3029,18 +3065,18 @@ class FrameHandObserver:
 
                     continue
 
-                action = (
-                    self.hand
-                    .observe_no_commitment(
-                        seat
-                    )
+                # Physical street progression proves completion,
+                # not an independently observed CHECK.
+                self.hand.resolve_boundary_completed_actor(
+                    seat
                 )
+                action = None
 
                 completion = {
                     "frame":
                         observation.get("frame"),
                     "type":
-                        "STREET_BOUNDARY_COMPLETION",
+                        "STREET_BOUNDARY_UNKNOWN_COMPLETION",
                     "street":
                         self.hand.street,
                     "seat": seat,
@@ -3065,11 +3101,62 @@ class FrameHandObserver:
                     f"next_actor={self.hand.next_actor}"
                 )
 
+        previous_street = str(self.hand.street)
+
         self.hand.start_street(
             street,
             list(action_order),
             board=observed_board,
         )
+
+        # Direct boundary admission must retire predecessor
+        # quantitative evidence just as retained-boundary
+        # reconciliation does. Otherwise an old physical stack
+        # decrease can become a new-street poker action.
+        self.retire_quantitative_evidence_before_boundary(
+            observation.get("frame")
+        )
+
+        # A completed semantic street cannot retain ownership
+        # of unresolved betting actions from its predecessor.
+        # Preserve independent physical accounting evidence.
+        if str(self.hand.street) != previous_street:
+            retired_motion = tuple(
+                seat
+                for seat, provenance
+                in self.pre_boundary_stack_motion.items()
+                if provenance.get("street") == previous_street
+            )
+
+            for seat in retired_motion:
+                self.pre_boundary_stack_motion.pop(
+                    seat, None
+                )
+
+            # Retire only evidence explicitly owned by the
+            # completed street. Unknown ownership remains retained
+            # and cannot be treated as proof of a new-street action.
+            for ownership in (
+                self.unresolved_quantitative_motion,
+                self.quantitative_retry_pending,
+                self.quantitative_confirmation_pending,
+            ):
+                for seat, provenance in tuple(
+                    ownership.items()
+                ):
+                    if (
+                        provenance.get("street")
+                        == previous_street
+                    ):
+                        ownership.pop(seat, None)
+
+            print(
+                "[STREET_QUANTITATIVE_OWNERSHIP_RETIRED]",
+                f"from={previous_street}",
+                f"to={self.hand.street}",
+                f"motion={retired_motion}",
+                flush=True,
+            )
 
         admitted = {
             "frame":
@@ -3814,7 +3901,9 @@ class FrameHandObserver:
                             ),
                             "reason":
                                 "hero_action_completion",
-                        }
+                                "actor_at_first_motion": self.hand.next_actor,
+                        "street": str(self.hand.street),
+                            }
 
                         print(
                             "[HERO_QUANTITATIVE_RETRY_ARMED]",
@@ -3890,7 +3979,9 @@ class FrameHandObserver:
                     "last_frame": frame_id,
                     "commitment_seen": True,
                     "reason": "bet_region_appearance",
-                }
+                        "actor_at_first_motion": self.hand.next_actor,
+                "street": str(self.hand.street),
+                    }
 
                 print(
                     "[QUANTITATIVE_RETRY_ARMED]",
@@ -3985,19 +4076,40 @@ class FrameHandObserver:
                 # This grants no semantic authority and changes no gate.
                 if (
                     boundary_type is not None
-                    and motion.wake
                     and seat == self.hand.next_actor
                 ):
-                    self.pre_boundary_stack_motion[
-                        str(seat)
-                    ] = {
-                        "frame": frame_id,
-                        "street": str(
-                            self.hand.street
-                        ),
-                        "boundary_frame": frame_id,
-                        "boundary_type": boundary_type,
-                    }
+                    motion_first_frame = None
+                    motion_actor = None
+
+                    if (
+                        retry_state is not None
+                        and retry_state.get("reason") == "stack_motion"
+                        and retry_state.get("actor_at_first_motion") == seat
+                    ):
+                        motion_first_frame = retry_state.get(
+                            "first_frame"
+                        )
+                        motion_actor = retry_state.get(
+                            "actor_at_first_motion"
+                        )
+
+                    elif motion.wake:
+                        motion_first_frame = frame_id
+                        motion_actor = seat
+
+                    if (
+                        motion_first_frame is not None
+                        and int(motion_first_frame) <= int(frame_id)
+                    ):
+                        self.pre_boundary_stack_motion[
+                            str(seat)
+                        ] = {
+                            "frame": int(motion_first_frame),
+                            "street": str(self.hand.street),
+                            "boundary_frame": frame_id,
+                            "boundary_type": boundary_type,
+                            "actor_at_first_motion": motion_actor,
+                        }
 
                     print(
                         "[PRE_BOUNDARY_STACK_MOTION]",
@@ -4132,11 +4244,19 @@ class FrameHandObserver:
                                     in self.confirmed_bet_regions
                                 ),
                                 "reason": "stack_motion",
-                            }
+                                "actor_at_first_motion": self.hand.next_actor,
+                                "baseline_confirmations": 0,
+                            "street": str(self.hand.street),
+                                          }
                             self.quantitative_retry_pending[
                                 seat
                             ] = retry_state
                             retry_reason = "stack_motion"
+
+                        retry_state["baseline_confirmations"] = (
+                            int(retry_state.get("baseline_confirmations", 0))
+                            + 1
+                        )
 
                         attempts = int(
                             retry_state.get(
@@ -4195,7 +4315,10 @@ class FrameHandObserver:
                                     or seat
                                     in self.confirmed_bet_regions
                                 ),
-                            }
+                                    "actor_at_first_motion": ((retry_state or {}).get("actor_at_first_motion", self.hand.next_actor)),
+                                    "baseline_confirmations": int((retry_state or {}).get("baseline_confirmations", 0)),
+                            "street": str((retry_state or {}).get("street", self.hand.street)),
+                                }
 
                             print(
                                 "[QUANTITATIVE_RETRY_EXHAUSTED]",
@@ -4286,7 +4409,9 @@ class FrameHandObserver:
                                 )
                                 or "stack_motion"
                             ),
-                        }
+                                "actor_at_first_motion": ((retry_state or {}).get("actor_at_first_motion", self.hand.next_actor)),
+                        "street": str((retry_state or {}).get("street", self.hand.street)),
+                            }
 
                         print(
                             "[QUANTITATIVE_RETRY_ARMED]",
@@ -4332,7 +4457,10 @@ class FrameHandObserver:
                                 or seat
                                 in self.confirmed_bet_regions
                             ),
-                        }
+                                "actor_at_first_motion": ((retry_state or {}).get("actor_at_first_motion", self.hand.next_actor)),
+                                "baseline_confirmations": int((retry_state or {}).get("baseline_confirmations", 0)),
+                        "street": str((retry_state or {}).get("street", self.hand.street)),
+                            }
 
                         print(
                             "[QUANTITATIVE_RETRY_EXHAUSTED]",
@@ -4342,6 +4470,39 @@ class FrameHandObserver:
                             "physical_motion_retained=True",
                             flush=True,
                         )
+
+                if (
+                    confirmation_state is not None
+                    and (
+                        not resolution.resolved
+                        or resolution.value is None
+                    )
+                    and frame_id != confirmation_state.get(
+                        "last_frame"
+                    )
+                ):
+                    attempts = int(
+                        confirmation_state.get("attempts", 0)
+                    ) + 1
+
+                    if (
+                        attempts
+                        >= self.quantitative_confirmation_max_attempts
+                    ):
+                        self.quantitative_confirmation_pending.pop(
+                            seat, None
+                        )
+
+                        print(
+                            "[QUANTITATIVE_CONFIRMATION_EXHAUSTED]",
+                            f"frame={frame_id}",
+                            f"seat={seat}",
+                            "reason=unresolved_ocr",
+                            flush=True,
+                        )
+                    else:
+                        confirmation_state["attempts"] = attempts
+                        confirmation_state["last_frame"] = frame_id
 
                 if (
                     resolution.resolved
@@ -4422,7 +4583,8 @@ class FrameHandObserver:
                             "first_frame": frame_id,
                             "last_frame": frame_id,
                             "attempts": 0,
-                        }
+                        "street": str(self.hand.street),
+                            }
 
                         print(
                             "[QUANTITATIVE_CONFIRMATION_ARMED]",

@@ -21,6 +21,10 @@ process_frame_transaction() used by live ACR.
 """
 
 from pathlib import Path
+import hashlib
+import json
+from contextlib import nullcontext
+from unittest.mock import patch
 import time
 
 import cv2
@@ -42,6 +46,8 @@ from src.v017.run_live_observer import (
 from src.v017.frame_hand_observer import (
     hero_cards_visible,
 )
+
+from src.v017.native_dealer_detector import detect_native_dealer
 
 from src.v017.native_seat_occupancy import (
     native_occupied_seats,
@@ -65,11 +71,57 @@ OBSERVER_INPUT = (
 
 
 
+
+def load_replay_identity_snapshot(frame_path, fixture_path, seats):
+    fixture = json.loads(Path(fixture_path).read_text())
+
+    assert fixture["schema_version"] == 1
+
+    image = cv2.imread(str(frame_path))
+    assert image is not None
+
+    assert [image.shape[1], image.shape[0]] == fixture["frame_size"]
+
+    digest = hashlib.sha256(
+        Path(frame_path).read_bytes()
+    ).hexdigest()
+
+    assert digest == fixture["acquisition_frame_sha256"], (
+        "REPLAY IDENTITY FRAME HASH MISMATCH"
+    )
+
+    rows = fixture["players"]
+    fixture_seats = [row["seat"] for row in rows]
+
+    assert len(fixture_seats) == len(set(fixture_seats))
+    assert set(fixture_seats) == set(seats), (
+        "REPLAY IDENTITY SEAT SET MISMATCH"
+    )
+
+    players = [
+        {
+            "seat": row["seat"],
+            "name": row.get("name") or "",
+            "is_hero": row["seat"] == "hero",
+        }
+        for row in rows
+    ]
+
+    return {
+        "dealer_button_seat": "",
+        "players": players,
+        "occupied_seats": list(seats),
+        "confidence": None,
+        "source": "hash_verified_replay_fixture",
+    }, {"total_ms": 0.0}
+
+
 def run(
     observer_input=OBSERVER_INPUT,
     *,
     publish_live_product=False,
     publication_dir=None,
+    identity_fixture=None,
 ):
     observer_input = Path(observer_input)
 
@@ -166,15 +218,90 @@ def run(
                 f"streak={participant_freeze.streak}",
             )
 
-        observer = build_observer_from_frame(
-            image,
-            path,
-            hand_id="pixel-simulation",
-            frozen_participants=
-                frozen_participants,
-            frozen_stack_authority=
-                participant_freeze.trusted_stacks,
+        first_dealer = detect_native_dealer(image)
+
+        if index + 1 >= len(paths):
+            raise RuntimeError(
+                "dealer confirmation requires another frame"
+            )
+
+        confirm_image = cv2.imread(
+            str(paths[index + 1])
         )
+
+        assert confirm_image is not None
+
+        second_dealer = detect_native_dealer(
+            confirm_image
+        )
+
+        first_seat = first_dealer.get(
+            "dealer_button_seat"
+        )
+
+        second_seat = second_dealer.get(
+            "dealer_button_seat"
+        )
+
+        if not (
+            first_seat
+            and first_seat == second_seat
+            and first_dealer.get("confidence", 0) >= 0.80
+            and second_dealer.get("confidence", 0) >= 0.80
+        ):
+            raise RuntimeError(
+                "physical dealer confirmation failed"
+            )
+
+
+        # Read starting stacks from the preserved acquisition frame.
+        acquisition_rows = bootstrap_local_stacks(
+            canonical_image=image,
+            frozen_participants=frozen_participants,
+            geometry=GEOMETRY,
+            crop_geometry_region=crop_geometry_region,
+            stack_reader=read_stack_native_fast,
+        )
+
+        acquisition_authority = {
+            str(row["seat"]): {
+                "stack_bb": float(row["stack_bb"])
+            }
+            for row in acquisition_rows
+            if (
+                row.get("seat")
+                and row.get("stack_bb") is not None
+            )
+        }
+
+        print(
+            "[PIXEL_ACQUISITION_STACKS]",
+            acquisition_authority,
+            flush=True,
+        )
+
+        snapshot_context = nullcontext()
+
+        if identity_fixture is not None:
+            snapshot_result = load_replay_identity_snapshot(
+                path,
+                identity_fixture,
+                frozen_participants,
+            )
+            snapshot_context = patch(
+                "src.v017.run_live_observer.read_table_snapshot_v2",
+                return_value=snapshot_result,
+            )
+
+        with snapshot_context:
+            observer = build_observer_from_frame(
+                image,
+                path,
+                hand_id="pixel-simulation",
+                frozen_participants=frozen_participants,
+                frozen_stack_authority=acquisition_authority,
+                confirmed_dealer_seat=first_seat,
+            )
 
         if observer is None:
             raise RuntimeError(
