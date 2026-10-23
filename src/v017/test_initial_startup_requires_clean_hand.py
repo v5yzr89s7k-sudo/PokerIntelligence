@@ -63,6 +63,9 @@ def main():
         create=True,
     ), patch.object(
         live,
+        "cv2",
+    ) as mocked_cv2, patch.object(
+        live,
         "hand_participant_presence",
         return_value={
             "hero": {

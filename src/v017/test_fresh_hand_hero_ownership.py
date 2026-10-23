@@ -58,7 +58,7 @@ def main():
     assert "image," in wait
     assert "path," in wait
     assert "tuple(frozen)," in wait
-    assert "participant_freeze.trusted_stacks" in wait
+    assert "acquisition_stack_authority" in wait
 
     # Bootstrap must consume and forward that same acquisition-owned
     # participant/stack authority rather than reconstructing it from
