@@ -1807,6 +1807,27 @@ def admit_board_catchup(
             observer
         )
 
+        # Delayed board identity cannot overtake unresolved
+        # quantitative ownership on the current semantic street.
+        pending_quantitative = any(
+            provenance.get("street") == observer.hand.street
+            for ownership in (
+                observer.quantitative_confirmation_pending,
+                observer.quantitative_retry_pending,
+                observer.unresolved_quantitative_motion,
+            )
+            for provenance in ownership.values()
+        )
+
+        if pending_quantitative:
+            print(
+                "[BOARD_CATCHUP_QUANTITATIVE_BLOCKED]",
+                f"frame={frame_id}",
+                f"street={observer.hand.street}",
+                flush=True,
+            )
+            break
+
         admitted = observer.admit_street_boundary(
             synthetic_boundary,
             action_order=order,
@@ -2682,6 +2703,9 @@ def apply_async_board_identity_result(
             board=board,
         )
 
+        if len(observer.hand.board) < len(board):
+            return None
+
     return True
 
 
@@ -2775,6 +2799,16 @@ def finalize_async_board_identity_result(
         observer,
         pending_completed,
     )
+
+    if applied is None:
+        # Preserve blocked identity for retry after settlement.
+        return {
+            "applied": False,
+            "deferred": True,
+            "reconciled_cards": (),
+            "reconciled_quantitative": (),
+            "publication": None,
+        }
 
     if not applied:
         # Failed/unusable identity is consumed; transport may continue
