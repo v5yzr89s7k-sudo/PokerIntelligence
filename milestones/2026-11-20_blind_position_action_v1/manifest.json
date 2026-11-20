@@ -1,0 +1,11 @@
+{
+  "board_sha256": "8a363f2c9a88b81c68316e3770e79168e624bf0d5ca9080d2637af1d6c3d24cf",
+  "rapid_action_frames": [
+    22,
+    166,
+    173
+  ],
+  "recording": "pi_native_live_20261119_123904",
+  "source_sha256": "700101d94a136375810700eefea35c0c65b7c01f8e77199cdc812ef853e4ea2a",
+  "tag": "pi-blind-position-action-milestone-2026-11-20-v1"
+}
