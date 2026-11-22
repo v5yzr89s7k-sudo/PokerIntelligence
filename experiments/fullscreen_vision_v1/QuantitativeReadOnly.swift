@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(CryptoKit)
+import CryptoKit
+#endif
 
 struct OCRLine {
     let text: String
@@ -235,6 +238,235 @@ func scan(_ root:URL,_ out:URL) throws {
     try data.write(to:out,options:.atomic)
     print("NUMERIC_SCAN_PASS frames=\(frames.count) status=\(counts.sorted{$0.key<$1.key}.map{"\($0.key):\($0.value)"}.joined(separator:",")) output=\(out.path)")
 }
+
+// Read-only incremental numeric projection.
+// Recorder remains the sole writer of current_hand.txt and actions.
+struct NumericFollowCursor {
+    let root: URL
+    var through: Int = 0
+    var snapshots = [[String:Any]]()
+    var counts = [String:Int]()
+    var priorSeatsByHand = [String:[String:(Double,Double)]]()
+    var rosterLoaded = Set<String>()
+
+    mutating func consume(frames: [[String:Any]], through end: Int) throws {
+        guard end >= through && end <= frames.count else {
+            throw NSError(domain:"NUMERIC_CURSOR_INVALID",code:end)
+        }
+        guard end > through else { return }
+
+        var rosters = [[String:Any]]()
+        let rosterURL = root.appendingPathComponent(
+            "observed_verified_dealt_in_rosters.json"
+        )
+        if let array = try? jsonFile(rosterURL) as? [[String:Any]] {
+            rosters = array
+        }
+
+        for n in (through+1)...end {
+            let frame = frames[n-1]
+            guard frame["id"] as? Int == n else {
+                throw NSError(domain:"NUMERIC_FRAME_ID",code:n)
+            }
+
+            let doc = try loadOCR(root,n)
+            guard doc["frame"] as? Int == n,
+                  let fingerprint = doc["sourceFingerprint"] as? String,
+                  fingerprint.hasPrefix("sha256:") else {
+                throw NSError(domain:"NUMERIC_OCR_IDENTITY",code:n)
+            }
+
+            #if canImport(CryptoKit)
+            guard let relative = frame["file"] as? String,
+                  !relative.hasPrefix("/"),
+                  !relative.contains("..") else {
+                throw NSError(domain:"NUMERIC_IMAGE_PATH",code:n)
+            }
+
+            let bytes = try Data(
+                contentsOf:root.appendingPathComponent(relative)
+            )
+            let digest = SHA256.hash(data:bytes).map {
+                String(format:"%02x",$0)
+            }.joined()
+
+            guard fingerprint == "sha256:"+digest else {
+                throw NSError(domain:"NUMERIC_IMAGE_FINGERPRINT",code:n)
+            }
+            #endif
+
+            let lines = parseLines(doc)
+            let hands = lines.compactMap {
+                captureMatch(rxHand,$0.text)
+            }
+            let hand = hands.count == 1 ? hands[0] : nil
+
+            if let hand = hand,
+               let roster = rosters.first(where:{
+                   ($0["hand"] as? String) == hand &&
+                   ($0["rosterFrame"] as? Int ?? Int.max) < n
+               }), !rosterLoaded.contains(hand) {
+
+                let rosterFrame = roster["rosterFrame"] as? Int ?? 0
+
+                if rosterFrame >= 1 && rosterFrame < n,
+                   let names = roster["clockwiseRing"] as? [String] {
+
+                    let rdoc = try loadOCR(root,rosterFrame)
+                    var known = [String:(Double,Double)]()
+
+                    for line in parseLines(rdoc)
+                        where names.contains(line.text) &&
+                              line.confidence >= 0.8 {
+                        if known[line.text] == nil {
+                            known[line.text] = (line.x,line.y)
+                        }
+                    }
+
+                    priorSeatsByHand[hand] = known
+                    rosterLoaded.insert(hand)
+                }
+            }
+
+            if let observation = extractSnapshot(
+                doc,
+                knownNames:hand.flatMap {
+                    priorSeatsByHand[$0].map { Array($0.keys) }
+                } ?? [],
+                pastSeats:hand.flatMap {
+                    priorSeatsByHand[$0]
+                } ?? [:]
+            ) {
+                guard observation.frame == n &&
+                      observation.sourceFingerprint == fingerprint else {
+                    throw NSError(domain:"NUMERIC_FRAME_OWNERSHIP",code:n)
+                }
+
+                counts[observation.status,default:0] += 1
+
+                if observation.pot != nil || observation.total != nil {
+                    snapshots.append(observation.jsonValue())
+                }
+            }
+
+            through = n
+        }
+    }
+
+    func data() throws -> Data {
+        let object:[String:Any] = [
+            "recording":root.lastPathComponent,
+            "total_frames":through,
+            "numeric_snapshots":snapshots,
+            "status_counts":counts,
+            "authoritative_actions_created":0,
+            "network_calls":0
+        ]
+        return try JSONSerialization.data(
+            withJSONObject:object,
+            options:[.sortedKeys,.prettyPrinted]
+        )
+    }
+}
+
+func numericFollowerReplayTest(_ root: URL, _ output: URL) throws {
+    guard let frames = try jsonFile(
+        root.appendingPathComponent("frames.json")
+    ) as? [[String:Any]] else {
+        throw NSError(domain:"MISSING_FRAMES",code:1)
+    }
+
+    var cursor = NumericFollowCursor(root:root)
+    let size = frames.count
+
+    let boundaries = [
+        0,1,2,3,17,18,44,73,100,160,200,
+        233,234,235,236,237,238,299,319,size
+    ].filter { $0 <= size }
+
+    for edge in boundaries.sorted() {
+        try cursor.consume(frames:frames,through:edge)
+    }
+
+    try cursor.consume(frames:frames,through:size)
+    try cursor.data().write(to:output,options:.atomic)
+
+    print(
+        "NUMERIC_INCREMENTAL_REPLAY_PASS frames=\(size) " +
+        "through=\(cursor.through) actions=0"
+    )
+}
+
+func followNumericSession(
+    _ root: URL, _ output: URL, pollMilliseconds: Int
+) throws {
+    guard pollMilliseconds >= 100 && pollMilliseconds <= 5000 else {
+        throw NSError(domain:"FOLLOW_CADENCE",code:pollMilliseconds)
+    }
+
+    // The follower cannot overwrite the authoritative hand history.
+    guard output.lastPathComponent ==
+              "observed_numeric_snapshots.json",
+          output.deletingLastPathComponent()
+              .standardizedFileURL.path ==
+              root.standardizedFileURL.path else {
+        throw NSError(domain:"NUMERIC_OUTPUT_OWNERSHIP",code:1)
+    }
+
+    let statusURL = root.appendingPathComponent("status.json")
+    let framesURL = root.appendingPathComponent("frames.json")
+    var cursor = NumericFollowCursor(root:root)
+    var lastObserved = 0
+    var missingStart = Date()
+
+    while true {
+        if let status = try? jsonFile(statusURL) as? [String:Any],
+           let analyzed = status["analyzed"] as? Int,
+           let frames = try? jsonFile(framesURL) as? [[String:Any]],
+           analyzed >= cursor.through &&
+           analyzed <= frames.count {
+
+            missingStart = Date()
+
+            if analyzed > cursor.through {
+                try cursor.consume(frames:frames,through:analyzed)
+                try cursor.data().write(to:output,options:.atomic)
+
+                lastObserved = analyzed
+
+                print(
+                    "NUMERIC_FOLLOW_PROGRESS through=\(analyzed) " +
+                    "records=\(cursor.snapshots.count)"
+                )
+            }
+
+            let stopped = status["stopped"] as? Bool ?? false
+
+            if stopped && lastObserved == analyzed {
+                if !FileManager.default.fileExists(
+                    atPath:output.path
+                ) {
+                    try cursor.data().write(
+                        to:output,options:.atomic
+                    )
+                }
+
+                print(
+                    "NUMERIC_FOLLOW_PASS frames=\(cursor.through) actions=0"
+                )
+                return
+            }
+
+        } else if Date().timeIntervalSince(missingStart) > 30 {
+            throw NSError(domain:"NUMERIC_SOURCE_STALE",code:0)
+        }
+
+        Thread.sleep(
+            forTimeInterval:Double(pollMilliseconds)/1000.0
+        )
+    }
+}
+
 @main struct QuantitativeReadOnly {
     static func main() throws {
         let args=CommandLine.arguments
@@ -275,6 +507,20 @@ func scan(_ root:URL,_ out:URL) throws {
             print("QUANTITATIVE_ANCHOR_PASS arithmetic=2/2 unresolved_pot_overlay=1 bad_wager_gate=YES identity_overlays_blocked=YES fabricated_actions=0")
         } else if args.count==4 && args[1]=="--scan" {
             try scan(URL(fileURLWithPath:args[2]),URL(fileURLWithPath:args[3]))
-        } else {print("Usage: --check <353_root> <354_root> | --scan <run_root> <output.json>");throw NSError(domain:"ARGS",code:1)}
+        } else if args.count==4 && args[1]=="--incremental-test" {
+            try numericFollowerReplayTest(URL(fileURLWithPath:args[2]),URL(fileURLWithPath:args[3]))
+        } else if args.count==5 && args[1]=="--follow" {
+            guard let ms=Int(args[4]) else {
+                throw NSError(domain:"BAD_MS",code:4)
+            }
+            try followNumericSession(
+                URL(fileURLWithPath:args[2]),
+                URL(fileURLWithPath:args[3]),
+                pollMilliseconds:ms
+            )
+        } else {
+            print("Usage: --check <353> <354> | --scan <root> <out> | --incremental-test <root> <out> | --follow <root> <out> <poll_ms>")
+            throw NSError(domain:"ARGS",code:1)
+        }
     }
 }

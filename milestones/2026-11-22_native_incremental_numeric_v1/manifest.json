@@ -1,0 +1,20 @@
+{
+  "authoritative_actions_created": 0,
+  "current_hand_writer": "UNCHANGED",
+  "incremental_determinism": "3/3 per recording",
+  "incremental_equals_full_scan": true,
+  "live_cursor_simulation": "PASS",
+  "network_calls": 0,
+  "original_frames_verified": 943,
+  "output_file": "observed_numeric_snapshots.json",
+  "parent_sha256": "cf7ee1529e434efbbad08324b524b4a212f35ee5b76363e49e08a8a1c3d2bbb2",
+  "production_observer_sha256": "04317f5a8b72a9ad18cac179f6f03e495141afe4e21b131b78f6181ea419d269",
+  "recordings": [
+    353,
+    354,
+    236
+  ],
+  "source_sha256": "62c230e311debf9c34fee576ac4f42896c447c5dc6cf4e65e563d6c113e1ffcf",
+  "unresolved_early_roster_wagers": 351,
+  "verified_early_roster_wager_owners": 199
+}
