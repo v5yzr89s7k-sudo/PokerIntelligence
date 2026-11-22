@@ -1,0 +1,9 @@
+{
+  "api_calls": 0,
+  "board_sha256": "8a363f2c9a88b81c68316e3770e79168e624bf0d5ca9080d2637af1d6c3d24cf",
+  "live_236_replay_events": 25,
+  "new_actions": 4,
+  "original_355_event_regression": 46,
+  "source_sha256": "1c0cfbc8d045dd31d8166c2f5a7d47891909ec148d6a487cff175086036ca065",
+  "status": "OFFLINE_REPLAY_VERIFIED; LIVE_VALIDATION_PENDING"
+}

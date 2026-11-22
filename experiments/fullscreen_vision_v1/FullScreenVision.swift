@@ -476,10 +476,7 @@ func withRetainedWinnerSeat(
                   abs(line.x - c.x) < 0.045,
                   c.y - line.y > 0.035,
                   c.y - line.y < 0.078,
-                  name.range(
-                      of: "^[A-Za-z][A-Za-z0-9_]{2,31}$",
-                      options: .regularExpression
-                  ) != nil,
+                  plausibleACRPlayerName(name),
                   !forbidden.contains(name.lowercased())
             else { continue }
 
@@ -549,6 +546,22 @@ func localWinnerSignals(_ lines: [LocalOCRLine]) -> [LocalOCRLine] {
     return signals
 }
 
+func plausibleACRPlayerName(_ raw: String) -> Bool {
+    let name = raw.trimmingCharacters(in: .whitespaces)
+    guard name.range(of:"^[A-Za-z0-9_]{3,31}$",
+                     options:.regularExpression) != nil,
+          name.range(of:"[A-Za-z]",options:.regularExpression) != nil,
+          name.range(of:"^[0-9]+(?:\\.[0-9]+)?BB$",
+                     options:[.regularExpression,.caseInsensitive]) == nil
+    else { return false }
+    let excluded = Set(["FOLD","FOLDR","CALL","RAISE","RAISER",
+        "CHECK","BET","WIN","WINER","WINNER","KER","LER",
+        "ANTE","ANTER","POSTBB","POSTSB","ALLIN","POT",
+        "TOTAL","TIME","BANK","TIMEBANK","CURRENT","PREVIOUS",
+        "SHOW","SIT","SITOUT","SITTING","OUT","OPTIONS","DEALER"])
+    return !excluded.contains(name.uppercased())
+}
+
 func localOverlayTransitions(_ before: LocalOCRFrame, _ after: LocalOCRFrame) -> [LocalOverlayCandidate] {
     guard after.frame == before.frame+1, before.capture.error == nil,
           after.capture.error == nil else { return [] }
@@ -562,16 +575,19 @@ func localOverlayTransitions(_ before: LocalOCRFrame, _ after: LocalOCRFrame) ->
     let excluded = Set(["fold", "winner", "total", "pot", "raise", "check",
                         "call", "time", "show", "current", "previous", "options", "ante", "anter", "postbb", "postsb", "win", "winer", "ker", "ler"])
     func possibleName(_ text: String) -> Bool {
-        text.range(of: "^[A-Za-z][A-Za-z0-9_]{2,31}$", options: .regularExpression) != nil
-            && !excluded.contains(text.lowercased())
+        plausibleACRPlayerName(text) &&
+            !excluded.contains(text.lowercased())
     }
     var candidates = [LocalOverlayCandidate]()
     let priorWinners = localWinnerSignals(old)
-    let signals = new.filter {
-        $0.text.trimmingCharacters(in: .whitespaces).uppercased() == "FOLD"
-    } + localWinnerSignals(new)
+    func foldSignal(_ line: LocalOCRLine) -> Bool {
+        let text = line.text.trimmingCharacters(in:.whitespaces).uppercased()
+        return text == "FOLD" || text == "FOLDR"
+    }
+    let signals = new.filter(foldSignal) + localWinnerSignals(new)
     for line in signals {
-        let label = line.text.trimmingCharacters(in: .whitespaces).uppercased()
+        let label = foldSignal(line) ? "FOLD" :
+            line.text.trimmingCharacters(in:.whitespaces).uppercased()
         guard (label == "FOLD" || label == "WINNER"), line.confidence >= 0.8 else { continue }
         if label == "WINNER" {
             guard hand != nil && !priorWinners.contains(where: {
@@ -579,7 +595,7 @@ func localOverlayTransitions(_ before: LocalOCRFrame, _ after: LocalOCRFrame) ->
             }) else { continue }
         } else {
             guard !old.contains(where: {
-                $0.text.trimmingCharacters(in: .whitespaces).uppercased() == label && near($0,line)
+                foldSignal($0) && near($0,line)
             }) else { continue }
         }
         let names = old.filter { possibleName($0.text) && $0.confidence >= 0.8 && near($0,line) }
@@ -776,8 +792,7 @@ func localActionTransitions(_ older: LocalOCRFrame, _ before: LocalOCRFrame,
     }
     func playerName(_ name: String) -> Bool {
         !excluded.contains(name.uppercased()) &&
-        name.range(of: "^[A-Za-z][A-Za-z0-9_]{2,31}$",
-                   options: .regularExpression) != nil
+        plausibleACRPlayerName(name)
     }
     func stack(_ lines: [LocalOCRLine], _ nameplate: LocalOCRLine) -> Decimal? {
         let nearby = lines.filter { line in
@@ -902,8 +917,7 @@ func laterSameHandFoldNames(_ overlays: [LocalOverlayCandidate],
                 let name=line.text.trimmingCharacters(in:.whitespaces)
                 return line.confidence >= 0.8 &&
                     abs(line.x-c.x)<0.028 && abs(line.y-c.y)<0.028 &&
-                    name.range(of:"^[A-Za-z][A-Za-z0-9_]{2,31}$",
-                        options:.regularExpression) != nil &&
+                    plausibleACRPlayerName(name) &&
                     !forbidden.contains(name.uppercased())
             }
             if names.count>1 {observed=[];break}
@@ -1069,8 +1083,7 @@ func supportedLocalWinner(_ c: LocalOverlayCandidate,
     guard c.label == "WINNER", c.confidence >= 0.8,
           let hand = c.hand, !hand.isEmpty,
           let name = c.retained_seat_name, !name.isEmpty,
-          name.range(of:"^[A-Za-z][A-Za-z0-9_]{2,31}$",
-                     options:.regularExpression) != nil,
+          plausibleACRPlayerName(name),
           c.frame >= 3, c.frame <= ocr.count,
           c.previous_frame == c.frame-1 else { return false }
 
@@ -1208,6 +1221,45 @@ actor Recorder {
         }
     }
     var localBoard = [LocalBoardObservation]()
+    var localCardBacks = [FrameCardPairs]()
+
+    var cardBackDirectory: URL {
+        directory.appendingPathComponent("local_card_backs")
+    }
+
+    func restoreLocalCardBacks() throws {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath:cardBackDirectory.path)
+        else { return }
+
+        let names = try fm.contentsOfDirectory(
+            atPath:cardBackDirectory.path
+        ).filter { $0.hasSuffix(".json") }.sorted()
+
+        try require(
+            names.count == localOCR.count,
+            "Card-back evidence incomplete during recovery"
+        )
+
+        for (index,name) in names.enumerated() {
+            let item = try JSONDecoder().decode(
+                FrameCardPairs.self,
+                from:Data(contentsOf:
+                    cardBackDirectory.appendingPathComponent(name))
+            )
+            let ocr = localOCR[index]
+
+            try require(
+                item.frame == index+1 &&
+                name == String(format:"%06d.json",index+1) &&
+                item.sourceFingerprint == ocr.sourceFingerprint &&
+                item.hand == currentLocalHand(ocr.capture),
+                "Card-back source ownership mismatch"
+            )
+
+            localCardBacks.append(item)
+        }
+    }
     var boardDirectory: URL {
         directory.appendingPathComponent("local_board")
     }
@@ -1288,6 +1340,7 @@ actor Recorder {
         }
         try restoreLocalOCR()
         try restoreLocalBoard()
+        try restoreLocalCardBacks()
         guard fm.fileExists(atPath: checkpointURL.path) else {
             // Old/partial runs are not automatically adopted as committed truth.
             if !frames.isEmpty || !((try? fm.contentsOfDirectory(
@@ -1399,6 +1452,24 @@ actor Recorder {
         let relativeSeatCandidates = adjacentSeatOrderCandidates(
             localActions, blindPositions
         )
+        let visualCardLosses = cardBackLossCandidates(
+            localCardBacks,
+            ocr:localOCR,
+            blindPositions:Array(blindPositions.values),
+            actions:localActions
+        )
+        let physicalReview = physicalFoldReview(
+            localActions,
+            cardLosses:visualCardLosses,
+            observations:localCardBacks,
+            overlayCandidates:localCandidates
+        )
+        let turnAudits = preflopTurnProgression(
+            localActions,
+            ocr: localOCR,
+            board: localBoard,
+            buttons: Array(blindPositions.values)
+        )
         let log = events.enumerated().map { i, e in
             "\(i+1). [\(e.basis)] [hand \(e.hand); frame \(e.frame)] \(e.text)"
         }.joined(separator: "\n")
@@ -1430,11 +1501,104 @@ actor Recorder {
                     )
                 }
             }
+            let audit = turnAudits.filter {
+                $0.hand == hand
+            }
+            if !audit.isEmpty {
+                lines.append(
+                    "PREFLOP TURN PROGRESSION — RAW OCR-ONLY AUDIT (before later reconciliation)"
+                )
+                for item in audit {
+                    lines.append(
+                        "  frame \(item.frame): " +
+                        "\(item.firstPlayer) \(item.firstOverlay) -> " +
+                        "\(item.secondPlayer) \(item.secondOverlay); " +
+                        "\(item.verdict); \(item.limitation)"
+                    )
+                }
+            }
+            let physical = visualCardLosses.filter {
+                $0.hand == hand
+            }
+            if !physical.isEmpty {
+                lines.append(
+                    "PHYSICAL CARD-BACK DISAPPEARANCE — NOT AUTOMATIC FOLD"
+                )
+                for p in physical {
+                    lines.append(
+                        "  frame \(p.lastPresentFrame)->\(p.firstMissingFrame): " +
+                        "\(p.player) cards no longer visible; " +
+                        "confirmed frame \(p.confirmedFrame); " +
+                        "FOLD overlay same frame=\(p.correspondingFoldOverlay); " +
+                        "execution order UNKNOWN"
+                    )
+                }
+            }
+            let crossChecks = physicalReview.filter {
+                $0.hand == hand
+            }
+            if !crossChecks.isEmpty {
+                lines.append(
+                    "FOLD PHYSICAL CORROBORATION — ORDER NOT CERTIFIED"
+                )
+                for item in crossChecks {
+                    let promoted = accepted.contains { e in
+                        e.kind == "action" &&
+                        e.text == "\(item.player) folds." &&
+                        e.evidence.contains(
+                            "LAGGED_BLIND_FOLD_CERTIFIED"
+                        )
+                    }
+
+                    lines.append(
+                        "  frame \(item.frame) \(item.player): " +
+                        "\(item.status); " +
+                        (promoted
+                            ? "corroborated late-confirmed action"
+                            : "candidate evidence only")
+                    )
+                }
+            }
             if accepted.isEmpty {
                 lines.append("  No committed actions or results in the captured segment.")
             } else {
-                for event in accepted {
-                    lines.append("  frame \(event.frame): \(event.text)")
+                // Checkpoint remains append-only; physical chronology
+                // is a separate, evidence-backed presentation order.
+                let ordered = accepted.enumerated().sorted { left,right in
+                    let a = evidenceBackedDisplayFrame(left.element)
+                    let b = evidenceBackedDisplayFrame(right.element)
+
+                    return a == b
+                        ? left.offset < right.offset
+                        : a < b
+                }
+
+                if accepted.contains(where: {
+                    $0.evidence.contains(
+                        "LAGGED_BLIND_FOLD_CERTIFIED"
+                    )
+                }) {
+                    lines.append(
+                        "  DISPLAY ORDER: physical overlay evidence; " +
+                        "late confirmation labeled; checkpoint append-only"
+                    )
+                }
+
+                for entry in ordered {
+                    let event = entry.element
+                    let physical = evidenceBackedDisplayFrame(event)
+
+                    if physical != event.frame {
+                        lines.append(
+                            "  frame \(physical) " +
+                            "(confirmed frame \(event.frame)): " +
+                            "\(event.text)"
+                        )
+                    } else {
+                        lines.append(
+                            "  frame \(event.frame): \(event.text)"
+                        )
+                    }
                 }
             }
             let streets = confirmedBoardStreets(localBoard)
@@ -1491,6 +1655,26 @@ actor Recorder {
         try encoded(blindPositions.values.sorted { $0.firstFrame < $1.firstFrame }).write(
             to:directory.appendingPathComponent("observed_button_from_blinds.json"),
             options:.atomic)
+        try encoded(localCardBacks).write(
+            to:directory.appendingPathComponent(
+                "observed_card_back_pairs.json"
+            ),options:.atomic
+        )
+        try encoded(physicalReview).write(
+            to:directory.appendingPathComponent(
+                "observed_fold_physical_fusion.json"
+            ),options:.atomic
+        )
+        try encoded(visualCardLosses).write(
+            to:directory.appendingPathComponent(
+                "observed_card_back_loss_episodes.json"
+            ),options:.atomic
+        )
+        try encoded(turnAudits).write(
+            to: directory.appendingPathComponent(
+                "observed_preflop_turn_progression.json"
+            ), options: .atomic
+        )
         try Data(observedTrace.utf8).write(
             to: directory.appendingPathComponent("observed_hand_chronology.txt"), options: .atomic)
         try Data(observedCurrentTrace.utf8).write(
@@ -1561,6 +1745,48 @@ actor Recorder {
             }
         }
         let unorderedEpisodes = unorderedActionEpisodes(ambiguous)
+        let promotedRapidFolds = certifiedRapidPreflopFoldEvents(
+            actions:localActions,
+            ocr:localOCR,
+            board:localBoard,
+            cards:localCardBacks,
+            buttons:blindPositions,
+            committed:events
+        ).filter {
+            $0.frame >= first && $0.frame <= last
+        }
+        let recoveredOpening = recoveredOpeningPreflopFolds(
+            overlays:localCandidates,ocr:localOCR,board:localBoard,
+            cards:localCardBacks,buttons:blindPositions,
+            committed:events
+        ).filter { $0.frame >= first && $0.frame <= last }
+        let mixedActions = corroboratedMixedPreflopActions(
+            actions:localActions,
+            overlays:localCandidates,
+            ocr:localOCR,
+            board:localBoard,
+            cards:localCardBacks,
+            buttons:blindPositions,
+            committed:events
+        ).filter { $0.frame >= first && $0.frame <= last }
+        let laggedBlindFolds = corroboratedLaggedSmallBlindFolds(
+            overlays:localCandidates,
+            actions:localActions,
+            ocr:localOCR,
+            board:localBoard,
+            cards:localCardBacks,
+            buttons:blindPositions,
+            committed:events
+        ).filter { $0.frame >= first && $0.frame <= last }
+
+        let namedOpening = recoveredNamedOpeningFold(
+            overlays:localCandidates,ocr:localOCR,board:localBoard,
+            cards:localCardBacks,buttons:blindPositions,committed:events
+        ).filter { $0.frame >= first && $0.frame <= last }
+        let confirmedAllIns = corroboratedAllIn(
+            actions:localActions,ocr:localOCR,board:localBoard,
+            cards:localCardBacks,buttons:blindPositions,committed:events
+        ).filter { $0.frame >= first && $0.frame <= last }
         let acceptedActions = observed.map { c in
             Event(
                 frame: c.frame,
@@ -1612,8 +1838,19 @@ actor Recorder {
                 )
             }
 
-        let accepted = (acceptedActions + unorderedEpisodes + winnerEvents + streetEvents).sorted { a,b in
+        let accepted = (acceptedActions + unorderedEpisodes + winnerEvents + streetEvents + promotedRapidFolds + recoveredOpening + mixedActions + laggedBlindFolds + namedOpening + confirmedAllIns).sorted { a,b in
             if a.frame != b.frame { return a.frame < b.frame }
+            if a.kind == "action" && b.kind == "action" &&
+                a.evidence.contains("RAPID_ORDER_CERTIFIED") &&
+                b.evidence.contains("RAPID_ORDER_CERTIFIED") {
+                return a.evidence < b.evidence
+            }
+            if a.kind == "action" &&
+                b.kind == "action" &&
+                a.evidence.contains("MIXED_PREFLOP_CHAIN_CERTIFIED") &&
+                b.evidence.contains("MIXED_PREFLOP_CHAIN_CERTIFIED") {
+                return a.evidence < b.evidence
+            }
             return a.kind == "action" && b.kind != "action"
         }
 
@@ -1656,7 +1893,10 @@ actor Recorder {
         )
     }
     func add(_ bytes: Data, start: Double, end: Double, width: Int, height: Int,
-        local: LocalOCRCapture? = nil, boardCount: Int? = nil) throws {
+        local: LocalOCRCapture? = nil,
+        boardCount: Int? = nil,
+        cardBackPairs: [LocalCardPair]? = nil,
+        faceUpCardPairs: [LocalCardPair]? = nil) throws {
         try recover()
         guard !stopped else { return }
         if localSemanticOnly {
@@ -1682,6 +1922,25 @@ actor Recorder {
                     localOCR[localOCR.count-1], item)
             }
             localOCR.append(item)
+
+            if let pairs = cardBackPairs {
+                let observation = FrameCardPairs(
+                    frame:id,
+                    sourceFingerprint:item.sourceFingerprint,
+                    hand:currentLocalHand(capture),
+                    pairs:pairs, faceUpPairs:faceUpCardPairs
+                )
+                try FileManager.default.createDirectory(
+                    at:cardBackDirectory,
+                    withIntermediateDirectories:true
+                )
+                try encoded(observation).write(
+                    to:cardBackDirectory.appendingPathComponent(
+                        String(format:"%06d.json",id)
+                    ),options:.atomic
+                )
+                localCardBacks.append(observation)
+            }
 
             if let count = boardCount {
                 try require([0,3,4,5].contains(count),
@@ -1710,7 +1969,62 @@ actor Recorder {
             let fresh = localActions.filter {
                 $0.frame == id && localSemanticSupported($0)
             }
+            refreshBlindEvidence()
+            let freshOpening = recoveredOpeningPreflopFolds(
+                overlays:localCandidates,ocr:localOCR,board:localBoard,
+                cards:localCardBacks,buttons:blindPositions,
+                committed:events
+            ).contains { $0.frame == id }
+            let recentMixed = localActions.contains { c in
+                c.frame == id-1 &&
+                c.sameFrameOrderUnknown &&
+                (c.overlay == "RAISE" || c.overlay == "CALL")
+            }
+
+            let freshMixed = recentMixed &&
+                corroboratedMixedPreflopActions(
+                    actions:localActions,
+                    overlays:localCandidates,
+                    ocr:localOCR,
+                    board:localBoard,
+                    cards:localCardBacks,
+                    buttons:blindPositions,
+                    committed:events
+                ).contains { $0.frame == id }
+
+            let freshLaggedFold = corroboratedLaggedSmallBlindFolds(
+                overlays:localCandidates,
+                actions:localActions,
+                ocr:localOCR,
+                board:localBoard,
+                cards:localCardBacks,
+                buttons:blindPositions,
+                committed:events
+            ).contains { $0.frame == id }
+
+            let freshNamedOpening = recoveredNamedOpeningFold(
+                overlays:localCandidates,ocr:localOCR,board:localBoard,
+                cards:localCardBacks,buttons:blindPositions,committed:events
+            ).contains { $0.frame == id }
+            let freshAllIn = corroboratedAllIn(
+                actions:localActions,ocr:localOCR,board:localBoard,
+                cards:localCardBacks,buttons:blindPositions,committed:events
+            ).contains { $0.frame == id }
             let freshEpisode = !unorderedActionEpisodes(localActions.filter { $0.frame == id }).isEmpty
+            let recentRapidPair = localActions.contains { c in
+                c.frame == id-1 &&
+                c.overlay == "FOLD" &&
+                c.sameFrameOrderUnknown
+            }
+            let freshCertifiedFolds = recentRapidPair &&
+                certifiedRapidPreflopFoldEvents(
+                    actions:localActions,
+                    ocr:localOCR,
+                    board:localBoard,
+                    cards:localCardBacks,
+                    buttons:blindPositions,
+                    committed:events
+                ).contains { $0.frame == id }
             let freshWinner = localCandidates.contains { c in
                 c.frame == id && supportedLocalWinner(c, localOCR) &&
                 !localActions.contains(where: { $0.frame == id })
@@ -1718,7 +2032,7 @@ actor Recorder {
             let freshStreet = confirmedBoardStreets(localBoard).contains {
                 $0.confirmedFrame == id
             }
-            if !fresh.isEmpty || freshEpisode || freshWinner || freshStreet {
+            if !fresh.isEmpty || freshEpisode || freshWinner || freshStreet || freshCertifiedFolds || freshOpening || freshMixed || freshLaggedFold || freshNamedOpening || freshAllIn {
                 try commitLocalOCRThrough(id)
             } else {
                 try publish()
@@ -2021,12 +2335,21 @@ func capture(_ recorder: Recorder, seconds: Double) async {
             let boardTask = Task.detached(priority:.utility) {
                 visualBoard(image:image).count
             }
+            let cardTask = Task.detached(priority:.utility) {
+                (
+                    fullScreenCardBackPairs(image:image),
+                    fullScreenFaceUpPairs(image:image)
+                )
+            }
             let local = readLocalFullDisplayOCR(image)
             let boardCount = await boardTask.value
+            let cardPairs = await cardTask.value
 
             try await recorder.add(bytes as Data, start: started, end: captured,
                 width: image.width, height: image.height,
-                local: local, boardCount: boardCount)
+                local: local, boardCount: boardCount,
+                cardBackPairs:cardPairs.0,
+                faceUpCardPairs:cardPairs.1)
             await pause(0.5 - (ProcessInfo.processInfo.systemUptime - tick))
         }
         await recorder.captureDone()
@@ -2318,6 +2641,25 @@ struct FullScreenVision {
     @MainActor static func main() async {
         setbuf(stdout, nil)
         do {
+            if CommandLine.arguments.count == 3 &&
+                CommandLine.arguments[1] == "--turn-progression-test" {
+                try testPreflopTurnProgression(
+                    URL(fileURLWithPath: CommandLine.arguments[2])
+                )
+                return
+            }
+            if CommandLine.arguments.count == 3 &&
+                CommandLine.arguments[1] == "--live236-proof" {
+                try proofF160F204(URL(fileURLWithPath:CommandLine.arguments[2]))
+                return
+            }
+            #if os(macOS)
+            if CommandLine.arguments.count == 3 &&
+                CommandLine.arguments[1] == "--live236-replay" {
+                try await live236FullReplay(URL(fileURLWithPath:CommandLine.arguments[2]))
+                return
+            }
+            #endif
             if CommandLine.arguments.contains("--self-test") { try await selfTest(); return }
             if CommandLine.arguments.contains("--parallel-self-test") { try await parallelSelfTest(); return }
             #if os(macOS)
@@ -2344,6 +2686,48 @@ struct FullScreenVision {
                 try originalRelativeSeatOrderRegression(
                     URL(fileURLWithPath: CommandLine.arguments[2])
                 )
+                return
+            }
+            if CommandLine.arguments.count == 3 &&
+                CommandLine.arguments[1] == "--card-back-test" {
+                try await testOriginalCardBackPhysicalEvidence(
+                    URL(fileURLWithPath:CommandLine.arguments[2])
+                )
+                return
+            }
+            if CommandLine.arguments.count == 4 &&
+                CommandLine.arguments[1] == "--face-up-fusion-test" {
+                try testFullScreenFaceUpFusion(
+                    URL(fileURLWithPath:CommandLine.arguments[2]),
+                    audited:URL(fileURLWithPath:CommandLine.arguments[3])
+                )
+                return
+            }
+            if CommandLine.arguments.count == 3 &&
+                CommandLine.arguments[1] == "--certified-rapid-fold-test" {
+                try await testCertifiedRapidFoldPromotion(
+                    URL(fileURLWithPath:CommandLine.arguments[2])
+                )
+                return
+            }
+            if CommandLine.arguments.count == 4 &&
+                CommandLine.arguments[1] == "--opening-fold-355" {
+                try await originalOpeningFoldRegression(
+                    URL(fileURLWithPath:CommandLine.arguments[2]),
+                    recorded:URL(fileURLWithPath:CommandLine.arguments[3]))
+                return
+            }
+            if CommandLine.arguments.count == 4 &&
+                CommandLine.arguments[1] == "--mixed-preflop-355" {
+                try await originalMixedPreflopReplay(
+                    URL(fileURLWithPath:CommandLine.arguments[2]),
+                    previous:URL(fileURLWithPath:CommandLine.arguments[3]))
+                return
+            }
+            if CommandLine.arguments.count == 3 &&
+                CommandLine.arguments[1] == "--f34-correction-test" {
+                try await numericSeatAndNoisyFoldReplay(
+                    URL(fileURLWithPath:CommandLine.arguments[2]))
                 return
             }
             _ = NSApplication.shared
@@ -2773,8 +3157,7 @@ func blindButtonSnapshot(_ item: LocalOCRFrame) -> BlindButtonSnapshot? {
         let name = line.text.trimmingCharacters(in: .whitespaces)
         guard line.confidence >= 0.8,
               !forbidden.contains(name.uppercased()),
-              name.range(of: "^[A-Za-z][A-Za-z0-9_]{2,31}$",
-                  options: .regularExpression) != nil else { continue }
+              plausibleACRPlayerName(name) else { continue }
         let stacks = lines.filter { amount in
             amount.confidence >= 0.8 && stack(amount.text) &&
             abs(amount.x-line.x) < 0.028 &&
@@ -3167,3 +3550,3634 @@ func originalRelativeSeatOrderRegression(_ input: URL) throws {
         "deterministic=3/3 api_calls=0 actions_promoted=0"
     )
 }
+
+
+struct TurnProgressionEvidence: Codable, Equatable {
+    let hand: String
+    let frame: Int
+    let firstPlayer: String
+    let firstOverlay: String
+    let secondPlayer: String
+    let secondOverlay: String
+    let ringEvidenceFrames: [Int]
+    let actionEvidenceFrames: [Int]
+    let actionFingerprints: [String]
+    let previousActor: String?
+    let previousActionFrame: Int?
+    let verdict: String
+    let limitation: String
+}
+
+// Never confuse preselected Fold intent with a completed action.
+// This is an evidence audit, not an authoritative action writer.
+func preflopTurnProgression(
+    _ actions: [LocalActionCandidate],
+    ocr: [LocalOCRFrame],
+    board: [LocalBoardObservation],
+    buttons: [BlindButtonEvidence]
+) -> [TurnProgressionEvidence] {
+    guard ocr.count == board.count && !ocr.isEmpty else {
+        return []
+    }
+
+    let positions = Dictionary(
+        uniqueKeysWithValues: buttons.map { ($0.hand, $0) }
+    )
+    let pairs = adjacentSeatOrderCandidates(actions, positions)
+    let groups = Dictionary(grouping: actions, by: { $0.hand })
+    let ocrFrames = Dictionary(
+        uniqueKeysWithValues: ocr.map { ($0.frame, $0) }
+    )
+    let boardFrames = Dictionary(
+        uniqueKeysWithValues: board.map { ($0.frame, $0) }
+    )
+
+    func supported(_ c: LocalActionCandidate) -> Bool {
+        guard c.frame >= 3,
+              let now = ocrFrames[c.frame],
+              let before = ocrFrames[c.frame - 1],
+              let earlier = ocrFrames[c.frame - 2],
+              let b0 = boardFrames[c.frame],
+              let b1 = boardFrames[c.frame - 1],
+              let b2 = boardFrames[c.frame - 2],
+              [now, before, earlier].allSatisfy({
+                  $0.capture.error == nil &&
+                  currentLocalHand($0.capture) == c.hand
+              }),
+              [b0, b1, b2].allSatisfy({
+                  $0.hand == c.hand &&
+                  $0.visibleBoardCount == 0
+              }),
+              b0.sourceFingerprint == now.sourceFingerprint,
+              b1.sourceFingerprint == before.sourceFingerprint,
+              b2.sourceFingerprint == earlier.sourceFingerprint,
+              c.beforeFrame == c.frame - 1,
+              c.currentFingerprint == now.sourceFingerprint,
+              c.beforeFingerprint == before.sourceFingerprint,
+              c.labelConfidence >= 0.8,
+              let prior = Decimal(
+                  string: c.beforeStackBB,
+                  locale: Locale(identifier: "en_US_POSIX")
+              )
+        else {
+            return false
+        }
+
+        if c.overlay == "FOLD" {
+            return true
+        }
+
+        guard let text = c.afterStackBB,
+              let after = Decimal(
+                  string: text,
+                  locale: Locale(identifier: "en_US_POSIX")
+              )
+        else {
+            return false
+        }
+
+        if c.overlay == "CHECK" {
+            return after == prior
+        }
+
+        if ["CALL", "RAISE", "BET"].contains(c.overlay) {
+            return after >= 0 && after < prior
+        }
+
+        return false
+    }
+
+    var results = [TurnProgressionEvidence]()
+
+    for pair in pairs {
+        guard let position = positions[pair.hand],
+              pair.ringEvidenceFrames == [
+                  position.firstFrame,
+                  position.confirmedFrame
+              ],
+              let bb = position.clockwiseRing.firstIndex(
+                  of: position.bigBlind
+              ),
+              position.confirmedFrame < pair.frame,
+              let first = actions.first(where: {
+                  $0.hand == pair.hand &&
+                  $0.frame == pair.frame &&
+                  $0.player == pair.firstSeat
+              }),
+              let second = actions.first(where: {
+                  $0.hand == pair.hand &&
+                  $0.frame == pair.frame &&
+                  $0.player == pair.secondSeat
+              }),
+              supported(first),
+              supported(second)
+        else {
+            continue
+        }
+
+        let ring = position.clockwiseRing
+        var expected = ring[(bb + 1) % ring.count]
+        var folded = Set<String>()
+        var precedingActor: String? = nil
+        var precedingFrame: Int? = nil
+        var continuous = true
+        var reason = "PREVIOUS_TURN_NOT_OBSERVED"
+
+        let byFrame = Dictionary(
+            grouping: groups[pair.hand] ?? [],
+            by: { $0.frame }
+        )
+
+        for frame in byFrame.keys.sorted()
+            where frame > position.confirmedFrame &&
+                  frame <= pair.frame {
+
+            guard let group = byFrame[frame] else {
+                continue
+            }
+
+            guard group.allSatisfy(supported) else {
+                continuous = false
+                reason = "MISSING_OR_CONFLICTING_PHYSICAL_EVIDENCE"
+                break
+            }
+
+            let ordered: [LocalActionCandidate]
+
+            if group.count == 1 {
+                ordered = group
+            } else if group.count == 2,
+                      frame == pair.frame,
+                      let a = group.first(where: {
+                          $0.player == pair.firstSeat
+                      }),
+                      let b = group.first(where: {
+                          $0.player == pair.secondSeat
+                      }) {
+                ordered = [a, b]
+            } else {
+                continuous = false
+                reason = "UNRESOLVED_MULTI_ACTION_EPISODE"
+                break
+            }
+
+            for action in ordered {
+                if action.player != expected ||
+                   folded.contains(action.player) {
+                    continuous = false
+                    reason = "MISSING_EARLIER_TURN_OR_FOLDED_PLAYER"
+                    break
+                }
+
+                if frame < pair.frame {
+                    precedingActor = action.player
+                    precedingFrame = frame
+                }
+
+                if action.overlay == "FOLD" {
+                    folded.insert(action.player)
+                }
+
+                guard let index = ring.firstIndex(
+                    of: action.player
+                ) else {
+                    continuous = false
+                    reason = "PLAYER_NOT_IN_FROZEN_RING"
+                    break
+                }
+
+                var next: String? = nil
+
+                for offset in 1...ring.count {
+                    let seat = ring[
+                        (index + offset) % ring.count
+                    ]
+                    if !folded.contains(seat) {
+                        next = seat
+                        break
+                    }
+                }
+
+                guard let next else {
+                    continuous = false
+                    reason = "NO_ELIGIBLE_NEXT_SEAT"
+                    break
+                }
+
+                expected = next
+            }
+
+            if !continuous {
+                break
+            }
+        }
+
+        results.append(TurnProgressionEvidence(
+            hand: pair.hand,
+            frame: pair.frame,
+            firstPlayer: pair.firstSeat,
+            firstOverlay: pair.firstOverlay,
+            secondPlayer: pair.secondSeat,
+            secondOverlay: pair.secondOverlay,
+            ringEvidenceFrames: pair.ringEvidenceFrames,
+            actionEvidenceFrames: pair.actionEvidenceFrames,
+            actionFingerprints: pair.actionFingerprints,
+            previousActor: precedingActor,
+            previousActionFrame: precedingFrame,
+            verdict: continuous
+                ? "PRE_FLOP_TURN_SEQUENCE_CONSISTENT"
+                : "UNRESOLVED_TURN_CONTINUITY",
+            limitation: continuous
+                ? "CONDITIONAL_ON_FULL_DEALT_IN_ROSTER; NEED_CARD_PRESENCE_AND_MISSING_ACTION_AUDIT; NOT_PROMOTED_TO_AUTHORITY"
+                : reason + "; POSITIONS_ONLY; NOT_PROMOTED_TO_AUTHORITY"
+        ))
+    }
+
+    return results.sorted {
+        $0.frame == $1.frame
+            ? $0.hand < $1.hand
+            : $0.frame < $1.frame
+    }
+}
+
+func testPreflopTurnProgression(_ input: URL) throws {
+    let frames = try JSONDecoder().decode(
+        [Frame].self,
+        from: Data(contentsOf:
+            input.appendingPathComponent("frames.json"))
+    )
+
+    let ocr = try (1...355).map { n in
+        try JSONDecoder().decode(
+            LocalOCRFrame.self,
+            from: Data(contentsOf: input.appendingPathComponent(
+                String(format: "local_ocr/%06d.json", n)
+            ))
+        )
+    }
+
+    let board = try JSONDecoder().decode(
+        [LocalBoardObservation].self,
+        from: Data(contentsOf: input.appendingPathComponent(
+            "local_board_observations.json"
+        ))
+    )
+
+    let actions = try JSONDecoder().decode(
+        [LocalActionCandidate].self,
+        from: Data(contentsOf: input.appendingPathComponent(
+            "local_action_candidates.json"
+        ))
+    )
+
+    try require(
+        frames.count == 355 && board.count == 355,
+        "Original frame evidence incomplete"
+    )
+
+    let buttons = bestBlindButtonEvidence(ocr)
+    let reports = preflopTurnProgression(
+        actions, ocr: ocr, board: board, buttons: buttons
+    )
+
+    try require(
+        reports.count == 3,
+        "Expected three ambiguous action episodes"
+    )
+
+    for report in reports {
+        for (n, fingerprint) in zip(
+            report.actionEvidenceFrames,
+            report.actionFingerprints
+        ) {
+            let actual = try frameFingerprint(
+                Data(contentsOf:
+                    input.appendingPathComponent(
+                        frames[n - 1].file
+                    )
+                )
+            )
+
+            try require(
+                actual == fingerprint,
+                "Original JPEG fingerprint mismatch at \(n)"
+            )
+        }
+
+        print(
+            "TURN_AUDIT frame=\(report.frame) " +
+            "hand=\(report.hand) " +
+            "\(report.firstPlayer)->\(report.secondPlayer) " +
+            "verdict=\(report.verdict)"
+        )
+    }
+
+    try require(
+        reports[0].frame == 22 &&
+        reports[0].verdict ==
+            "PRE_FLOP_TURN_SEQUENCE_CONSISTENT",
+        "Frame 22 lost supported progression"
+    )
+
+    for index in [1, 2] {
+        try require(
+            reports[index].verdict ==
+                "UNRESOLVED_TURN_CONTINUITY",
+            "Unobserved prior action incorrectly certified"
+        )
+    }
+
+    let baseline = try encoded(reports)
+
+    for _ in 0..<2 {
+        let repeated = try encoded(
+            preflopTurnProgression(
+                actions,
+                ocr: ocr,
+                board: board,
+                buttons: buttons
+            )
+        )
+        try require(
+            repeated == baseline,
+            "Nondeterministic turn progression"
+        )
+    }
+
+    try require(
+        preflopTurnProgression(
+            actions, ocr: ocr, board: board, buttons: []
+        ).isEmpty,
+        "Missing blind evidence falsely authorized progression"
+    )
+
+    print(
+        "TURN_PROGRESSION_PASS cases=3 consistent=1 " +
+        "unresolved=2 deterministic=3/3 " +
+        "authoritative_changes=0 api_calls=0"
+    )
+}
+
+
+struct LocalCardPair: Codable, Equatable {
+    let x: Double
+    let y: Double
+}
+
+struct FrameCardPairs: Codable, Equatable {
+    let frame: Int
+    let sourceFingerprint: String
+    let hand: String?
+    let pairs: [LocalCardPair]
+    var faceUpPairs: [LocalCardPair]? = nil
+}
+
+struct CardBackLossEvidence: Codable, Equatable {
+    let hand: String
+    let player: String
+    let lastPresentFrame: Int
+    let firstMissingFrame: Int
+    let confirmedFrame: Int
+    let sourceFrames: [Int]
+    let sourceFingerprints: [String]
+    let correspondingFoldOverlay: Bool
+    let interpretation: String
+}
+
+struct RedMaskDSU {
+    var parents: [Int32] = [0]
+
+    mutating func add() -> Int32 {
+        let i = Int32(parents.count)
+        parents.append(i)
+        return i
+    }
+
+    mutating func find(_ id: Int32) -> Int32 {
+        var k = Int(id)
+        while parents[k] != Int32(k) {
+            k = Int(parents[k])
+        }
+        let root = Int32(k)
+        k = Int(id)
+        while parents[k] != root {
+            let old = Int(parents[k])
+            parents[k] = root
+            k = old
+        }
+        return root
+    }
+
+    mutating func merge(_ a: Int32, _ b: Int32) {
+        let x = find(a)
+        let y = find(b)
+        if x != y {
+            parents[Int(max(x,y))] = min(x,y)
+        }
+    }
+}
+
+// Whole-frame connected components. No seat crops or fixed image rectangles.
+func fullScreenRedBackPairs(
+    mask: [UInt8], width w: Int, height h: Int
+) -> [LocalCardPair] {
+    guard w > 0 && h > 0 && mask.count == w*h else { return [] }
+
+    var labels = [Int32](repeating:0,count:w*h)
+    var dsu = RedMaskDSU()
+
+    for y in 0..<h {
+        for x in 0..<w {
+            let i = y*w+x
+            if mask[i] == 0 { continue }
+            let left: Int32 = x > 0 ? labels[i-1] : 0
+            let up: Int32 = y > 0 ? labels[i-w] : 0
+
+            if left == 0 && up == 0 {
+                labels[i] = dsu.add()
+            } else if left == 0 {
+                labels[i] = up
+            } else if up == 0 {
+                labels[i] = left
+            } else {
+                labels[i] = left
+                if left != up { dsu.merge(left,up) }
+            }
+        }
+    }
+
+    let count = dsu.parents.count
+    var x0 = [Int](repeating:w,count:count)
+    var y0 = [Int](repeating:h,count:count)
+    var x1 = [Int](repeating:0,count:count)
+    var y1 = [Int](repeating:0,count:count)
+    var pixels = [Int](repeating:0,count:count)
+
+    for y in 0..<h {
+        for x in 0..<w {
+            let label = labels[y*w+x]
+            if label == 0 { continue }
+            let root = Int(dsu.find(label))
+            pixels[root] += 1
+            x0[root] = min(x0[root],x)
+            y0[root] = min(y0[root],y)
+            x1[root] = max(x1[root],x)
+            y1[root] = max(y1[root],y)
+        }
+    }
+
+    struct Component {
+        let x: Int
+        let y: Int
+        let w: Int
+        let h: Int
+    }
+
+    var boxes = [Component]()
+
+    for i in 1..<count where pixels[i] > 0 {
+        let ww = x1[i]-x0[i]+1
+        let hh = y1[i]-y0[i]+1
+        let fill = Double(pixels[i])/Double(ww*hh)
+
+        if Double(ww)>0.034*Double(w) &&
+           Double(ww)<0.078*Double(w) &&
+           Double(hh)>0.035*Double(h) &&
+           Double(hh)<0.09*Double(h) &&
+           fill>0.75 &&
+           Double(ww)/Double(hh)>1.08 &&
+           Double(ww)/Double(hh)<1.85 {
+            boxes.append(Component(
+                x:x0[i],y:y0[i],w:ww,h:hh
+            ))
+        }
+    }
+
+    let sorted = boxes.sorted { $0.x < $1.x }
+    var pairs = [LocalCardPair]()
+
+    for a in sorted {
+        let partners = sorted.filter { b in
+            let gap = Double(b.x-a.x-a.w)
+            return b.x>a.x &&
+                gap >= -0.10*Double(a.w) &&
+                gap <= 0.32*Double(a.w) &&
+                abs(a.y-b.y) <= Int(0.014*Double(h)) &&
+                abs(a.w-b.w) < Int(0.25*Double(a.w)) &&
+                abs(a.h-b.h) < Int(0.30*Double(a.h))
+        }
+
+        if partners.count == 1 {
+            let b = partners[0]
+            pairs.append(LocalCardPair(
+                x:Double(a.x+b.x+b.w)/2/Double(w),
+                y:Double(min(a.y,b.y)+max(a.h,b.h)/2)/Double(h)
+            ))
+        }
+    }
+
+    return pairs.sorted {
+        $0.y == $1.y ? $0.x < $1.x : $0.y < $1.y
+    }
+}
+
+#if os(macOS)
+func fullScreenCardBackPairs(image: CGImage) -> [LocalCardPair] {
+    let w = min(image.width,1152)
+    let h = max(1,Int((
+        Double(image.height)*Double(w)/Double(image.width)
+    ).rounded()))
+
+    var rgba = [UInt8](repeating:0,count:w*h*4)
+
+    let rendered = rgba.withUnsafeMutableBytes { buffer -> Bool in
+        guard let context = CGContext(
+            data:buffer.baseAddress,
+            width:w,height:h,
+            bitsPerComponent:8,
+            bytesPerRow:w*4,
+            space:CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo:CGBitmapInfo.byteOrder32Big.rawValue |
+                CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return false }
+
+        context.interpolationQuality = .high
+        context.draw(
+            image,
+            in:CGRect(x:0,y:0,width:CGFloat(w),height:CGFloat(h))
+        )
+        return true
+    }
+
+    guard rendered else { return [] }
+
+    var mask = [UInt8](repeating:0,count:w*h)
+
+    for i in 0..<(w*h) {
+        let r = Int(rgba[i*4])
+        let g = Int(rgba[i*4+1])
+        let b = Int(rgba[i*4+2])
+
+        if r>55 && r*100>145*g &&
+           r*100>150*b && r-g>32 {
+            mask[i] = 1
+        }
+    }
+
+    return fullScreenRedBackPairs(
+        mask:mask,width:w,height:h
+    )
+}
+
+func fullScreenCardBackPairs(jpeg: URL) throws -> [LocalCardPair] {
+    guard let src = CGImageSourceCreateWithURL(jpeg as CFURL,nil),
+          let image = CGImageSourceCreateImageAtIndex(src,0,nil)
+    else {
+        throw Problem("Original JPEG could not be decoded")
+    }
+    return fullScreenCardBackPairs(image:image)
+}
+#endif
+
+// Candidate evidence only. A missing card back is not, by itself,
+// a proven Fold or an authorization to change the hand ledger.
+func cardBackLossCandidates(
+    _ captured: [FrameCardPairs],
+    ocr: [LocalOCRFrame],
+    blindPositions: [BlindButtonEvidence],
+    actions: [LocalActionCandidate]
+) -> [CardBackLossEvidence] {
+    guard captured.count >= 4 else { return [] }
+
+    let byFrame = Dictionary(
+        uniqueKeysWithValues:ocr.map { ($0.frame,$0) }
+    )
+
+    var result = [CardBackLossEvidence]()
+
+    for position in blindPositions {
+        guard let anchor = byFrame[position.confirmedFrame],
+              currentLocalHand(anchor.capture) == position.hand
+        else { continue }
+
+        let rows = captured.filter {
+            $0.hand == position.hand &&
+            $0.frame >= position.confirmedFrame
+        }.sorted { $0.frame < $1.frame }
+
+        guard rows.count >= 4 else { continue }
+
+        for player in position.clockwiseRing {
+            let matching = anchor.capture.lines.filter {
+                $0.text == player && $0.confidence >= 0.8
+            }
+            guard matching.count == 1 else { continue }
+
+            let centerX = matching[0].x
+            let centerY = 1.0-matching[0].y
+
+            func present(_ row: FrameCardPairs) -> Bool {
+                row.pairs.filter { pair in
+                    abs(pair.x-centerX)<0.030 &&
+                    centerY-pair.y>0.030 &&
+                    centerY-pair.y<0.085
+                }.count == 1
+            }
+
+            for index in 0..<(rows.count-3) {
+                let a = rows[index]
+                let b = rows[index+1]
+                let c = rows[index+2]
+                let d = rows[index+3]
+
+                guard a.frame+1 == b.frame &&
+                      b.frame+1 == c.frame &&
+                      c.frame+1 == d.frame &&
+                      present(a) && present(b) &&
+                      !present(c) && !present(d) &&
+                      a.sourceFingerprint != b.sourceFingerprint &&
+                      b.sourceFingerprint != c.sourceFingerprint &&
+                      c.sourceFingerprint != d.sourceFingerprint &&
+                      byFrame[a.frame]?.sourceFingerprint == a.sourceFingerprint &&
+                      byFrame[b.frame]?.sourceFingerprint == b.sourceFingerprint &&
+                      byFrame[c.frame]?.sourceFingerprint == c.sourceFingerprint &&
+                      byFrame[d.frame]?.sourceFingerprint == d.sourceFingerprint
+                else { continue }
+
+                let overlay = actions.contains {
+                    $0.hand == position.hand &&
+                    $0.frame == c.frame &&
+                    $0.player == player &&
+                    $0.overlay == "FOLD"
+                }
+
+                result.append(CardBackLossEvidence(
+                    hand:position.hand,
+                    player:player,
+                    lastPresentFrame:b.frame,
+                    firstMissingFrame:c.frame,
+                    confirmedFrame:d.frame,
+                    sourceFrames:[a.frame,b.frame,c.frame,d.frame],
+                    sourceFingerprints:[
+                        a.sourceFingerprint,b.sourceFingerprint,
+                        c.sourceFingerprint,d.sourceFingerprint
+                    ],
+                    correspondingFoldOverlay:overlay,
+                    interpretation:
+                        "FULL_SCREEN_CARD_BACK_PAIR_LOSS; " +
+                        "NONAUTHORITATIVE_PHYSICAL_CANDIDATE; " +
+                        "NO_FOLD_COMMITTED"
+                ))
+                break
+            }
+        }
+    }
+
+    return result.sorted {
+        ($0.firstMissingFrame,$0.player) <
+        ($1.firstMissingFrame,$1.player)
+    }
+}
+
+#if os(macOS)
+func testOriginalCardBackPhysicalEvidence(_ input: URL) async throws {
+    let manifest = try JSONDecoder().decode(
+        [Frame].self,
+        from:Data(contentsOf:input.appendingPathComponent("frames.json"))
+    )
+
+    let ocr = try (1...355).map { n in
+        try JSONDecoder().decode(
+            LocalOCRFrame.self,
+            from:Data(contentsOf:input.appendingPathComponent(
+                String(format:"local_ocr/%06d.json",n)
+            ))
+        )
+    }
+
+    let board = try JSONDecoder().decode(
+        [LocalBoardObservation].self,
+        from:Data(contentsOf:
+            input.appendingPathComponent("local_board_observations.json")
+        )
+    )
+
+    let actions = try JSONDecoder().decode(
+        [LocalActionCandidate].self,
+        from:Data(contentsOf:
+            input.appendingPathComponent("local_action_candidates.json")
+        )
+    )
+
+    try require(
+        manifest.count == 355 && board.count == 355,
+        "Original recording incomplete"
+    )
+
+    let buttons = bestBlindButtonEvidence(ocr)
+    let selected = Array(16...24) + Array(157...175)
+
+    let expectedPairs: [Int:Int] = [
+        20:6,21:5,22:3,23:3,
+        165:5,166:4,167:4,172:4,173:4
+    ]
+
+    var evidence = [FrameCardPairs]()
+
+    for n in selected {
+        let bytes = try Data(
+            contentsOf:input.appendingPathComponent(manifest[n-1].file)
+        )
+
+        try require(
+            frameFingerprint(bytes) == ocr[n-1].sourceFingerprint,
+            "Original frame fingerprint mismatch at \(n)"
+        )
+
+        let pairs = try fullScreenCardBackPairs(
+            jpeg:input.appendingPathComponent(manifest[n-1].file)
+        )
+
+        if let expected = expectedPairs[n] {
+            try require(
+                pairs.count == expected,
+                "Card-back count mismatch frame \(n): \(pairs.count)"
+            )
+        }
+
+        evidence.append(FrameCardPairs(
+            frame:n,
+            sourceFingerprint:ocr[n-1].sourceFingerprint,
+            hand:currentLocalHand(ocr[n-1].capture),
+            pairs:pairs
+        ))
+    }
+
+    let losses = cardBackLossCandidates(
+        evidence,ocr:ocr,blindPositions:buttons,actions:actions
+    )
+
+    let expected: [(Int,String)] = [
+        (21,"BaruquesAA"),
+        (22,"Friens"),
+        (22,"GatiN_PretO"),
+        (166,"Scklo")
+    ]
+
+    for (frame,player) in expected {
+        try require(
+            losses.contains {
+                $0.firstMissingFrame == frame &&
+                $0.player == player &&
+                $0.correspondingFoldOverlay
+            },
+            "Missing physical loss episode \(player) at \(frame)"
+        )
+    }
+
+    try require(
+        !losses.contains {
+            $0.firstMissingFrame == 166 &&
+            $0.player == "GatiN_PretO"
+        },
+        "RAISE incorrectly identified as card disappearance"
+    )
+
+    let reference = try encoded(losses)
+
+    for _ in 0..<2 {
+        try require(
+            try encoded(cardBackLossCandidates(
+                evidence,ocr:ocr,
+                blindPositions:buttons,actions:actions
+            )) == reference,
+            "Physical episode nondeterminism"
+        )
+    }
+
+    // Verify the existing Recorder stores and recovers this evidence.
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "pi-card-back-test-"+UUID().uuidString
+    )
+
+    defer {
+        try? FileManager.default.removeItem(at:root)
+    }
+
+    for sub in ["frames","accepted","responses"] {
+        try FileManager.default.createDirectory(
+            at:root.appendingPathComponent(sub),
+            withIntermediateDirectories:true
+        )
+    }
+
+    let rec = Recorder(
+        directory:root,
+        live:root.appendingPathComponent("live.txt"),
+        verbose:false,
+        localSemanticOnly:true
+    )
+
+    try await rec.publish()
+
+    for n in 1...24 {
+        let f = manifest[n-1]
+        let bytes = try Data(
+            contentsOf:input.appendingPathComponent(f.file)
+        )
+
+        let pairs = try fullScreenCardBackPairs(
+            jpeg:input.appendingPathComponent(f.file)
+        )
+
+        try await rec.add(
+            bytes,
+            start:f.started,end:f.captured,
+            width:f.width,height:f.height,
+            local:ocr[n-1].capture,
+            boardCount:board[n-1].visibleBoardCount,
+            cardBackPairs:pairs
+        )
+    }
+
+    try await rec.finish()
+
+    let before = await rec.events
+
+    let physical = try JSONDecoder().decode(
+        [CardBackLossEvidence].self,
+        from:Data(contentsOf:root.appendingPathComponent(
+            "observed_card_back_loss_episodes.json"
+        ))
+    )
+
+    try require(
+        physical.contains {
+            $0.firstMissingFrame == 22 &&
+            $0.player == "Friens"
+        },
+        "Recorder lost physical evidence"
+    )
+
+    let recorded = try JSONDecoder().decode(
+        [FrameCardPairs].self,
+        from:Data(contentsOf:root.appendingPathComponent(
+            "observed_card_back_pairs.json"
+        ))
+    )
+
+    try require(
+        recorded.count == 24,
+        "Incomplete frame-owned card evidence"
+    )
+
+    let recovered = Recorder(
+        directory:root,
+        live:root.appendingPathComponent("live.txt"),
+        verbose:false,
+        localSemanticOnly:true
+    )
+
+    try await recovered.publish()
+
+    let after = await recovered.events
+    let status = await recovered.status()
+
+    try require(
+        before == after &&
+        status.stopped && status.pending == 0,
+        "Recorder recovery changed authoritative history"
+    )
+
+    let recoveredPhysical = try Data(
+        contentsOf:root.appendingPathComponent(
+            "observed_card_back_loss_episodes.json"
+        )
+    )
+
+    try require(
+        recoveredPhysical == (try encoded(physical)),
+        "Restart changed physical evidence"
+    )
+
+    print(
+        "CARD_BACK_NATIVE_PASS original_frames=28 pairs_verified=9 " +
+        "fold_losses=4 raise_retains_cards=YES deterministic=3/3 " +
+        "checkpoint=YES restart=YES authoritative_action_changes=0 api_calls=0"
+    )
+}
+#endif
+
+
+// Additional full-screen physical evidence. No cropping and no new hand writer.
+func fullScreenWhiteCardPairs(
+    mask: [UInt8], width w: Int, height h: Int
+) -> [LocalCardPair] {
+    guard w > 0 && h > 0 && mask.count == w*h else { return [] }
+
+    var labels = [Int32](repeating:0,count:w*h)
+    var dsu = RedMaskDSU()
+
+    for y in 0..<h {
+        for x in 0..<w {
+            let i = y*w+x
+            if mask[i] == 0 { continue }
+            let left: Int32 = x > 0 ? labels[i-1] : 0
+            let up: Int32 = y > 0 ? labels[i-w] : 0
+
+            if left == 0 && up == 0 {
+                labels[i] = dsu.add()
+            } else if left == 0 {
+                labels[i] = up
+            } else if up == 0 {
+                labels[i] = left
+            } else {
+                labels[i] = left
+                if left != up { dsu.merge(left,up) }
+            }
+        }
+    }
+
+    let count = dsu.parents.count
+    var x0 = [Int](repeating:w,count:count)
+    var y0 = [Int](repeating:h,count:count)
+    var x1 = [Int](repeating:0,count:count)
+    var y1 = [Int](repeating:0,count:count)
+    var pixels = [Int](repeating:0,count:count)
+
+    for y in 0..<h {
+        for x in 0..<w {
+            let label = labels[y*w+x]
+            if label == 0 { continue }
+            let root = Int(dsu.find(label))
+            pixels[root] += 1
+            x0[root] = min(x0[root],x)
+            y0[root] = min(y0[root],y)
+            x1[root] = max(x1[root],x)
+            y1[root] = max(y1[root],y)
+        }
+    }
+
+    struct WhiteBox {
+        let x: Int, y: Int, w: Int, h: Int
+    }
+
+    var boxes = [WhiteBox]()
+
+    for i in 1..<count where pixels[i] > 0 {
+        let ww = x1[i]-x0[i]+1
+        let hh = y1[i]-y0[i]+1
+        let fill = Double(pixels[i])/Double(ww*hh)
+
+        if Double(ww)/Double(w) >= 0.04 &&
+           Double(ww)/Double(w) <= 0.09 &&
+           Double(hh)/Double(h) >= 0.065 &&
+           Double(hh)/Double(h) <= 0.185 &&
+           Double(hh)/Double(ww) >= 0.72 &&
+           Double(hh)/Double(ww) <= 2.5 &&
+           fill >= 0.57 {
+            boxes.append(WhiteBox(
+                x:x0[i],y:y0[i],w:ww,h:hh
+            ))
+        }
+    }
+
+    boxes.sort { $0.x < $1.x }
+    var pairs = [LocalCardPair]()
+
+    for a in boxes {
+        let partners = boxes.filter { b in
+            guard b.x > a.x else { return false }
+            let spacing = Double(b.x-a.x)/Double(a.w)
+
+            return spacing >= 0.90 && spacing <= 1.40 &&
+                abs(a.y-b.y) <= Int(0.015*Double(h)) &&
+                Double(abs(a.w-b.w)) <= 0.25*Double(a.w) &&
+                Double(abs(a.h-b.h)) <= 0.30*Double(a.h)
+        }
+
+        guard partners.count == 1 else { continue }
+        let b = partners[0]
+
+        pairs.append(LocalCardPair(
+            x:Double(a.x+b.x+b.w)/2/Double(w),
+            y:Double(min(a.y,b.y)+max(a.h,b.h)/2)/Double(h)
+        ))
+    }
+
+    return pairs.sorted {
+        $0.y == $1.y ? $0.x < $1.x : $0.y < $1.y
+    }
+}
+
+#if os(macOS)
+func fullScreenFaceUpPairs(image: CGImage) -> [LocalCardPair] {
+    let w = min(image.width,1152)
+    let h = max(1,Int(
+        (Double(image.height)*Double(w)/Double(image.width)).rounded()
+    ))
+
+    var rgba = [UInt8](repeating:0,count:w*h*4)
+
+    let rendered = rgba.withUnsafeMutableBytes { buffer -> Bool in
+        guard let ctx = CGContext(
+            data:buffer.baseAddress,
+            width:w,height:h,
+            bitsPerComponent:8,
+            bytesPerRow:w*4,
+            space:CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo:CGBitmapInfo.byteOrder32Big.rawValue |
+                CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return false }
+
+        ctx.interpolationQuality = .high
+        ctx.draw(image,in:CGRect(
+            x:0,y:0,width:CGFloat(w),height:CGFloat(h)
+        ))
+        return true
+    }
+
+    guard rendered else { return [] }
+
+    var mask = [UInt8](repeating:0,count:w*h)
+
+    for i in 0..<(w*h) {
+        let r = Int(rgba[i*4])
+        let g = Int(rgba[i*4+1])
+        let b = Int(rgba[i*4+2])
+        let high = max(r,max(g,b))
+        let low = min(r,min(g,b))
+
+        if high >= 175 && (high-low)*255 <= high*80 {
+            mask[i] = 1
+        }
+    }
+
+    return fullScreenWhiteCardPairs(
+        mask:mask,width:w,height:h
+    )
+}
+
+func fullScreenFaceUpPairs(jpeg: URL) throws -> [LocalCardPair] {
+    guard let source = CGImageSourceCreateWithURL(jpeg as CFURL,nil),
+          let image = CGImageSourceCreateImageAtIndex(source,0,nil)
+    else {
+        throw Problem("Cannot decode original face-up card evidence")
+    }
+    return fullScreenFaceUpPairs(image:image)
+}
+#endif
+
+struct PhysicalFoldReview: Codable, Equatable {
+    let hand: String
+    let player: String
+    let frame: Int
+    let status: String
+    let sourceFrames: [Int]
+    let sourceFingerprints: [String]
+    let limitation: String
+}
+
+func faceUpCardLossSupported(
+    _ action: LocalActionCandidate,
+    observations: [Int:FrameCardPairs]
+) -> Bool {
+    guard action.overlay == "FOLD",
+          action.frame >= 3 else { return false }
+
+    let ids = [
+        action.frame-2,action.frame-1,
+        action.frame,action.frame+1
+    ]
+
+    guard let a = observations[ids[0]],
+          let b = observations[ids[1]],
+          let c = observations[ids[2]],
+          let d = observations[ids[3]],
+          a.hand == action.hand &&
+          b.hand == action.hand &&
+          c.hand == action.hand &&
+          d.hand == action.hand &&
+          a.faceUpPairs != nil &&
+          b.faceUpPairs != nil &&
+          c.faceUpPairs != nil &&
+          d.faceUpPairs != nil &&
+          b.sourceFingerprint == action.beforeFingerprint &&
+          c.sourceFingerprint == action.currentFingerprint &&
+          Set([
+              a.sourceFingerprint,b.sourceFingerprint,
+              c.sourceFingerprint,d.sourceFingerprint
+          ]).count == 4
+    else { return false }
+
+    let seatY = 1.0-action.y
+
+    func present(_ record: FrameCardPairs) -> Bool {
+        let matches = (record.faceUpPairs ?? []).filter { p in
+            abs(p.x-action.x) <= 0.048 &&
+            seatY-p.y >= 0.020 &&
+            seatY-p.y <= 0.110
+        }
+        return matches.count == 1
+    }
+
+    return present(a) && present(b) &&
+        !present(c) && !present(d)
+}
+
+func physicalFoldReview(
+    _ actions: [LocalActionCandidate],
+    cardLosses: [CardBackLossEvidence],
+    observations: [FrameCardPairs],
+    overlayCandidates: [LocalOverlayCandidate]
+) -> [PhysicalFoldReview] {
+    let byFrame = Dictionary(
+        uniqueKeysWithValues:observations.map { ($0.frame,$0) }
+    )
+
+    var reports = [PhysicalFoldReview]()
+
+    for action in actions where action.overlay == "FOLD" {
+        let matched = cardLosses.first {
+            $0.hand == action.hand &&
+            $0.player == action.player &&
+            $0.firstMissingFrame == action.frame &&
+            $0.correspondingFoldOverlay
+        }
+
+        let faceUp = matched == nil &&
+            faceUpCardLossSupported(
+                action,observations:byFrame
+            )
+
+        let status = matched != nil
+            ? "FOLD_OVERLAY_AND_RED_BACK_LOSS"
+            : (faceUp
+                ? "FOLD_OVERLAY_AND_FACE_UP_CARD_LOSS"
+                : "FOLD_OVERLAY_PHYSICAL_STATUS_UNRESOLVED")
+
+        reports.append(PhysicalFoldReview(
+            hand:action.hand,
+            player:action.player,
+            frame:action.frame,
+            status:status,
+            sourceFrames:[
+                action.beforeFrame,action.frame
+            ],
+            sourceFingerprints:[
+                action.beforeFingerprint,
+                action.currentFingerprint
+            ],
+            limitation:
+                "VISIBLE_LABEL_AND_CARD_APPEARANCE_ONLY; " +
+                "EXECUTION_ORDER_NOT_CERTIFIED; " +
+                "NOT_ADDED_TO_AUTHORITATIVE_ACTIONS"
+        ))
+    }
+
+    for loss in cardLosses where !loss.correspondingFoldOverlay {
+        let earlierFold = overlayCandidates.filter { overlay in
+            overlay.hand == loss.hand &&
+            overlay.label == "FOLD" &&
+            overlay.previous_name_same_position == loss.player &&
+            overlay.frame + 1 == loss.firstMissingFrame &&
+            loss.sourceFrames.count == 4 &&
+            loss.sourceFingerprints.count == 4 &&
+            overlay.previous_frame == loss.sourceFrames[0] &&
+            overlay.frame == loss.sourceFrames[1] &&
+            overlay.previous_fingerprint == loss.sourceFingerprints[0] &&
+            overlay.current_fingerprint == loss.sourceFingerprints[1]
+        }.count == 1
+        let nearWinner = overlayCandidates.contains { overlay in
+            overlay.hand == loss.hand &&
+            overlay.label == "WINNER" &&
+            (overlay.retained_seat_name ??
+                overlay.previous_name_same_position) == loss.player &&
+            overlay.frame >= loss.firstMissingFrame &&
+            overlay.frame <= loss.confirmedFrame+1
+        }
+
+        reports.append(PhysicalFoldReview(
+            hand:loss.hand,
+            player:loss.player,
+            frame:loss.firstMissingFrame,
+            status:earlierFold
+                ? "FOLD_OVERLAY_ONE_FRAME_BEFORE_RED_BACK_LOSS"
+                : (nearWinner
+                    ? "RED_BACK_NOT_DETECTED_DURING_WINNER_ANIMATION"
+                    : "RED_BACK_LOSS_WITHOUT_FOLD_LABEL_UNRESOLVED"),
+            sourceFrames:loss.sourceFrames,
+            sourceFingerprints:loss.sourceFingerprints,
+            limitation:earlierFold
+                ? "FOLD_OVERLAY_PRECEDES_PHYSICAL_CARD_LOSS; " +
+                  "EXECUTION_ORDER_NOT_CERTIFIED; NO_ACTION_PROMOTED"
+                : "NONDETECTION_IS_NOT_PROOF_OF_FOLD; " +
+                  "OVERLAY_CAN_OCCLUDE_CARDS; NO_ACTION_PROMOTED"
+        ))
+    }
+
+    return reports.sorted {
+        if $0.frame != $1.frame {
+            return $0.frame < $1.frame
+        }
+        if $0.hand != $1.hand {
+            return $0.hand < $1.hand
+        }
+        return $0.player < $1.player
+    }
+}
+
+#if os(macOS)
+func testFullScreenFaceUpFusion(
+    _ input: URL, audited: URL
+) throws {
+    let manifest = try JSONDecoder().decode(
+        [Frame].self,
+        from:Data(contentsOf:
+            input.appendingPathComponent("frames.json"))
+    )
+
+    let actions = try JSONDecoder().decode(
+        [LocalActionCandidate].self,
+        from:Data(contentsOf:
+            input.appendingPathComponent(
+                "local_action_candidates.json"))
+    )
+
+    let overlays = try JSONDecoder().decode(
+        [LocalOverlayCandidate].self,
+        from:Data(contentsOf:
+            input.appendingPathComponent(
+                "local_overlay_candidates.json"))
+    )
+
+    let losses = try JSONDecoder().decode(
+        [CardBackLossEvidence].self,
+        from:Data(contentsOf:
+            audited.appendingPathComponent(
+                "full_recording_card_losses.json"))
+    )
+
+    var observed = try JSONDecoder().decode(
+        [FrameCardPairs].self,
+        from:Data(contentsOf:
+            audited.appendingPathComponent(
+                "full_recording_card_pairs.json"))
+    )
+
+    try require(
+        manifest.count == 355 &&
+        observed.count == 355 &&
+        losses.count == 14 &&
+        actions.filter { $0.overlay == "FOLD" }.count == 15,
+        "Saved original physical evidence incomplete"
+    )
+
+    for n in 1...355 {
+        let ocr = try JSONDecoder().decode(
+            LocalOCRFrame.self,
+            from:Data(contentsOf:
+                input.appendingPathComponent(
+                    String(format:"local_ocr/%06d.json",n)
+                ))
+        )
+        try require(
+            ocr.frame == n &&
+            observed[n-1].frame == n &&
+            observed[n-1].sourceFingerprint ==
+                ocr.sourceFingerprint &&
+            observed[n-1].hand ==
+                currentLocalHand(ocr.capture),
+            "Original OCR/physical ownership mismatch at \(n)"
+        )
+    }
+
+    let samples = [
+        171:1,172:1,173:0,174:0,
+        274:1,275:1,276:0,277:0
+    ]
+
+    for n in samples.keys.sorted() {
+        let jpeg = input.appendingPathComponent(
+            manifest[n-1].file
+        )
+        let bytes = try Data(contentsOf:jpeg)
+
+        try require(
+            frameFingerprint(bytes) ==
+                observed[n-1].sourceFingerprint,
+            "Original JPEG SHA mismatch at frame \(n)"
+        )
+
+        let pairs = try fullScreenFaceUpPairs(jpeg:jpeg)
+
+        let heroPairs = pairs.filter {
+            abs($0.x-0.519) < 0.048 &&
+            abs($0.y-0.785) < 0.045
+        }
+
+        try require(
+            heroPairs.count == samples[n]!,
+            "Face-up physical detection mismatch at frame \(n)"
+        )
+
+        observed[n-1].faceUpPairs = pairs
+
+        print(
+            "FACE_UP_FRAME_PASS frame=\(n) " +
+            "visible_pair=\(samples[n]!)"
+        )
+    }
+
+    let fused = physicalFoldReview(
+        actions,cardLosses:losses,
+        observations:observed,
+        overlayCandidates:overlays
+    )
+
+    func count(_ status: String) -> Int {
+        fused.filter { $0.status == status }.count
+    }
+
+    try require(
+        count("FOLD_OVERLAY_AND_RED_BACK_LOSS") == 13 &&
+        count("FOLD_OVERLAY_AND_FACE_UP_CARD_LOSS") == 2 &&
+        count("RED_BACK_NOT_DETECTED_DURING_WINNER_ANIMATION") == 1 &&
+        !fused.contains { $0.status.contains("UNRESOLVED") } &&
+        fused.count == 16,
+        "Physical fusion left unexpected classifications"
+    )
+
+    let white = fused.filter {
+        $0.status == "FOLD_OVERLAY_AND_FACE_UP_CARD_LOSS"
+    }
+
+    try require(
+        white.map { $0.frame } == [173,276] &&
+        white.allSatisfy { $0.player == "poker5068" },
+        "Hero face-up Fold attribution mismatch"
+    )
+
+    let original = try encoded(fused)
+
+    for _ in 0..<2 {
+        try require(
+            try encoded(physicalFoldReview(
+                actions,cardLosses:losses,
+                observations:observed,
+                overlayCandidates:overlays
+            )) == original,
+            "Fusion nondeterministic"
+        )
+    }
+
+    let noFrontEvidence = observed.map { item -> FrameCardPairs in
+        var record = item
+        record.faceUpPairs = nil
+        return record
+    }
+
+    let negative = physicalFoldReview(
+        actions,cardLosses:losses,
+        observations:noFrontEvidence,
+        overlayCandidates:overlays
+    )
+
+    try require(
+        negative.filter {
+            $0.status == "FOLD_OVERLAY_AND_FACE_UP_CARD_LOSS"
+        }.isEmpty &&
+        negative.filter {
+            $0.status == "FOLD_OVERLAY_PHYSICAL_STATUS_UNRESOLVED"
+        }.count == 2,
+        "Unobserved face-up evidence falsely accepted"
+    )
+
+    let stored = try encoded(observed[172])
+    try require(
+        try JSONDecoder().decode(
+            FrameCardPairs.self,from:stored
+        ) == observed[172],
+        "Frame-owned face-up evidence failed serialization"
+    )
+
+    print(
+        "FACE_UP_FUSION_PASS frames=355 red_fold_matches=13 " +
+        "face_up_fold_matches=2 winner_occlusion=1 " +
+        "unresolved_fold_overlays=0 deterministic=3/3 " +
+        "missing_evidence_gate=YES " +
+        "authoritative_changes=0 api_calls=0"
+    )
+}
+#endif
+
+
+// A confirmation event is published one frame after both rapid folds.
+// Actual action interval and inferred order remain explicit in provenance.
+// No other simultaneous-action pair is automatically promoted.
+func certifiedRapidPreflopFoldEvents(
+    actions: [LocalActionCandidate],
+    ocr: [LocalOCRFrame],
+    board: [LocalBoardObservation],
+    cards: [FrameCardPairs],
+    buttons: [String:BlindButtonEvidence],
+    committed: [Event]
+) -> [Event] {
+    guard ocr.count == board.count &&
+          board.count == cards.count &&
+          ocr.count >= 4 && !buttons.isEmpty else { return [] }
+
+    let turnReports = preflopTurnProgression(
+        actions, ocr:ocr, board:board,
+        buttons:Array(buttons.values)
+    )
+    let losses = cardBackLossCandidates(
+        cards, ocr:ocr,
+        blindPositions:Array(buttons.values),
+        actions:actions
+    )
+    let pairs = adjacentSeatOrderCandidates(actions,buttons)
+    var result = [Event]()
+
+    for pair in pairs {
+        let f = pair.frame
+        let confirmed = f+1
+
+        guard f >= 3 && confirmed <= ocr.count &&
+              pair.firstOverlay == "FOLD" &&
+              pair.secondOverlay == "FOLD",
+              let position = buttons[pair.hand],
+              position.confirmedFrame <= f-2,
+              let report = turnReports.first(where: {
+                  $0.hand == pair.hand &&
+                  $0.frame == f &&
+                  $0.verdict == "PRE_FLOP_TURN_SEQUENCE_CONSISTENT"
+              }),
+              report.firstPlayer == pair.firstSeat &&
+              report.secondPlayer == pair.secondSeat,
+              let index = position.clockwiseRing.firstIndex(
+                  of:pair.firstSeat
+              ),
+              position.clockwiseRing[
+                  (index+1)%position.clockwiseRing.count
+              ] == pair.secondSeat
+        else { continue }
+
+        let priorActor = position.clockwiseRing[
+            (index-1+position.clockwiseRing.count) %
+            position.clockwiseRing.count
+        ]
+
+        guard committed.contains(where: {
+            $0.hand == pair.hand &&
+            $0.frame == f-1 &&
+            $0.kind == "action" &&
+            $0.basis == "observed" &&
+            $0.text == "\(priorActor) folds."
+        }) else { continue }
+
+        let candidates = actions.filter {
+            $0.hand == pair.hand && $0.frame == f
+        }
+        guard candidates.count == 2 &&
+              candidates.allSatisfy({
+                  $0.overlay == "FOLD" &&
+                  $0.sameFrameOrderUnknown &&
+                  $0.labelConfidence >= 0.8
+              }) else { continue }
+
+        let ids = Array((f-2)...confirmed)
+
+        guard ids.allSatisfy({ n in
+            let i = n-1
+            return ocr[i].frame == n &&
+                ocr[i].capture.error == nil &&
+                currentLocalHand(ocr[i].capture) == pair.hand &&
+                board[i].frame == n &&
+                board[i].hand == pair.hand &&
+                board[i].visibleBoardCount == 0 &&
+                cards[i].frame == n &&
+                cards[i].hand == pair.hand &&
+                board[i].sourceFingerprint ==
+                    ocr[i].sourceFingerprint &&
+                cards[i].sourceFingerprint ==
+                    ocr[i].sourceFingerprint
+        }) else { continue }
+
+        let players = [pair.firstSeat,pair.secondSeat]
+
+        let matched = players.compactMap { player in
+            losses.first(where: {
+                $0.hand == pair.hand &&
+                $0.player == player &&
+                $0.firstMissingFrame == f &&
+                $0.confirmedFrame == confirmed &&
+                $0.correspondingFoldOverlay &&
+                $0.sourceFrames == ids
+            })
+        }
+
+        guard matched.count == 2 &&
+              matched[0].sourceFingerprints ==
+                  matched[1].sourceFingerprints &&
+              !players.contains(where: { player in
+                  committed.contains(where: {
+                      $0.hand == pair.hand &&
+                      $0.kind == "action" &&
+                      $0.text == "\(player) folds."
+                  })
+              }) else { continue }
+
+        for (i,player) in players.enumerated() {
+            let proof =
+                "RAPID_ORDER_CERTIFIED sequence=\(i+1)/2; " +
+                "actor=\(player); prior_actor=\(priorActor); " +
+                "action_interval=\(f-1)->\(f); " +
+                "confirmed_frame=\(confirmed); " +
+                "blind_ring_frames=\(position.firstFrame)," +
+                "\(position.confirmedFrame); " +
+                "original fingerprints: " +
+                matched[i].sourceFingerprints.joined(separator:",") +
+                "; explicit Fold label; cards present twice then " +
+                "absent twice; inferred preflop seat order; " +
+                "other hand actions UNKNOWN"
+
+            result.append(Event(
+                frame:confirmed,
+                hand:pair.hand,
+                kind:"action",
+                basis:"inferred",
+                text:"\(player) folds.",
+                evidence:proof
+            ))
+        }
+    }
+
+    return result.sorted {
+        if $0.frame != $1.frame {
+            return $0.frame < $1.frame
+        }
+        return $0.evidence < $1.evidence
+    }
+}
+
+
+#if os(macOS)
+func testCertifiedRapidFoldPromotion(_ input: URL) async throws {
+    let manifest = try JSONDecoder().decode(
+        [Frame].self,
+        from:Data(contentsOf:
+            input.appendingPathComponent("frames.json"))
+    )
+    let board = try JSONDecoder().decode(
+        [LocalBoardObservation].self,
+        from:Data(contentsOf:
+            input.appendingPathComponent(
+                "local_board_observations.json"))
+    )
+    try require(
+        manifest.count == 355 && board.count == 355,
+        "Original recording incomplete"
+    )
+
+    let ocr = try (1...24).map { n in
+        try JSONDecoder().decode(
+            LocalOCRFrame.self,
+            from:Data(contentsOf:
+                input.appendingPathComponent(
+                    String(format:"local_ocr/%06d.json",n)))
+        )
+    }
+    var comparisons = [Data]()
+
+    for _ in 0..<2 {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "pi-certified-fold-"+UUID().uuidString
+            )
+        defer {
+            try? FileManager.default.removeItem(at:root)
+        }
+
+        for sub in ["frames","accepted","responses"] {
+            try FileManager.default.createDirectory(
+                at:root.appendingPathComponent(sub),
+                withIntermediateDirectories:true
+            )
+        }
+
+        let rec = Recorder(
+            directory:root,
+            live:root.appendingPathComponent("live.txt"),
+            verbose:false,
+            localSemanticOnly:true
+        )
+        try await rec.publish()
+
+        for n in 1...24 {
+            let frame = manifest[n-1]
+            let jpeg = input.appendingPathComponent(frame.file)
+            let data = try Data(contentsOf:jpeg)
+
+            try require(
+                frame.id == n &&
+                ocr[n-1].frame == n &&
+                frameFingerprint(data) ==
+                    ocr[n-1].sourceFingerprint &&
+                board[n-1].sourceFingerprint ==
+                    ocr[n-1].sourceFingerprint,
+                "Original JPEG or OCR fingerprint mismatch"
+            )
+
+            try await rec.add(
+                data,
+                start:frame.started,
+                end:frame.captured,
+                width:frame.width,
+                height:frame.height,
+                local:ocr[n-1].capture,
+                boardCount:board[n-1].visibleBoardCount,
+                cardBackPairs:try fullScreenCardBackPairs(
+                    jpeg:jpeg
+                ),
+                faceUpCardPairs:try fullScreenFaceUpPairs(
+                    jpeg:jpeg
+                )
+            )
+
+            if n == 22 {
+                let events = await rec.events
+                try require(
+                    events.filter {
+                        $0.kind == "action_episode" &&
+                        $0.frame == 22
+                    }.count == 1 &&
+                    !events.contains(where: {
+                        $0.kind == "action" &&
+                        $0.basis == "inferred"
+                    }),
+                    "Premature action certification"
+                )
+            }
+
+            if n == 23 {
+                let events = await rec.events
+                let proven = events.filter {
+                    $0.kind == "action" &&
+                    $0.basis == "inferred" &&
+                    $0.evidence.contains(
+                        "RAPID_ORDER_CERTIFIED"
+                    )
+                }
+
+                try require(
+                    proven.map { $0.text } ==
+                        ["Friens folds.","GatiN_PretO folds."] &&
+                    proven.map { $0.frame } == [23,23] &&
+                    foldEpisodesAreUnique(events),
+                    "Certified fold sequence incorrect"
+                )
+            }
+        }
+
+        try await rec.finish()
+        let final = await rec.events
+
+        let certified = final.filter {
+            $0.kind == "action" &&
+            $0.basis == "inferred" &&
+            $0.evidence.contains(
+                "RAPID_ORDER_CERTIFIED"
+            )
+        }
+
+        try require(
+            certified.count == 2 &&
+            final.filter {
+                $0.kind == "action_episode" &&
+                $0.frame == 22
+            }.count == 1,
+            "Original episode lost or duplicated"
+        )
+
+        let checkpoint = try JSONDecoder().decode(
+            DurableState.self,
+            from:Data(contentsOf:
+                root.appendingPathComponent(
+                    "authoritative_checkpoint.json"))
+        )
+
+        try require(
+            checkpoint.cursor == 24 &&
+            checkpoint.commits.flatMap {
+                $0.accepted
+            } == final,
+            "Durable checkpoint mismatch"
+        )
+
+        let restored = Recorder(
+            directory:root,
+            live:root.appendingPathComponent("live.txt"),
+            verbose:false,
+            localSemanticOnly:true
+        )
+        try await restored.publish()
+
+        let recovered = await restored.events
+        let status = await restored.status()
+
+        try require(
+            recovered == final &&
+            status.stopped &&
+            status.pending == 0,
+            "Restart altered committed chronology"
+        )
+
+        let candidates = await rec.localActions
+        let cards = await rec.localCardBacks
+        let positions = await rec.blindPositions
+        let boardEvidence = await rec.localBoard
+        let originalOCR = await rec.localOCR
+
+        let prior = final.filter { $0.frame <= 22 }
+
+        let pure = certifiedRapidPreflopFoldEvents(
+            actions:candidates,
+            ocr:originalOCR,
+            board:boardEvidence,
+            cards:cards,
+            buttons:positions,
+            committed:prior
+        )
+
+        try require(
+            pure == certified,
+            "Recomputed evidence differs"
+        )
+
+        try require(
+            certifiedRapidPreflopFoldEvents(
+                actions:candidates,
+                ocr:originalOCR,
+                board:boardEvidence,
+                cards:cards,
+                buttons:[:],
+                committed:prior
+            ).isEmpty &&
+            certifiedRapidPreflopFoldEvents(
+                actions:candidates,
+                ocr:originalOCR,
+                board:boardEvidence,
+                cards:[],
+                buttons:positions,
+                committed:prior
+            ).isEmpty &&
+            certifiedRapidPreflopFoldEvents(
+                actions:candidates,
+                ocr:originalOCR,
+                board:boardEvidence,
+                cards:cards,
+                buttons:positions,
+                committed:[]
+            ).isEmpty &&
+            certifiedRapidPreflopFoldEvents(
+                actions:candidates,
+                ocr:Array(originalOCR.prefix(22)),
+                board:Array(boardEvidence.prefix(22)),
+                cards:Array(cards.prefix(22)),
+                buttons:positions,
+                committed:prior
+            ).isEmpty,
+            "Missing-evidence safety gate failed"
+        )
+
+        comparisons.append(try encoded(final))
+    }
+
+    try require(
+        comparisons.count == 2 &&
+        comparisons[0] == comparisons[1],
+        "Deterministic replay mismatch"
+    )
+
+    print(
+        "CERTIFIED_RAPID_FOLDS_PASS original_frames=24 " +
+        "inferred_folds=2 physical_action_frame=22 " +
+        "confirmation_frame=23 " +
+        "prior_unordered_episode_preserved=YES " +
+        "negative_gates=4 deterministic=2/2 " +
+        "checkpoint=YES restart=YES api_calls=0"
+    )
+}
+#endif
+
+
+// Recover an early preflop Fold when the nameplate becomes legible later.
+// Physical action frame and confirmation/publication frame remain distinct.
+func recoveredOpeningPreflopFolds(
+    overlays: [LocalOverlayCandidate], ocr: [LocalOCRFrame],
+    board: [LocalBoardObservation], cards: [FrameCardPairs],
+    buttons: [String:BlindButtonEvidence], committed: [Event]
+) -> [Event] {
+    guard !ocr.isEmpty, ocr.count == board.count,
+          board.count == cards.count else { return [] }
+
+    let laterNames = laterSameHandFoldNames(overlays, ocr)
+    var out = [Event]()
+
+    for link in laterNames {
+        let f = link.overlayFrame
+        let name = link.playerCandidate
+
+        guard f >= 2, link.nameplateFrames.count == 2,
+              link.nameplateFrames[1] == link.nameplateFrames[0]+1,
+              let button = buttons[link.hand],
+              button.confirmedFrame > f,
+              let bb = button.clockwiseRing.firstIndex(of: button.bigBlind),
+              button.clockwiseRing.count >= 3,
+              button.clockwiseRing[(bb+1) % button.clockwiseRing.count] == name,
+              let label = overlays.first(where: {
+                  $0.hand == link.hand && $0.frame == f &&
+                  $0.label == "FOLD" && $0.confidence >= 0.8 &&
+                  $0.previous_name_same_position == nil &&
+                  $0.current_fingerprint == link.overlayFingerprint
+              }),
+              overlays.filter({
+                  $0.hand == link.hand && $0.frame == f &&
+                  $0.label == "FOLD"
+              }).count == 1,
+              !committed.contains(where: {
+                  $0.hand == link.hand && $0.kind == "action" &&
+                  $0.text == "\(name) folds."
+              })
+        else { continue }
+
+        let publishFrame = max(button.confirmedFrame, link.nameplateFrames[1])
+        let owned = [
+            f-1,f,f+1,link.nameplateFrames[0],
+            link.nameplateFrames[1],button.firstFrame,
+            button.confirmedFrame
+        ]
+
+        guard publishFrame <= ocr.count && owned.allSatisfy({ n in
+            n > 0 && n <= ocr.count &&
+            ocr[n-1].frame == n && ocr[n-1].capture.error == nil &&
+            currentLocalHand(ocr[n-1].capture) == link.hand &&
+            board[n-1].frame == n && board[n-1].hand == link.hand &&
+            board[n-1].visibleBoardCount == 0 &&
+            cards[n-1].frame == n && cards[n-1].hand == link.hand &&
+            cards[n-1].sourceFingerprint == ocr[n-1].sourceFingerprint &&
+            board[n-1].sourceFingerprint == ocr[n-1].sourceFingerprint
+        }) else { continue }
+
+        guard label.previous_frame == f-1 &&
+              label.previous_fingerprint == ocr[f-2].sourceFingerprint &&
+              label.current_fingerprint == ocr[f-1].sourceFingerprint &&
+              link.nameplateFingerprints == link.nameplateFrames.map({
+                  ocr[$0-1].sourceFingerprint
+              }) &&
+              button.firstFingerprint ==
+                  ocr[button.firstFrame-1].sourceFingerprint &&
+              button.confirmedFingerprint ==
+                  ocr[button.confirmedFrame-1].sourceFingerprint
+        else { continue }
+
+        let before = cards[f-2]
+        let after = cards[f-1]
+        let next = cards[f]
+
+        func atSeat(_ p: LocalCardPair) -> Bool {
+            abs(p.x-label.x) < 0.03 &&
+            (1.0-label.y)-p.y > 0.03 &&
+            (1.0-label.y)-p.y < 0.085
+        }
+
+        let prior = before.pairs.filter(atSeat)
+
+        guard prior.count == 1 &&
+              after.pairs.filter(atSeat).isEmpty &&
+              next.pairs.filter(atSeat).isEmpty &&
+              before.pairs.count == after.pairs.count+1 &&
+              after.pairs.count == next.pairs.count
+        else { continue }
+
+        // Reject widespread animation loss or simultaneous unproven losses.
+        let others = before.pairs.filter { !atSeat($0) }
+        let stableOthers = others.allSatisfy { p in
+            [after,next].allSatisfy { row in
+                row.pairs.contains { q in
+                    abs(q.x-p.x) < 0.018 &&
+                    abs(q.y-p.y) < 0.018
+                }
+            }
+        }
+
+        guard stableOthers &&
+              !overlays.contains(where: {
+                  $0.hand == link.hand &&
+                  $0.frame < f && $0.label == "FOLD"
+              })
+        else { continue }
+
+        let evidence =
+            "OPENING_PREFLOP_FOLD_RECONCILED; " +
+            "physical_action_interval=\(f-1)->\(f); " +
+            "confirmation_frame=\(publishFrame); " +
+            "delayed_name_frames=\(link.nameplateFrames); " +
+            "blind_ring_frames=\(button.firstFrame),\(button.confirmedFrame); " +
+            "first_preflop_actor_after_big_blind=\(name); " +
+            "one_red_card_pair_present_then_two_absent; " +
+            "no_other_card_loss; original fingerprints: " +
+            owned.map { ocr[$0-1].sourceFingerprint }.joined(separator:",")
+
+        out.append(Event(
+            frame:publishFrame,hand:link.hand,
+            kind:"action",basis:"inferred",
+            text:"\(name) folds.",evidence:evidence
+        ))
+    }
+
+    return out.sorted {
+        $0.frame == $1.frame
+            ? $0.hand < $1.hand
+            : $0.frame < $1.frame
+    }
+}
+
+
+#if os(macOS)
+func originalOpeningFoldRegression(
+    _ original: URL, recorded: URL
+) async throws {
+    let decode = JSONDecoder()
+
+    let manifest = try decode.decode([Frame].self,
+        from:Data(contentsOf:
+            original.appendingPathComponent("frames.json")))
+
+    let board = try decode.decode([LocalBoardObservation].self,
+        from:Data(contentsOf:
+            original.appendingPathComponent("local_board_observations.json")))
+
+    let overlays = try decode.decode([LocalOverlayCandidate].self,
+        from:Data(contentsOf:
+            original.appendingPathComponent("local_overlay_candidates.json")))
+
+    let cards = try decode.decode([FrameCardPairs].self,
+        from:Data(contentsOf:
+            recorded.appendingPathComponent("observed_card_back_pairs.json")))
+
+    let reference = try decode.decode(DurableState.self,
+        from:Data(contentsOf:
+            recorded.appendingPathComponent("authoritative_checkpoint.json")))
+
+    try require(
+        manifest.count == 355 && board.count == 355 &&
+        cards.count == 355 && reference.cursor == 355 &&
+        reference.commits.flatMap({$0.accepted}).count == 40,
+        "Baseline 355-frame checkpoint missing"
+    )
+
+    var ocr = [LocalOCRFrame]()
+
+    for n in 1...355 {
+        let row = try decode.decode(LocalOCRFrame.self,
+            from:Data(contentsOf:
+                original.appendingPathComponent(
+                    String(format:"local_ocr/%06d.json",n))))
+
+        let image = try Data(contentsOf:
+            original.appendingPathComponent(manifest[n-1].file))
+
+        try require(
+            manifest[n-1].id == n && row.frame == n &&
+            frameFingerprint(image) == row.sourceFingerprint &&
+            cards[n-1].frame == n &&
+            cards[n-1].sourceFingerprint == row.sourceFingerprint &&
+            board[n-1].frame == n &&
+            board[n-1].sourceFingerprint == row.sourceFingerprint &&
+            cards[n-1].hand == currentLocalHand(row.capture) &&
+            board[n-1].hand == currentLocalHand(row.capture),
+            "Original evidence mismatch at frame \(n)"
+        )
+
+        ocr.append(row)
+    }
+
+    let buttons = Dictionary(uniqueKeysWithValues:
+        bestBlindButtonEvidence(ocr).map { ($0.hand,$0) })
+
+    let recovered = recoveredOpeningPreflopFolds(
+        overlays:overlays,ocr:ocr,board:board,cards:cards,
+        buttons:buttons,committed:[]
+    )
+
+    try require(
+        recovered.count == 2 &&
+        recovered[0].hand == "2871296743" &&
+        recovered[0].frame == 162 &&
+        recovered[0].text == "Friens folds." &&
+        recovered[1].hand == "2871297575" &&
+        recovered[1].frame == 265 &&
+        recovered[1].text == "GatiN_PretO folds.",
+        "Original opening folds not recovered"
+    )
+
+    let referenceEvidence = try encoded(recovered)
+
+    for _ in 0..<2 {
+        try require(
+            try encoded(recoveredOpeningPreflopFolds(
+                overlays:overlays,ocr:ocr,board:board,cards:cards,
+                buttons:buttons,committed:[]
+            )) == referenceEvidence,
+            "Opening-fold inference nondeterministic"
+        )
+    }
+
+    try require(
+        recoveredOpeningPreflopFolds(
+            overlays:overlays,ocr:ocr,board:board,cards:cards,
+            buttons:[:],committed:[]
+        ).isEmpty,
+        "Blind-position absence failed safety gate"
+    )
+
+    var damaged = cards
+    damaged[156] = FrameCardPairs(
+        frame:damaged[156].frame,
+        sourceFingerprint:damaged[156].sourceFingerprint,
+        hand:damaged[156].hand,
+        pairs:[],
+        faceUpPairs:damaged[156].faceUpPairs
+    )
+
+    let withoutPhysical = recoveredOpeningPreflopFolds(
+        overlays:overlays,ocr:ocr,board:board,cards:damaged,
+        buttons:buttons,committed:[]
+    )
+
+    try require(
+        withoutPhysical.count == 1 &&
+        withoutPhysical[0].frame == 265,
+        "Missing card evidence incorrectly accepted"
+    )
+
+    let withoutOverlay = recoveredOpeningPreflopFolds(
+        overlays:overlays.filter { $0.frame != 158 },
+        ocr:ocr,board:board,cards:cards,
+        buttons:buttons,committed:[]
+    )
+
+    try require(
+        withoutOverlay.count == 1 &&
+        withoutOverlay[0].frame == 265,
+        "Missing Fold label incorrectly accepted"
+    )
+
+    try require(
+        recoveredOpeningPreflopFolds(
+            overlays:overlays,ocr:ocr,board:board,cards:cards,
+            buttons:buttons,committed:recovered
+        ).isEmpty,
+        "Already committed fold duplicated"
+    )
+
+    print(
+        "EARLY_FOLD_EVIDENCE_PASS folds=2 source_frames=158,263 " +
+        "publication_frames=162,265 negative_gates=4 deterministic=3/3"
+    )
+
+    let fm = FileManager.default
+    let destination = fm.temporaryDirectory.appendingPathComponent(
+        "pi-opening-fold-" + UUID().uuidString
+    )
+
+    defer { try? fm.removeItem(at:destination) }
+
+    for sub in ["frames","accepted","responses"] {
+        try fm.createDirectory(
+            at:destination.appendingPathComponent(sub),
+            withIntermediateDirectories:true
+        )
+    }
+
+    let rec = Recorder(
+        directory:destination,
+        live:destination.appendingPathComponent("live.txt"),
+        verbose:false,localSemanticOnly:true
+    )
+    try await rec.publish()
+
+    for n in 1...355 {
+        let f = manifest[n-1]
+        let bytes = try Data(contentsOf:
+            original.appendingPathComponent(f.file))
+
+        try await rec.add(
+            bytes,start:f.started,end:f.captured,
+            width:f.width,height:f.height,
+            local:ocr[n-1].capture,
+            boardCount:board[n-1].visibleBoardCount,
+            cardBackPairs:cards[n-1].pairs,
+            faceUpCardPairs:cards[n-1].faceUpPairs ?? []
+        )
+
+        if n == 158 || n == 263 {
+            let current = await rec.events
+            try require(
+                !current.contains {
+                    $0.evidence.contains(
+                        "OPENING_PREFLOP_FOLD_RECONCILED"
+                    ) &&
+                    $0.hand == currentLocalHand(ocr[n-1].capture)
+                },
+                "Fold published before nameplate confirmation"
+            )
+        }
+
+        if n == 162 || n == 265 {
+            let current = await rec.events
+            try require(
+                current.contains {
+                    $0.frame == n &&
+                    $0.evidence.contains(
+                        "OPENING_PREFLOP_FOLD_RECONCILED"
+                    )
+                },
+                "Opening fold missing at publication frame"
+            )
+        }
+
+        if n % 75 == 0 {
+            print("OPENING_FOLD_REPLAY_PROGRESS \(n)/355")
+        }
+    }
+
+    try await rec.finish()
+    let events = await rec.events
+
+    let newEvents = events.filter {
+        $0.evidence.contains("OPENING_PREFLOP_FOLD_RECONCILED")
+    }
+    let baselineEvents = reference.commits.flatMap { $0.accepted }
+
+    try require(
+        newEvents == recovered &&
+        events.count == 46 &&
+        events.filter {
+            !$0.evidence.contains("OPENING_PREFLOP_FOLD_RECONCILED") &&
+            !$0.evidence.contains("MIXED_PREFLOP_CHAIN_CERTIFIED")
+        } == baselineEvents &&
+        events.filter { $0.evidence.contains("MIXED_PREFLOP_CHAIN_CERTIFIED") }.count == 4,
+        "Original 40 events changed or opening folds missing"
+    )
+
+    let cp = try decode.decode(DurableState.self,
+        from:Data(contentsOf:
+            destination.appendingPathComponent(
+                "authoritative_checkpoint.json")))
+
+    try require(
+        cp.cursor == 355 &&
+        cp.commits.flatMap({$0.accepted}) == events,
+        "Opening folds not checkpointed"
+    )
+
+    let restored = Recorder(
+        directory:destination,
+        live:destination.appendingPathComponent("live.txt"),
+        verbose:false,localSemanticOnly:true
+    )
+
+    try await restored.publish()
+    let restoredEvents = await restored.events
+    let status = await restored.status()
+
+    try require(
+        restoredEvents == events &&
+        status.stopped &&
+        status.pending == 0 &&
+        status.calls == 0,
+        "Checkpoint recovery duplicated or dropped opening folds"
+    )
+
+    print(
+        "OPENING_FOLD_FULL_REPLAY_PASS frames=355 old_events=40 " +
+        "new_opening_folds=2 total_events=46 checkpoint=355 " +
+        "restart=YES api_calls=0"
+    )
+}
+#endif
+
+
+func corroboratedMixedPreflopActions(
+    actions: [LocalActionCandidate],
+    overlays: [LocalOverlayCandidate],
+    ocr: [LocalOCRFrame],
+    board: [LocalBoardObservation],
+    cards: [FrameCardPairs],
+    buttons: [String:BlindButtonEvidence],
+    committed: [Event]
+) -> [Event] {
+    guard ocr.count == board.count &&
+          ocr.count == cards.count &&
+          ocr.count >= 4 else { return [] }
+
+    let pairs = adjacentSeatOrderCandidates(actions, buttons)
+
+    let lostBacks = cardBackLossCandidates(
+        cards, ocr: ocr,
+        blindPositions: Array(buttons.values),
+        actions: actions
+    )
+
+    let byFrame = Dictionary(
+        uniqueKeysWithValues: cards.map { ($0.frame, $0) }
+    )
+
+    var accepted = [Event]()
+
+    for pair in pairs where
+        (pair.firstOverlay == "RAISE" ||
+         pair.firstOverlay == "CALL") &&
+        pair.secondOverlay == "FOLD" {
+
+        let f = pair.frame
+        let confirmed = f + 1
+
+        guard f >= 3 && confirmed <= ocr.count,
+              let position = buttons[pair.hand],
+              position.confirmedFrame < f,
+              position.clockwiseRing.count >= 3,
+              Set(position.clockwiseRing).count ==
+                  position.clockwiseRing.count,
+              pair.ringEvidenceFrames == [
+                  position.firstFrame,
+                  position.confirmedFrame
+              ],
+              pair.actionEvidenceFrames == [f-1, f],
+              let dealer = position.clockwiseRing.firstIndex(
+                  of: position.dealer
+              ),
+              position.clockwiseRing[
+                  (dealer+1) % position.clockwiseRing.count
+              ] == position.smallBlind,
+              position.clockwiseRing[
+                  (dealer+2) % position.clockwiseRing.count
+              ] == position.bigBlind,
+              let firstIndex = position.clockwiseRing.firstIndex(
+                  of: pair.firstSeat
+              ),
+              position.clockwiseRing[
+                  (firstIndex+1) % position.clockwiseRing.count
+              ] == pair.secondSeat,
+              let first = actions.first(where: {
+                  $0.hand == pair.hand &&
+                  $0.frame == f &&
+                  $0.player == pair.firstSeat
+              }),
+              let second = actions.first(where: {
+                  $0.hand == pair.hand &&
+                  $0.frame == f &&
+                  $0.player == pair.secondSeat
+              })
+        else { continue }
+
+        let participants = actions.filter {
+            $0.hand == pair.hand && $0.frame == f
+        }
+
+        guard participants.count == 2,
+              first.overlay == pair.firstOverlay &&
+              second.overlay == "FOLD",
+              first.sameFrameOrderUnknown &&
+              second.sameFrameOrderUnknown,
+              first.labelConfidence >= 0.8 &&
+              second.labelConfidence >= 0.8,
+              first.beforeFrame == f-1 &&
+              second.beforeFrame == f-1,
+              first.beforeFingerprint ==
+                  second.beforeFingerprint &&
+              first.currentFingerprint ==
+                  second.currentFingerprint,
+              pair.actionFingerprints == [
+                  first.beforeFingerprint,
+                  first.currentFingerprint
+              ],
+              let oldStack = Decimal(
+                  string: first.beforeStackBB,
+                  locale: Locale(identifier: "en_US_POSIX")
+              ),
+              let newStackString = first.afterStackBB,
+              let newStack = Decimal(
+                  string: newStackString,
+                  locale: Locale(identifier: "en_US_POSIX")
+              ),
+              newStack >= 0 && newStack < oldStack,
+              let oldFoldStack = Decimal(
+                  string: second.beforeStackBB,
+                  locale: Locale(identifier: "en_US_POSIX")
+              ),
+              let newFoldString = second.afterStackBB,
+              let newFoldStack = Decimal(
+                  string: newFoldString,
+                  locale: Locale(identifier: "en_US_POSIX")
+              ),
+              newFoldStack == oldFoldStack
+        else { continue }
+
+        let previousSeat = position.clockwiseRing[
+            (firstIndex - 1 + position.clockwiseRing.count) %
+            position.clockwiseRing.count
+        ]
+
+        let priorActions = committed.filter {
+            $0.hand == pair.hand &&
+            $0.kind == "action" &&
+            $0.frame < f
+        }
+
+        guard let previous = priorActions.last,
+              previous.text == "\(previousSeat) folds.",
+              previous.basis == "inferred",
+              (
+                  previous.evidence.contains(
+                      "OPENING_PREFLOP_FOLD_RECONCILED"
+                  ) ||
+                  previous.evidence.contains(
+                      "MIXED_PREFLOP_CHAIN_CERTIFIED"
+                  )
+              ),
+              !committed.contains(where: {
+                  $0.hand == pair.hand &&
+                  $0.kind == "action" &&
+                  (
+                      $0.text == localSemanticText(first) ||
+                      $0.text == "\(second.player) folds."
+                  )
+              }),
+              !actions.contains(where: {
+                  $0.hand == pair.hand &&
+                  $0.frame > previous.frame &&
+                  $0.frame < f
+              }),
+              !overlays.contains(where: {
+                  $0.hand == pair.hand &&
+                  $0.frame > previous.frame &&
+                  $0.frame < f &&
+                  $0.label == "FOLD"
+              })
+        else { continue }
+
+        let sourceFrames = Array((f-2)...confirmed)
+
+        guard sourceFrames.allSatisfy({ n in
+            let i = n-1
+            return ocr[i].frame == n &&
+                ocr[i].capture.error == nil &&
+                currentLocalHand(ocr[i].capture) == pair.hand &&
+                board[i].frame == n &&
+                board[i].hand == pair.hand &&
+                board[i].visibleBoardCount == 0 &&
+                board[i].sourceFingerprint ==
+                    ocr[i].sourceFingerprint &&
+                cards[i].frame == n &&
+                cards[i].hand == pair.hand &&
+                cards[i].sourceFingerprint ==
+                    ocr[i].sourceFingerprint
+        }),
+              (previous.frame...confirmed).allSatisfy({ n in
+                  let i = n-1
+                  return ocr[i].capture.error == nil &&
+                      currentLocalHand(ocr[i].capture) == pair.hand &&
+                      board[i].visibleBoardCount == 0 &&
+                      board[i].sourceFingerprint ==
+                          ocr[i].sourceFingerprint
+              }),
+              ocr[f-2].sourceFingerprint ==
+                  first.beforeFingerprint,
+              ocr[f-1].sourceFingerprint ==
+                  first.currentFingerprint
+        else { continue }
+
+        // A raise/call must NOT be mistaken for card loss.
+        let cy = 1.0 - first.y
+
+        func firstStillHasCards(_ row: FrameCardPairs) -> Bool {
+            row.pairs.filter { p in
+                abs(p.x-first.x) < 0.030 &&
+                cy-p.y > 0.030 &&
+                cy-p.y < 0.085
+            }.count == 1
+        }
+
+        guard sourceFrames.allSatisfy({
+            firstStillHasCards(cards[$0-1])
+        }) else { continue }
+
+        // Both red-backed and face-up hero Fold episodes are supported.
+        // A preselected Fold button alone is never sufficient.
+        let redLoss = lostBacks.contains {
+            $0.hand == pair.hand &&
+            $0.player == second.player &&
+            $0.firstMissingFrame == f &&
+            $0.confirmedFrame == confirmed &&
+            $0.correspondingFoldOverlay &&
+            $0.sourceFrames == sourceFrames
+        }
+
+        let faceUpLoss = faceUpCardLossSupported(
+            second, observations: byFrame
+        )
+
+        guard redLoss || faceUpLoss else { continue }
+
+        let hashes = sourceFrames.map {
+            ocr[$0-1].sourceFingerprint
+        }
+
+        for (index, participant) in
+            [first, second].enumerated() {
+
+            let proof =
+                "MIXED_PREFLOP_CHAIN_CERTIFIED sequence=\(index+1)/2; " +
+                "action_frame=\(f); " +
+                "physical_confirmation_frame=\(confirmed); " +
+                "prior_committed=\(previous.text) " +
+                "at frame \(previous.frame); " +
+                "button_frames=\(position.firstFrame)," +
+                "\(position.confirmedFrame); " +
+                "actor_retained_cards=YES; " +
+                "folder_card_loss=\(redLoss ? "RED_BACK" : "FACE_UP"); " +
+                "original fingerprints: \(hashes.joined(separator: ",")); " +
+                "stack_motion_confirmed=YES; " +
+                "within_interval_clock_times_UNKNOWN; " +
+                "exact_raise_or_call_amount_UNKNOWN"
+
+            accepted.append(Event(
+                frame: confirmed,
+                hand: pair.hand,
+                kind: "action",
+                basis: "inferred",
+                text: localSemanticText(participant),
+                evidence: proof
+            ))
+        }
+    }
+
+    return accepted.sorted {
+        if $0.frame != $1.frame {
+            return $0.frame < $1.frame
+        }
+        return $0.evidence < $1.evidence
+    }
+}
+
+
+#if os(macOS)
+func originalMixedPreflopReplay(
+    _ source: URL, previous: URL
+) async throws {
+    let decoder = JSONDecoder()
+
+    let manifest = try decoder.decode(
+        [Frame].self,
+        from: Data(contentsOf:
+            source.appendingPathComponent("frames.json"))
+    )
+
+    let boards = try decoder.decode(
+        [LocalBoardObservation].self,
+        from: Data(contentsOf:
+            source.appendingPathComponent(
+                "local_board_observations.json"))
+    )
+
+    let prior = try decoder.decode(
+        DurableState.self,
+        from: Data(contentsOf:
+            previous.appendingPathComponent(
+                "authoritative_checkpoint.json"))
+    )
+
+    let oldEvents = prior.commits.flatMap {
+        $0.accepted
+    }
+
+    try require(
+        manifest.count == 355 &&
+        boards.count == 355 &&
+        prior.cursor == 355 &&
+        oldEvents.count == 40,
+        "Original 40-event regression baseline missing"
+    )
+
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent(
+            "pi-mixed-chain-" + UUID().uuidString
+        )
+
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    for sub in ["frames","accepted","responses"] {
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent(sub),
+            withIntermediateDirectories: true
+        )
+    }
+
+    let rec = Recorder(
+        directory: root,
+        live: root.appendingPathComponent("live.txt"),
+        verbose: false,
+        localSemanticOnly: true
+    )
+
+    try await rec.publish()
+
+    for n in 1...355 {
+        let frame = manifest[n-1]
+
+        let ocr = try decoder.decode(
+            LocalOCRFrame.self,
+            from: Data(contentsOf:
+                source.appendingPathComponent(
+                    String(format:"local_ocr/%06d.json", n)
+                ))
+        )
+
+        let jpeg = source.appendingPathComponent(frame.file)
+        let bytes = try Data(contentsOf: jpeg)
+
+        try require(
+            frame.id == n &&
+            ocr.frame == n &&
+            frameFingerprint(bytes) == ocr.sourceFingerprint &&
+            boards[n-1].frame == n &&
+            boards[n-1].sourceFingerprint ==
+                ocr.sourceFingerprint &&
+            boards[n-1].hand ==
+                currentLocalHand(ocr.capture),
+            "Original screenshot ownership mismatch at \(n)"
+        )
+
+        guard let cgsrc = CGImageSourceCreateWithURL(
+                  jpeg as CFURL, nil
+              ),
+              let image = CGImageSourceCreateImageAtIndex(
+                  cgsrc, 0, nil
+              )
+        else {
+            throw Problem(
+                "Cannot decode original screenshot at frame \(n)"
+            )
+        }
+
+        try await rec.add(
+            bytes,
+            start: frame.started,
+            end: frame.captured,
+            width: frame.width,
+            height: frame.height,
+            local: ocr.capture,
+            boardCount: boards[n-1].visibleBoardCount,
+            cardBackPairs: fullScreenCardBackPairs(image: image),
+            faceUpCardPairs: fullScreenFaceUpPairs(image: image)
+        )
+
+        if [166,167,173,174].contains(n) {
+            let current = await rec.events
+            let mixed = current.filter {
+                $0.evidence.contains(
+                    "MIXED_PREFLOP_CHAIN_CERTIFIED"
+                )
+            }
+
+            let expected = n == 166
+                ? 0 : (n == 167 || n == 173 ? 2 : 4)
+
+            try require(
+                mixed.count == expected,
+                "Premature or duplicated mixed action at \(n)"
+            )
+        }
+
+        if n % 75 == 0 {
+            print("MIXED_CHAIN_REPLAY_PROGRESS \(n)/355")
+        }
+    }
+
+    try await rec.finish()
+
+    let events = await rec.events
+
+    let recovered = events.filter {
+        $0.evidence.contains(
+            "OPENING_PREFLOP_FOLD_RECONCILED"
+        )
+    }
+
+    let mixed = events.filter {
+        $0.evidence.contains(
+            "MIXED_PREFLOP_CHAIN_CERTIFIED"
+        )
+    }
+
+    let unaffected = events.filter {
+        !$0.evidence.contains(
+            "OPENING_PREFLOP_FOLD_RECONCILED"
+        ) &&
+        !$0.evidence.contains(
+            "MIXED_PREFLOP_CHAIN_CERTIFIED"
+        )
+    }
+
+    try require(
+        unaffected == oldEvents &&
+        recovered.count == 2 &&
+        recovered.map { $0.text } == [
+            "Friens folds.",
+            "GatiN_PretO folds."
+        ] &&
+        mixed.map { $0.text } == [
+            "GatiN_PretO raises (amount unverified).",
+            "Scklo folds.",
+            "JosephPLACR calls (amount unverified).",
+            "poker5068 folds."
+        ] &&
+        mixed.map { $0.frame } == [167,167,174,174] &&
+        events.filter {
+            $0.kind == "action_episode"
+        }.map { $0.frame } == [22,166,173] &&
+        events.count == 46,
+        "Original actions changed or new chain is incorrect"
+    )
+
+    let checkpoint = try decoder.decode(
+        DurableState.self,
+        from: Data(contentsOf:
+            root.appendingPathComponent(
+                "authoritative_checkpoint.json"))
+    )
+
+    try require(
+        checkpoint.cursor == 355 &&
+        checkpoint.commits.flatMap({
+            $0.accepted
+        }) == events,
+        "Native durable checkpoint mismatch"
+    )
+
+    let positions = await rec.blindPositions
+    let actions = await rec.localActions
+    let overlays = await rec.localCandidates
+    let ocr = await rec.localOCR
+    let board = await rec.localBoard
+    let cards = await rec.localCardBacks
+
+    let priorOpening = events.filter {
+        $0.hand == "2871296743" && $0.frame <= 162
+    }
+
+    let first = corroboratedMixedPreflopActions(
+        actions: actions,
+        overlays: overlays,
+        ocr: ocr,
+        board: board,
+        cards: cards,
+        buttons: positions,
+        committed: priorOpening
+    )
+
+    try require(
+        first.map { $0.text } == [
+            "GatiN_PretO raises (amount unverified).",
+            "Scklo folds."
+        ],
+        "Frame 166 actions could not be reproduced"
+    )
+
+    let priorSecond = events.filter {
+        $0.hand == "2871296743" && $0.frame <= 167
+    }
+
+    let second = corroboratedMixedPreflopActions(
+        actions: actions,
+        overlays: overlays,
+        ocr: ocr,
+        board: board,
+        cards: cards,
+        buttons: positions,
+        committed: priorSecond
+    )
+
+    try require(
+        second.map { $0.text } == [
+            "JosephPLACR calls (amount unverified).",
+            "poker5068 folds."
+        ],
+        "Frame 173 actions could not be reproduced"
+    )
+
+    try require(
+        corroboratedMixedPreflopActions(
+            actions:actions, overlays:overlays,
+            ocr:ocr, board:board, cards:cards,
+            buttons:[:], committed:priorOpening
+        ).isEmpty &&
+        corroboratedMixedPreflopActions(
+            actions:actions, overlays:overlays,
+            ocr:ocr, board:board, cards:cards,
+            buttons:positions, committed:[]
+        ).isEmpty &&
+        corroboratedMixedPreflopActions(
+            actions:actions, overlays:overlays,
+            ocr:ocr, board:board, cards:cards,
+            buttons:positions, committed:events
+        ).isEmpty &&
+        corroboratedMixedPreflopActions(
+            actions:actions, overlays:overlays,
+            ocr:Array(ocr.prefix(173)),
+            board:Array(board.prefix(173)),
+            cards:Array(cards.prefix(173)),
+            buttons:positions,
+            committed:priorSecond
+        ).isEmpty &&
+        corroboratedMixedPreflopActions(
+            actions:actions.filter { $0.frame != 166 },
+            overlays:overlays,
+            ocr:ocr, board:board, cards:cards,
+            buttons:positions,
+            committed:priorOpening
+        ).isEmpty,
+        "One or more missing-evidence gates failed"
+    )
+
+    let firstProof = try encoded(first)
+
+    for _ in 0..<2 {
+        let repeated = try encoded(
+            corroboratedMixedPreflopActions(
+                actions:actions, overlays:overlays,
+                ocr:ocr, board:board, cards:cards,
+                buttons:positions,
+                committed:priorOpening
+            )
+        )
+
+        try require(
+            repeated == firstProof,
+            "Mixed-chain inference is nondeterministic"
+        )
+    }
+
+    let beforeRestart = try Data(contentsOf:
+        root.appendingPathComponent(
+            "observed_fold_physical_fusion.json")
+    )
+
+    let restarted = Recorder(
+        directory: root,
+        live: root.appendingPathComponent("live.txt"),
+        verbose: false,
+        localSemanticOnly: true
+    )
+
+    try await restarted.publish()
+
+    let restored = await restarted.events
+    let status = await restarted.status()
+
+    let afterRestart = try Data(contentsOf:
+        root.appendingPathComponent(
+            "observed_fold_physical_fusion.json")
+    )
+
+    try require(
+        restored == events &&
+        status.stopped &&
+        status.pending == 0 &&
+        status.calls == 0 &&
+        beforeRestart == afterRestart,
+        "Restart altered action chronology or physical evidence"
+    )
+
+    print(
+        "MIXED_PREFLOP_355_PASS frames=355 " +
+        "previous_events=42 new_actions=4 total_events=46 " +
+        "action_frames=166,173 " +
+        "confirmation_frames=167,174 " +
+        "negative_gates=5 deterministic=3/3 " +
+        "checkpoint=355 restart=YES api_calls=0"
+    )
+}
+#endif
+
+
+#if os(macOS)
+func numericSeatAndNoisyFoldReplay(_ input: URL) async throws {
+    let decoder = JSONDecoder()
+    let manifest = try decoder.decode([Frame].self,
+        from: Data(contentsOf: input.appendingPathComponent("frames.json")))
+    let board = try decoder.decode([LocalBoardObservation].self,
+        from: Data(contentsOf: input.appendingPathComponent("local_board_observations.json")))
+    let original = try decoder.decode(DurableState.self,
+        from: Data(contentsOf: input.appendingPathComponent("authoritative_checkpoint.json")))
+    let cards = try decoder.decode([FrameCardPairs].self,
+        from: Data(contentsOf: input.appendingPathComponent("observed_card_back_pairs.json")))
+    let oldEvents = original.commits.flatMap { $0.accepted }
+
+    try require(manifest.count == 40 && board.count == 40 &&
+        cards.count == 40 && original.cursor == 40 &&
+        oldEvents.count == 4, "Original 40-frame recording incomplete")
+
+    var ocr = [LocalOCRFrame]()
+    for n in 1...40 {
+        let f = manifest[n-1]
+        let row = try decoder.decode(LocalOCRFrame.self,
+            from: Data(contentsOf: input.appendingPathComponent(
+                String(format:"local_ocr/%06d.json",n))))
+        let image = try Data(contentsOf: input.appendingPathComponent(f.file))
+        try require(f.id == n && row.frame == n &&
+            frameFingerprint(image) == row.sourceFingerprint &&
+            board[n-1].sourceFingerprint == row.sourceFingerprint &&
+            cards[n-1].sourceFingerprint == row.sourceFingerprint,
+            "Original screenshot fingerprint mismatch at \(n)")
+        ocr.append(row)
+    }
+
+    try require(plausibleACRPlayerName("88kk55") &&
+        !plausibleACRPlayerName("FOLDR") &&
+        !plausibleACRPlayerName("RAISER") &&
+        !plausibleACRPlayerName("10BB") &&
+        !plausibleACRPlayerName("123"),
+        "Name recognition safety gate failed")
+
+    let rings = bestBlindButtonEvidence(ocr)
+    try require(rings.count == 1 &&
+        rings[0].clockwiseRing.count == 7 &&
+        rings[0].clockwiseRing.contains("88kk55") &&
+        rings[0].dealer == "AzKareca" &&
+        rings[0].smallBlind == "WisvyGomes" &&
+        rings[0].bigBlind == "Petenho",
+        "Frozen seven-seat ring incorrect")
+
+    var overlays = [LocalOverlayCandidate]()
+    for n in 2...40 {
+        overlays += localOverlayTransitions(ocr[n-2],ocr[n-1])
+    }
+
+    let wisvy = overlays.filter {
+        $0.label == "FOLD" &&
+        $0.previous_name_same_position == "WisvyGomes"
+    }
+    try require(wisvy.count == 1 && wisvy[0].frame == 33 &&
+        !overlays.contains(where: {
+            $0.label == "FOLD" && $0.frame == 34
+        }), "FOLDR alias incorrectly recognized or duplicated")
+
+    let actions = try decoder.decode([LocalActionCandidate].self,
+        from: Data(contentsOf: input.appendingPathComponent("local_action_candidates.json")))
+    try require(actions.count == 4 &&
+        actions.contains(where: {
+            $0.frame == 34 && $0.player == "Petenho" &&
+            $0.overlay == "CALL"
+        }), "Original Call evidence missing")
+
+    let losses = cardBackLossCandidates(cards,ocr:ocr,
+        blindPositions:rings,actions:actions)
+    let reviews = physicalFoldReview(actions,cardLosses:losses,
+        observations:cards,overlayCandidates:overlays)
+
+    try require(reviews.contains(where: {
+        $0.player == "WisvyGomes" && $0.frame == 34 &&
+        $0.status == "FOLD_OVERLAY_ONE_FRAME_BEFORE_RED_BACK_LOSS"
+    }), "WisvyGomes Fold not physically corroborated")
+
+    let missingLabel = physicalFoldReview(actions,cardLosses:losses,
+        observations:cards,
+        overlayCandidates:overlays.filter { $0.frame != 33 })
+    try require(missingLabel.contains(where: {
+        $0.player == "WisvyGomes" &&
+        $0.status == "RED_BACK_LOSS_WITHOUT_FOLD_LABEL_UNRESOLVED"
+    }), "Missing-label safety gate failed")
+
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "pi-f34-"+UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at:root) }
+
+    for sub in ["frames","accepted","responses"] {
+        try FileManager.default.createDirectory(
+            at:root.appendingPathComponent(sub),
+            withIntermediateDirectories:true)
+    }
+
+    let recorder = Recorder(directory:root,
+        live:root.appendingPathComponent("live.txt"),
+        verbose:false,localSemanticOnly:true)
+    try await recorder.publish()
+
+    for n in 1...40 {
+        let f = manifest[n-1]
+        let bytes = try Data(contentsOf:input.appendingPathComponent(f.file))
+        try await recorder.add(bytes,start:f.started,end:f.captured,
+            width:f.width,height:f.height,local:ocr[n-1].capture,
+            boardCount:board[n-1].visibleBoardCount,
+            cardBackPairs:cards[n-1].pairs,
+            faceUpCardPairs:cards[n-1].faceUpPairs)
+    }
+
+    try await recorder.finish()
+    let committed = await recorder.events
+    // Preserve the four original events exactly.
+    // Permit only the independently supported 88kk55 Call.
+    let added = committed.filter { !oldEvents.contains($0) }
+    let recoveredCall = added.first(where: {
+        $0.frame == 11
+    })
+    let recoveredFold = added.first(where: {
+        $0.frame == 35
+    })
+
+    try require(
+        oldEvents.count == 4 &&
+        committed.count == 6 &&
+        added.count == 2 &&
+        recoveredCall?.frame == 11 &&
+        recoveredCall?.hand == "2872162051" &&
+        recoveredCall?.kind == "action" &&
+        recoveredCall?.basis == "observed" &&
+        recoveredCall?.text == "88kk55 calls (amount unverified)." &&
+        recoveredCall?.evidence.contains("stack 65.92->63.92 BB") == true &&
+        recoveredCall?.evidence.contains(ocr[9].sourceFingerprint) == true &&
+        recoveredCall?.evidence.contains(ocr[10].sourceFingerprint) == true &&
+        recoveredFold?.kind == "action" &&
+        recoveredFold?.basis == "inferred" &&
+        recoveredFold?.hand == "2872162051" &&
+        recoveredFold?.text == "WisvyGomes folds." &&
+        recoveredFold?.evidence.contains(
+            "LAGGED_BLIND_FOLD_CERTIFIED"
+        ) == true &&
+        recoveredFold?.evidence.contains(
+            "physical_overlay_frame=33"
+        ) == true &&
+        committed.filter { !added.contains($0) } == oldEvents,
+        "Original actions changed or unsupported new action added"
+    )
+
+    let newCandidates = await recorder.localActions
+
+    try require(
+        newCandidates.count == 5 &&
+        newCandidates.filter {
+            $0.frame == 11 &&
+            $0.player == "88kk55" &&
+            $0.overlay == "CALL"
+        }.count == 1 &&
+        !newCandidates.contains(where: {
+            $0.player.uppercased() == "FOLDR"
+        }),
+        "Numeric-name Call missing or FOLDR misclassified"
+    )
+
+    let cp = try decoder.decode(DurableState.self,
+        from:Data(contentsOf:root.appendingPathComponent(
+            "authoritative_checkpoint.json")))
+    try require(cp.cursor == 40 &&
+        cp.commits.flatMap({ $0.accepted }) == committed,
+        "Checkpoint regression")
+
+    let physical = try Data(contentsOf:root.appendingPathComponent(
+        "observed_fold_physical_fusion.json"))
+    let saved = try decoder.decode([PhysicalFoldReview].self,from:physical)
+    try require(saved == reviews,"Physical evidence differs after replay")
+
+    let savedRings = try decoder.decode([BlindButtonEvidence].self,
+        from:Data(contentsOf:root.appendingPathComponent(
+            "observed_button_from_blinds.json")))
+    try require(savedRings == rings,"Recorder lost full seat ring")
+
+    let displayed = try String(contentsOf:
+        root.appendingPathComponent("current_hand.txt"),encoding:.utf8)
+    try require(displayed.contains(
+        "WisvyGomes: FOLD_OVERLAY_ONE_FRAME_BEFORE_RED_BACK_LOSS") &&
+        displayed.contains("Petenho calls (amount unverified)."),
+        "Current-hand evidence projection incomplete")
+
+    let proofOverlays = await recorder.localCandidates
+    let proofActions = await recorder.localActions
+    let proofOCR = await recorder.localOCR
+    let proofBoard = await recorder.localBoard
+    let proofCards = await recorder.localCardBacks
+    let proofButtons = await recorder.blindPositions
+
+    let priorEvents = committed.filter { $0.frame <= 34 }
+
+    func infer(
+        _ ovs:[LocalOverlayCandidate],
+        _ physical:[FrameCardPairs],
+        _ btn:[String:BlindButtonEvidence],
+        _ ledger:[Event]
+    ) -> [Event] {
+        corroboratedLaggedSmallBlindFolds(
+            overlays:ovs,
+            actions:proofActions,
+            ocr:proofOCR,
+            board:proofBoard,
+            cards:physical,
+            buttons:btn,
+            committed:ledger
+        )
+    }
+
+    let expectedLate = infer(
+        proofOverlays,proofCards,proofButtons,priorEvents
+    )
+
+    try require(
+        expectedLate.count == 1 &&
+        expectedLate[0] == recoveredFold &&
+        evidenceBackedDisplayFrame(expectedLate[0]) == 33,
+        "Late Fold evidence could not be reproduced"
+    )
+
+    try require(
+        infer([],proofCards,proofButtons,priorEvents).isEmpty &&
+        infer(proofOverlays,[],proofButtons,priorEvents).isEmpty &&
+        infer(proofOverlays,proofCards,[:],priorEvents).isEmpty &&
+        infer(
+            proofOverlays,proofCards,proofButtons,
+            priorEvents.filter { $0.frame != 26 }
+        ).isEmpty &&
+        infer(
+            proofOverlays,proofCards,proofButtons,
+            priorEvents.filter { $0.frame != 34 }
+        ).isEmpty &&
+        infer(
+            proofOverlays,proofCards,proofButtons,committed
+        ).isEmpty,
+        "Missing evidence or duplicate-action gate failed"
+    )
+
+    let rendered = try String(
+        contentsOf:root.appendingPathComponent("current_hand.txt"),
+        encoding:.utf8
+    )
+
+    guard let fold = rendered.range(
+        of:"frame 33 (confirmed frame 35): WisvyGomes folds."
+    ),
+    let call = rendered.range(
+        of:"frame 34: Petenho calls (amount unverified)."
+    ) else {
+        throw Problem("Chronological display evidence missing")
+    }
+
+    try require(
+        fold.lowerBound < call.lowerBound,
+        "Late Fold displayed after its successor"
+    )
+
+    print(
+        "LAGGED_SMALL_BLIND_PASS physical_overlay=33 " +
+        "card_loss=34 confirmation=35 late_fold=1 " +
+        "prior_events_preserved=YES negative_gates=6 " +
+        "append_only=YES chronology_projection=YES"
+    )
+
+    let restarted = Recorder(directory:root,
+        live:root.appendingPathComponent("live.txt"),
+        verbose:false,localSemanticOnly:true)
+    try await restarted.publish()
+    let restored = await restarted.events
+    let status = await restarted.status()
+    let again = try Data(contentsOf:root.appendingPathComponent(
+        "observed_fold_physical_fusion.json"))
+
+    try require(restored == committed && status.stopped &&
+        status.pending == 0 && status.calls == 0 &&
+        physical == again,"Restart changed physical or committed evidence")
+
+    print("F34_CORRECTION_PASS frames=40 seats=7 numeric_name=88kk55 " +
+          "fold=WisvyGomes overlay_frame=33 physical_loss=34 " +
+          "confirmation=35 original_actions=4 preserved=YES new_call=1 late_fold=1 total_actions=6 " +
+          "checkpoint=40 restart=YES negative_gate=YES api_calls=0")
+}
+#endif
+
+
+// Late confirmation never rewrites an earlier checkpoint transaction.
+func corroboratedLaggedSmallBlindFolds(
+    overlays: [LocalOverlayCandidate],
+    actions: [LocalActionCandidate],
+    ocr: [LocalOCRFrame],
+    board: [LocalBoardObservation],
+    cards: [FrameCardPairs],
+    buttons: [String:BlindButtonEvidence],
+    committed: [Event]
+) -> [Event] {
+    guard ocr.count == board.count &&
+          board.count == cards.count &&
+          ocr.count >= 4 else { return [] }
+
+    let losses = cardBackLossCandidates(
+        cards, ocr:ocr,
+        blindPositions:Array(buttons.values),
+        actions:actions
+    )
+
+    var result = [Event]()
+
+    for loss in losses where !loss.correspondingFoldOverlay {
+        let f = loss.firstMissingFrame
+        let confirmed = loss.confirmedFrame
+        let overlayFrame = f-1
+
+        guard overlayFrame >= 3,
+              confirmed == f+1,
+              confirmed <= ocr.count,
+              loss.sourceFrames == [f-2,f-1,f,f+1],
+              let position = buttons[loss.hand],
+              position.smallBlind == loss.player,
+              position.clockwiseRing.count >= 3,
+              Set(position.clockwiseRing).count ==
+                  position.clockwiseRing.count,
+              let dealer = position.clockwiseRing.firstIndex(
+                  of:position.dealer
+              ),
+              position.clockwiseRing[
+                  (dealer+1)%position.clockwiseRing.count
+              ] == position.smallBlind,
+              position.clockwiseRing[
+                  (dealer+2)%position.clockwiseRing.count
+              ] == position.bigBlind,
+              position.confirmedFrame < overlayFrame,
+              !committed.contains(where: {
+                  $0.hand == loss.hand &&
+                  $0.kind == "action" &&
+                  $0.text == "\(loss.player) folds."
+              })
+        else { continue }
+
+        let labels = overlays.filter {
+            $0.hand == loss.hand &&
+            $0.frame == overlayFrame &&
+            $0.label == "FOLD" &&
+            $0.confidence >= 0.8 &&
+            $0.previous_name_same_position == loss.player
+        }
+
+        guard labels.count == 1 else { continue }
+
+        let label = labels[0]
+
+        guard label.previous_frame == overlayFrame-1 &&
+              label.previous_fingerprint ==
+                  ocr[overlayFrame-2].sourceFingerprint &&
+              label.current_fingerprint ==
+                  ocr[overlayFrame-1].sourceFingerprint
+        else { continue }
+
+        let prior = committed.filter {
+            $0.hand == loss.hand &&
+            $0.kind == "action" &&
+            $0.frame < overlayFrame
+        }.last
+
+        guard let predecessor = prior,
+              predecessor.text == "\(position.dealer) folds.",
+              predecessor.basis == "observed",
+              predecessor.frame > position.confirmedFrame,
+              !actions.contains(where: {
+                  $0.hand == loss.hand &&
+                  $0.frame > predecessor.frame &&
+                  $0.frame < f
+              }),
+              !overlays.contains(where: {
+                  $0.hand == loss.hand &&
+                  $0.label == "FOLD" &&
+                  $0.frame > predecessor.frame &&
+                  $0.frame < overlayFrame
+              }),
+              let call = committed.first(where: {
+                  $0.hand == loss.hand &&
+                  $0.kind == "action" &&
+                  $0.frame == f &&
+                  $0.basis == "observed" &&
+                  $0.text ==
+                      "\(position.bigBlind) calls (amount unverified)."
+              }),
+              let callEvidence = actions.first(where: {
+                  $0.hand == loss.hand &&
+                  $0.frame == f &&
+                  $0.player == position.bigBlind &&
+                  $0.overlay == "CALL" &&
+                  !$0.sameFrameOrderUnknown &&
+                  localSemanticSupported($0)
+              }),
+              call.evidence.contains(
+                  callEvidence.beforeFingerprint
+              ),
+              call.evidence.contains(
+                  callEvidence.currentFingerprint
+              )
+        else { continue }
+
+        let frames = loss.sourceFrames
+
+        guard frames.allSatisfy({ n in
+            let i = n-1
+
+            return ocr[i].frame == n &&
+                ocr[i].capture.error == nil &&
+                currentLocalHand(ocr[i].capture) == loss.hand &&
+                board[i].frame == n &&
+                board[i].hand == loss.hand &&
+                board[i].visibleBoardCount == 0 &&
+                cards[i].frame == n &&
+                cards[i].hand == loss.hand &&
+                board[i].sourceFingerprint ==
+                    ocr[i].sourceFingerprint &&
+                cards[i].sourceFingerprint ==
+                    ocr[i].sourceFingerprint
+        }),
+              loss.sourceFingerprints == frames.map({
+                  ocr[$0-1].sourceFingerprint
+              })
+        else { continue }
+
+        let before = cards[f-2]
+        let after = cards[f-1]
+        let next = cards[f]
+
+        guard before.pairs.count == after.pairs.count+1 &&
+              after.pairs.count == next.pairs.count &&
+              after.pairs.allSatisfy({ a in
+                  next.pairs.contains(where: {
+                      abs($0.x-a.x) < 0.018 &&
+                      abs($0.y-a.y) < 0.018
+                  })
+              })
+        else { continue }
+
+        result.append(Event(
+            frame:confirmed,
+            hand:loss.hand,
+            kind:"action",
+            basis:"inferred",
+            text:"\(loss.player) folds.",
+            evidence:
+                "LAGGED_BLIND_FOLD_CERTIFIED; " +
+                "physical_overlay_frame=\(overlayFrame); " +
+                "first_missing_cards_frame=\(f); " +
+                "confirmation_frame=\(confirmed); " +
+                "predecessor=\(predecessor.text) at \(predecessor.frame); " +
+                "successor=\(call.text) at \(call.frame); " +
+                "blind_button_frames=\(position.firstFrame)," +
+                "\(position.confirmedFrame); " +
+                "original fingerprints: " +
+                loss.sourceFingerprints.joined(separator:",") +
+                "; absolute_execution_timestamp=UNKNOWN; " +
+                "no prior transactions rewritten"
+        ))
+    }
+
+    return result.sorted {
+        $0.frame == $1.frame
+            ? $0.hand < $1.hand
+            : $0.frame < $1.frame
+    }
+}
+
+// Changes display order only, not immutable transaction order.
+func evidenceBackedDisplayFrame(_ event: Event) -> Int {
+    guard event.kind == "action" &&
+          event.basis == "inferred" &&
+          (event.evidence.contains("LAGGED_BLIND_FOLD_CERTIFIED") ||
+           event.evidence.contains("OPENING_PREFLOP_FOLD_RECONCILED; PRIOR_NAMEPLATE") ||
+           event.evidence.contains("ALL_IN_PHYSICAL_CERTIFIED"))
+    else { return event.frame }
+
+    let marker = "physical_overlay_frame="
+
+    guard let range = event.evidence.range(of:marker)
+    else { return event.frame }
+
+    let remainder = event.evidence[range.upperBound...]
+    let digits = remainder.prefix(while:{$0.isNumber})
+
+    guard let n = Int(digits),
+          n > 0 && n < event.frame
+    else { return event.frame }
+
+    return n
+}
+
+
+// First-to-act Fold with a nameplate visible in the preceding frame.
+// The button/seat ring can be established later, but the Fold frame never changes.
+func recoveredNamedOpeningFold(
+    overlays: [LocalOverlayCandidate], ocr: [LocalOCRFrame],
+    board: [LocalBoardObservation], cards: [FrameCardPairs],
+    buttons: [String:BlindButtonEvidence], committed: [Event]
+) -> [Event] {
+    guard ocr.count == board.count && board.count == cards.count else { return [] }
+    var output = [Event]()
+    for label in overlays where label.label == "FOLD" && label.confidence >= 0.8 {
+        guard let hand = label.hand, let player = label.previous_name_same_position,
+              plausibleACRPlayerName(player), let position = buttons[hand],
+              label.frame >= 3, position.firstFrame > label.frame,
+              position.confirmedFrame > position.firstFrame,
+              position.confirmedFrame <= ocr.count,
+              position.clockwiseRing.count >= 3,
+              Set(position.clockwiseRing).count == position.clockwiseRing.count,
+              let bb = position.clockwiseRing.firstIndex(of: position.bigBlind),
+              position.clockwiseRing[(bb+1) % position.clockwiseRing.count] == player,
+              overlays.filter({ $0.hand == hand && $0.frame == label.frame && $0.label == "FOLD" }).count == 1,
+              !overlays.contains(where: { $0.hand == hand && $0.frame < label.frame && $0.label == "FOLD" }),
+              !committed.contains(where: { $0.hand == hand && $0.kind == "action" })
+        else { continue }
+        let f = label.frame
+        let frames = [f-1,f,f+1,position.firstFrame,position.confirmedFrame]
+        guard ((f-1)...position.confirmedFrame).allSatisfy({ n in
+            let i = n-1
+            return ocr[i].frame == n && ocr[i].capture.error == nil &&
+                currentLocalHand(ocr[i].capture) == hand &&
+                board[i].frame == n && board[i].hand == hand && board[i].visibleBoardCount == 0 &&
+                cards[i].frame == n && cards[i].hand == hand &&
+                ocr[i].sourceFingerprint == board[i].sourceFingerprint &&
+                ocr[i].sourceFingerprint == cards[i].sourceFingerprint
+        }),
+        label.previous_frame == f-1,
+        label.previous_fingerprint == ocr[f-2].sourceFingerprint,
+        label.current_fingerprint == ocr[f-1].sourceFingerprint,
+        position.firstFingerprint == ocr[position.firstFrame-1].sourceFingerprint,
+        position.confirmedFingerprint == ocr[position.confirmedFrame-1].sourceFingerprint
+        else { continue }
+        let names = ocr[f-2].capture.lines.filter {
+            $0.text.trimmingCharacters(in:.whitespaces) == player && $0.confidence >= 0.8 &&
+            abs($0.x-label.x) < 0.035 && abs($0.y-label.y) < 0.038
+        }
+        guard names.count == 1 else { continue }
+        func atSeat(_ p: LocalCardPair) -> Bool {
+            abs(p.x-label.x) < 0.030 &&
+            (1.0-label.y)-p.y > 0.030 && (1.0-label.y)-p.y < 0.085
+        }
+        let before = cards[f-2], after = cards[f-1], next = cards[f]
+        guard before.pairs.filter(atSeat).count == 1,
+              after.pairs.filter(atSeat).isEmpty,
+              next.pairs.filter(atSeat).isEmpty,
+              before.pairs.count == after.pairs.count+1,
+              after.pairs.count == next.pairs.count else { continue }
+        let others = before.pairs.filter { !atSeat($0) }
+        guard others.allSatisfy({ p in
+            [after,next].allSatisfy { row in
+                row.pairs.contains { abs($0.x-p.x) < 0.018 && abs($0.y-p.y) < 0.018 }
+            }
+        }) else { continue }
+        let proof = "OPENING_PREFLOP_FOLD_RECONCILED; PRIOR_NAMEPLATE; " +
+            "physical_overlay_frame=\(f); first_missing_cards_frame=\(f); " +
+            "confirmation_frame=\(position.confirmedFrame); " +
+            "button_frames=\(position.firstFrame),\(position.confirmedFrame); " +
+            "first_preflop_actor_after_big_blind=\(player); " +
+            "one_red_back_pair_disappeared; all_other_card_pairs_stable; " +
+            "original fingerprints: " + frames.map { ocr[$0-1].sourceFingerprint }.joined(separator:",") +
+            "; original execution timestamp UNKNOWN"
+        output.append(Event(frame:position.confirmedFrame,hand:hand,kind:"action",
+                            basis:"inferred",text:"\(player) folds.",evidence:proof))
+    }
+    return output.sorted { $0.frame == $1.frame ? $0.hand < $1.hand : $0.frame < $1.frame }
+}
+
+// An all-in requires explicit label, 0 BB stack, matching displayed wager,
+// retained hole cards and legal turn progression. No pot or payout is inferred.
+func corroboratedAllIn(
+    actions: [LocalActionCandidate], ocr: [LocalOCRFrame],
+    board: [LocalBoardObservation], cards: [FrameCardPairs],
+    buttons: [String:BlindButtonEvidence], committed: [Event]
+) -> [Event] {
+    guard ocr.count == board.count && board.count == cards.count else { return [] }
+    var output = [Event]()
+    for c in actions where c.overlay == "ALL-IN" && !c.sameFrameOrderUnknown && c.labelConfidence >= 0.8 {
+        let f = c.frame
+        guard f >= 4, f+2 <= ocr.count, c.beforeFrame == f-1,
+              let position = buttons[c.hand], position.confirmedFrame < f,
+              position.clockwiseRing.contains(c.player),
+              let actorIndex = position.clockwiseRing.firstIndex(of:c.player),
+              let before = Decimal(string:c.beforeStackBB,locale:Locale(identifier:"en_US_POSIX")),
+              let afterText = c.afterStackBB,
+              let after = Decimal(string:afterText,locale:Locale(identifier:"en_US_POSIX")),
+              before > 0 && after == 0,
+              let wager = c.displayedWager, wager.confidence >= 0.8,
+              let value = Decimal(string:wager.amountBB,locale:Locale(identifier:"en_US_POSIX")),
+              value == before, wager.priorDisplayedWagerBB == nil,
+              actions.filter({ $0.hand == c.hand && $0.frame == f }).count == 1,
+              !committed.contains(where: { $0.hand == c.hand && $0.kind == "action" &&
+                  ($0.text.hasPrefix("\(c.player) goes all-in") || $0.text == "\(c.player) folds.") })
+        else { continue }
+        let previous = committed.filter { $0.hand == c.hand && $0.kind == "action" && $0.frame < f }.last
+        guard let prior = previous,
+              prior.text == "\(position.clockwiseRing[(actorIndex-1+position.clockwiseRing.count) % position.clockwiseRing.count]) folds.",
+              !actions.contains(where: { $0.hand == c.hand && $0.frame > prior.frame && $0.frame < f })
+        else { continue }
+        let frames = Array((f-2)...(f+2))
+        guard frames.allSatisfy({ n in
+            let i=n-1
+            return ocr[i].frame == n && ocr[i].capture.error == nil &&
+                currentLocalHand(ocr[i].capture) == c.hand &&
+                board[i].frame == n && board[i].hand == c.hand && board[i].visibleBoardCount == 0 &&
+                cards[i].frame == n && cards[i].hand == c.hand &&
+                ocr[i].sourceFingerprint == board[i].sourceFingerprint &&
+                ocr[i].sourceFingerprint == cards[i].sourceFingerprint
+        }),
+              c.beforeFingerprint == ocr[f-2].sourceFingerprint,
+              c.currentFingerprint == ocr[f-1].sourceFingerprint else { continue }
+        let oldNames = [f-2,f-1].allSatisfy { n in
+            ocr[n-1].capture.lines.filter { l in
+                l.text == c.player && l.confidence >= 0.8 &&
+                abs(l.x-c.x) < 0.035 && abs(l.y-c.y) < 0.038
+            }.count == 1
+        }
+        guard oldNames else { continue }
+        func atSeat(_ p: LocalCardPair) -> Bool {
+            abs(p.x-c.x) < 0.030 && (1.0-c.y)-p.y > 0.030 && (1.0-c.y)-p.y < 0.085
+        }
+        guard frames.allSatisfy({ cards[$0-1].pairs.filter(atSeat).count == 1 }) else { continue }
+        let stable = (f...(f+2)).allSatisfy { n in
+            let lines=ocr[n-1].capture.lines
+            let zeros=lines.filter { l in
+                l.confidence >= 0.8 && l.text.trimmingCharacters(in:.whitespaces).uppercased() == "0 BB" &&
+                abs(l.x-c.x) < 0.024 && c.y-l.y > 0.028 && c.y-l.y < 0.065
+            }
+            let wagers=lines.filter { l in
+                l.confidence >= 0.8 &&
+                abs(l.x-wager.x) < 0.030 && abs(l.y-wager.y) < 0.030 &&
+                l.text.trimmingCharacters(in:.whitespaces).range(
+                    of:"^[0-9]{1,4}(\\.[0-9]{1,3})?\\s*BB$",
+                    options:[.regularExpression,.caseInsensitive]) != nil &&
+                Decimal(string:String(l.text.trimmingCharacters(in:.whitespaces).dropLast(2))
+                    .trimmingCharacters(in:.whitespaces),locale:Locale(identifier:"en_US_POSIX")) == value
+            }
+            return zeros.count == 1 && wagers.count == 1
+        }
+        guard stable else { continue }
+        let proof="ALL_IN_PHYSICAL_CERTIFIED; physical_overlay_frame=\(f); confirmation_frame=\(f+2); " +
+            "player=\(c.player); stack=\(c.beforeStackBB)->0 BB; displayed_wager=\(wager.amountBB) BB; " +
+            "cards_retained=YES; previous_actor=\(prior.text) at \(prior.frame); " +
+            "exact_contribution_and_pot_UNVERIFIED; original fingerprints: " +
+            frames.map { ocr[$0-1].sourceFingerprint }.joined(separator:",")
+        output.append(Event(frame:f+2,hand:c.hand,kind:"action",basis:"inferred",
+            text:"\(c.player) goes all-in (displayed wager \(wager.amountBB) BB; exact contribution unverified).",
+            evidence:proof))
+    }
+    return output.sorted { $0.frame == $1.frame ? $0.hand < $1.hand : $0.frame < $1.frame }
+}
+
+
+func proofF160F204(_ input: URL) throws {
+    let d = JSONDecoder()
+    let n = try d.decode([Frame].self, from:try Data(contentsOf:input.appendingPathComponent("frames.json"))).count
+    let aggregate = input.appendingPathComponent("offline_ocr.json")
+    let frames: [LocalOCRFrame]
+    if FileManager.default.fileExists(atPath:aggregate.path) {
+        frames = try d.decode([LocalOCRFrame].self, from:try Data(contentsOf:aggregate))
+    } else {
+        frames = try (1...n).map { i in
+            try d.decode(LocalOCRFrame.self,from:try Data(contentsOf:input.appendingPathComponent(
+                String(format:"local_ocr/%06d.json",i))))
+        }
+    }
+    let board = try d.decode([LocalBoardObservation].self, from:try Data(contentsOf:input.appendingPathComponent("local_board_observations.json")))
+    let cards = try d.decode([FrameCardPairs].self, from:try Data(contentsOf:input.appendingPathComponent("observed_card_back_pairs.json")))
+    let ovs = try d.decode([LocalOverlayCandidate].self, from:try Data(contentsOf:input.appendingPathComponent("local_overlay_candidates.json")))
+    let acts = try d.decode([LocalActionCandidate].self, from:try Data(contentsOf:input.appendingPathComponent("local_action_candidates.json")))
+    let ring = try d.decode([BlindButtonEvidence].self, from:try Data(contentsOf:input.appendingPathComponent("observed_button_from_blinds.json")))
+    let cp = try d.decode(DurableState.self, from:try Data(contentsOf:input.appendingPathComponent("authoritative_checkpoint.json")))
+    let buttons = Dictionary(uniqueKeysWithValues:ring.map { ($0.hand,$0) })
+    let early = recoveredNamedOpeningFold(overlays:ovs,ocr:frames,board:board,cards:cards,buttons:buttons,committed:[])
+    try require(early.count == 1 && early[0].frame == 167 && early[0].text == "VdaraPete folds.","Original f160 opening Fold not recovered")
+    let prev = cp.commits.flatMap{$0.accepted}.filter{$0.frame <= 199}
+    let allin = corroboratedAllIn(actions:acts,ocr:frames,board:board,cards:cards,buttons:buttons,committed:prev)
+    try require(allin.count == 1 && allin[0].frame == 206 && allin[0].text.hasPrefix("fufu1989 goes all-in"),"Original f204 all-in not recovered")
+    let mix = corroboratedMixedPreflopActions(actions:acts,overlays:ovs,ocr:frames,board:board,cards:cards,buttons:buttons,committed:early)
+    try require(mix.count == 2 && mix.map{$0.frame} == [191,191],"Original f190 mixed pair not supported")
+    try require(recoveredNamedOpeningFold(overlays:[],ocr:frames,board:board,cards:cards,buttons:buttons,committed:[]).isEmpty,"Fold without label")
+    try require(recoveredNamedOpeningFold(overlays:ovs,ocr:frames,board:board,cards:cards,buttons:[:],committed:[]).isEmpty,"Fold without button")
+    try require(recoveredNamedOpeningFold(overlays:ovs,ocr:frames,board:board,cards:cards,buttons:buttons,committed:early).isEmpty,"Duplicate Fold")
+    try require(corroboratedAllIn(actions:acts,ocr:frames,board:board,cards:cards,buttons:[:],committed:prev).isEmpty,"Allin without button")
+    try require(corroboratedAllIn(actions:acts,ocr:frames,board:board,cards:cards,buttons:buttons,committed:[]).isEmpty,"Allin without preceding action")
+    try require(corroboratedAllIn(actions:acts.filter{$0.frame != 204},ocr:frames,board:board,cards:cards,buttons:buttons,committed:prev).isEmpty,"Allin without label")
+    var damagedCards = cards
+    let target = cards[158] // Frame 159, before VdaraPete's Fold.
+    damagedCards[158] = FrameCardPairs(frame:target.frame,sourceFingerprint:target.sourceFingerprint,
+        hand:target.hand,pairs:target.pairs.filter{$0.x < 0.81},faceUpPairs:target.faceUpPairs)
+    try require(recoveredNamedOpeningFold(overlays:ovs,ocr:frames,board:board,cards:damagedCards,
+        buttons:buttons,committed:[]).isEmpty,"Fold without physical card loss")
+    var noWagerOCR = frames
+    let affected = frames[203] // Frame 204, first all-in overlay.
+    let filtered = affected.capture.lines.filter { l in
+        !(l.x > 0.26 && l.x < 0.31 && l.y > 0.45 && l.y < 0.50 && l.text.contains("83.08"))
+    }
+    noWagerOCR[203] = LocalOCRFrame(frame:affected.frame,sourceFingerprint:affected.sourceFingerprint,
+        capture:LocalOCRCapture(elapsed_ms:affected.capture.elapsed_ms,lines:filtered,error:affected.capture.error))
+    try require(corroboratedAllIn(actions:acts,ocr:noWagerOCR,board:board,cards:cards,
+        buttons:buttons,committed:prev).isEmpty,"All-in without visible wager")
+    var noCards = cards
+    let changed = cards[203] // Frame 204, retain all other seats, erase fufu1989 pair.
+    noCards[203] = FrameCardPairs(frame:changed.frame,sourceFingerprint:changed.sourceFingerprint,
+        hand:changed.hand,pairs:changed.pairs.filter{$0.x > 0.20 || $0.y < 0.40},faceUpPairs:changed.faceUpPairs)
+    try require(corroboratedAllIn(actions:acts,ocr:frames,board:board,cards:noCards,
+        buttons:buttons,committed:prev).isEmpty,"All-in without retained cards")
+    let expected = try encoded(early+mix+allin)
+    for _ in 0..<2 {
+        let same = try encoded(recoveredNamedOpeningFold(overlays:ovs,ocr:frames,board:board,cards:cards,buttons:buttons,committed:[]) +
+            corroboratedMixedPreflopActions(actions:acts,overlays:ovs,ocr:frames,board:board,cards:cards,buttons:buttons,committed:early) +
+            corroboratedAllIn(actions:acts,ocr:frames,board:board,cards:cards,buttons:buttons,committed:prev))
+        try require(same == expected,"Nondeterministic result")
+    }
+    print("LIVE236_EVIDENCE_PASS opening_fold=f160_commit167 mixed=f190_commit191 allin=f204_commit206 negative_gates=9 deterministic=3/3")
+}
+
+
+#if os(macOS)
+func live236FullReplay(_ input: URL) async throws {
+    let d=JSONDecoder()
+    let manifest=try d.decode([Frame].self,from:Data(contentsOf:input.appendingPathComponent("frames.json")))
+    let board=try d.decode([LocalBoardObservation].self,from:Data(contentsOf:input.appendingPathComponent("local_board_observations.json")))
+    let cards=try d.decode([FrameCardPairs].self,from:Data(contentsOf:input.appendingPathComponent("observed_card_back_pairs.json")))
+    let checkpoint=try d.decode(DurableState.self,from:Data(contentsOf:input.appendingPathComponent("authoritative_checkpoint.json")))
+    let original=checkpoint.commits.flatMap{$0.accepted}
+    try require(manifest.count==236 && board.count==236 && cards.count==236 &&
+                checkpoint.cursor==236 && original.count==21,"Original 236-frame baseline missing")
+    let root=FileManager.default.temporaryDirectory.appendingPathComponent("pi-f160-f204-"+UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at:root) }
+    for sub in ["frames","accepted","responses"] {
+        try FileManager.default.createDirectory(at:root.appendingPathComponent(sub),withIntermediateDirectories:true)
+    }
+    let rec=Recorder(directory:root,live:root.appendingPathComponent("live.txt"),verbose:false,localSemanticOnly:true)
+    try await rec.publish()
+    for i in 1...236 {
+        let f=manifest[i-1]
+        let row=try d.decode(LocalOCRFrame.self,from:Data(contentsOf:input.appendingPathComponent(
+            String(format:"local_ocr/%06d.json",i))))
+        let bytes=try Data(contentsOf:input.appendingPathComponent(f.file))
+        let hash=frameFingerprint(bytes)
+        try require(f.id==i && row.frame==i && row.sourceFingerprint==hash &&
+                    board[i-1].frame==i && board[i-1].sourceFingerprint==hash &&
+                    cards[i-1].frame==i && cards[i-1].sourceFingerprint==hash &&
+                    cards[i-1].hand==currentLocalHand(row.capture) &&
+                    board[i-1].hand==currentLocalHand(row.capture),"Source frame/OCR/card ownership mismatch at \(i)")
+        try await rec.add(bytes,start:f.started,end:f.captured,width:f.width,height:f.height,
+            local:row.capture,boardCount:board[i-1].visibleBoardCount,
+            cardBackPairs:cards[i-1].pairs,faceUpCardPairs:cards[i-1].faceUpPairs)
+        if [160,167,190,191,204,206].contains(i) {
+            let running=await rec.events
+            let fresh=running.filter { e in
+                e.evidence.contains("OPENING_PREFLOP_FOLD_RECONCILED; PRIOR_NAMEPLATE") ||
+                e.evidence.contains("MIXED_PREFLOP_CHAIN_CERTIFIED") ||
+                e.evidence.contains("ALL_IN_PHYSICAL_CERTIFIED")
+            }
+            let target: Int
+            switch i { case 160: target=0; case 167,190: target=1;
+                case 191,204: target=3; default: target=4 }
+            try require(fresh.count==target,"Premature or missing native promotion at frame \(i)")
+        }
+        if i%60 == 0 { print("LIVE236_REPLAY_PROGRESS \(i)/236") }
+    }
+    try await rec.finish()
+    let ev=await rec.events
+    let added=ev.filter { e in
+        e.evidence.contains("OPENING_PREFLOP_FOLD_RECONCILED; PRIOR_NAMEPLATE") ||
+        e.evidence.contains("MIXED_PREFLOP_CHAIN_CERTIFIED") ||
+        e.evidence.contains("ALL_IN_PHYSICAL_CERTIFIED")
+    }
+    let preserved=ev.filter { !added.contains($0) }
+    try require(preserved == original && ev.count == 25 && added.count == 4,
+        "Historical events changed or expected new actions missing")
+    try require(added.map{$0.frame} == [167,191,191,206] &&
+        added.map{$0.text} == [
+            "VdaraPete folds.",
+            "zigzigzAA raises (amount unverified).",
+            "poker5068 folds.",
+            "fufu1989 goes all-in (displayed wager 83.08 BB; exact contribution unverified)."
+        ],"New action identities/order/confirmation wrong")
+    let cp=try d.decode(DurableState.self,from:Data(contentsOf:root.appendingPathComponent("authoritative_checkpoint.json")))
+    try require(cp.cursor==236 && cp.commits.flatMap{$0.accepted}==ev,"Durable checkpoint mismatch")
+    let display=try String(contentsOf:root.appendingPathComponent("current_hand.txt"),encoding:.utf8)
+    try require(display.contains("frame 160 (confirmed frame 167): VdaraPete folds.") &&
+        display.contains("frame 204 (confirmed frame 206): fufu1989 goes all-in"),
+        "Physical chronology not shown with late confirmation")
+    let restarted=Recorder(directory:root,live:root.appendingPathComponent("live.txt"),verbose:false,localSemanticOnly:true)
+    try await restarted.publish()
+    let restored=await restarted.events
+    let st=await restarted.status()
+    try require(restored==ev && st.stopped && st.pending==0 && st.calls==0,
+        "Restart lost, changed, or duplicated events")
+    print("LIVE236_FULL_REPLAY_PASS original_events=21 new_events=4 total_events=25 " +
+        "named_fold=f160_confirm167 rapid_pair=f190_confirm191 " +
+        "allin=f204_confirm206 restart=YES checkpoint=236 api_calls=0")
+}
+#endif
