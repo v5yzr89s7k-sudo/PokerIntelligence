@@ -1490,14 +1490,33 @@ actor Recorder {
             }
             if !positioning.isEmpty {
                 lines.append(
-                    "POSITIONAL ORDER OF SIMULTANEOUS OVERLAY CANDIDATES — EXECUTION ORDER UNKNOWN"
+                    "POSITIONAL CANDIDATES — consult committed actions below for any subsequently certified order"
                 )
                 for candidate in positioning {
+                    let certified = accepted.contains { e in
+                        e.kind == "action" &&
+                        e.hand == hand &&
+                        e.text.hasPrefix(candidate.firstSeat + " ") &&
+                        (
+                            e.evidence.contains(
+                                "MIXED_PREFLOP_CHAIN_CERTIFIED"
+                            ) ||
+                            e.evidence.contains(
+                                "STAGGERED_PREFLOP_FOLD_CERTIFIED"
+                            )
+                        ) &&
+                        e.evidence.contains(
+                            "=\(candidate.frame);"
+                        )
+                    }
+
                     lines.append(
                         "  frame \(candidate.frame): " +
                         "\(candidate.firstSeat) \(candidate.firstOverlay) -> " +
                         "\(candidate.secondSeat) \(candidate.secondOverlay) " +
-                        "[ADJACENT CLOCKWISE SEATS; not confirmed action order]"
+                        (certified
+                            ? "[ORDER CERTIFIED BY PHYSICAL EVIDENCE]"
+                            : "[POSITIONAL ONLY; EXECUTION ORDER UNKNOWN]")
                     )
                 }
             }
@@ -1576,6 +1595,9 @@ actor Recorder {
                 if accepted.contains(where: {
                     $0.evidence.contains(
                         "LAGGED_BLIND_FOLD_CERTIFIED"
+                    ) ||
+                    $0.evidence.contains(
+                        "STAGGERED_PREFLOP_FOLD_CERTIFIED"
                     )
                 }) {
                     lines.append(
@@ -1787,6 +1809,16 @@ actor Recorder {
             actions:localActions,ocr:localOCR,board:localBoard,
             cards:localCardBacks,buttons:blindPositions,committed:events
         ).filter { $0.frame >= first && $0.frame <= last }
+        let staggeredFolds = certifiedStaggeredPreflopFolds(
+            actions:localActions,
+            overlays:localCandidates,
+            ocr:localOCR,
+            board:localBoard,
+            cards:localCardBacks,
+            buttons:blindPositions,
+            committed:events
+        ).filter { $0.frame >= first && $0.frame <= last }
+
         let acceptedActions = observed.map { c in
             Event(
                 frame: c.frame,
@@ -1838,7 +1870,7 @@ actor Recorder {
                 )
             }
 
-        let accepted = (acceptedActions + unorderedEpisodes + winnerEvents + streetEvents + promotedRapidFolds + recoveredOpening + mixedActions + laggedBlindFolds + namedOpening + confirmedAllIns).sorted { a,b in
+        let accepted = (acceptedActions + unorderedEpisodes + winnerEvents + streetEvents + promotedRapidFolds + recoveredOpening + mixedActions + laggedBlindFolds + namedOpening + confirmedAllIns + staggeredFolds).sorted { a,b in
             if a.frame != b.frame { return a.frame < b.frame }
             if a.kind == "action" && b.kind == "action" &&
                 a.evidence.contains("RAPID_ORDER_CERTIFIED") &&
@@ -1849,6 +1881,15 @@ actor Recorder {
                 b.kind == "action" &&
                 a.evidence.contains("MIXED_PREFLOP_CHAIN_CERTIFIED") &&
                 b.evidence.contains("MIXED_PREFLOP_CHAIN_CERTIFIED") {
+                return a.evidence < b.evidence
+            }
+            if a.kind == "action" && b.kind == "action" &&
+                a.evidence.contains(
+                    "STAGGERED_PREFLOP_FOLD_CERTIFIED"
+                ) &&
+                b.evidence.contains(
+                    "STAGGERED_PREFLOP_FOLD_CERTIFIED"
+                ) {
                 return a.evidence < b.evidence
             }
             return a.kind == "action" && b.kind != "action"
@@ -2010,6 +2051,16 @@ actor Recorder {
                 actions:localActions,ocr:localOCR,board:localBoard,
                 cards:localCardBacks,buttons:blindPositions,committed:events
             ).contains { $0.frame == id }
+            let freshStaggered = certifiedStaggeredPreflopFolds(
+                actions:localActions,
+                overlays:localCandidates,
+                ocr:localOCR,
+                board:localBoard,
+                cards:localCardBacks,
+                buttons:blindPositions,
+                committed:events
+            ).contains { $0.frame == id }
+
             let freshEpisode = !unorderedActionEpisodes(localActions.filter { $0.frame == id }).isEmpty
             let recentRapidPair = localActions.contains { c in
                 c.frame == id-1 &&
@@ -2032,7 +2083,7 @@ actor Recorder {
             let freshStreet = confirmedBoardStreets(localBoard).contains {
                 $0.confirmedFrame == id
             }
-            if !fresh.isEmpty || freshEpisode || freshWinner || freshStreet || freshCertifiedFolds || freshOpening || freshMixed || freshLaggedFold || freshNamedOpening || freshAllIn {
+            if !fresh.isEmpty || freshEpisode || freshWinner || freshStreet || freshCertifiedFolds || freshOpening || freshMixed || freshLaggedFold || freshNamedOpening || freshAllIn || freshStaggered {
                 try commitLocalOCRThrough(id)
             } else {
                 try publish()
@@ -2657,6 +2708,22 @@ struct FullScreenVision {
             if CommandLine.arguments.count == 3 &&
                 CommandLine.arguments[1] == "--live236-replay" {
                 try await live236FullReplay(URL(fileURLWithPath:CommandLine.arguments[2]))
+                return
+            }
+            #endif
+            if CommandLine.arguments.count == 3 &&
+                CommandLine.arguments[1] == "--nov22-rapid-proof" {
+                try nov22RapidEvidenceProof(
+                    URL(fileURLWithPath:CommandLine.arguments[2])
+                )
+                return
+            }
+            #if os(macOS)
+            if CommandLine.arguments.count == 3 &&
+                CommandLine.arguments[1] == "--nov22-rapid-replay" {
+                try await nov22RapidFullRecordedReplay(
+                    URL(fileURLWithPath:CommandLine.arguments[2])
+                )
                 return
             }
             #endif
@@ -5900,14 +5967,34 @@ func corroboratedMixedPreflopActions(
 
         guard let previous = priorActions.last,
               previous.text == "\(previousSeat) folds.",
-              previous.basis == "inferred",
               (
-                  previous.evidence.contains(
-                      "OPENING_PREFLOP_FOLD_RECONCILED"
-                  ) ||
-                  previous.evidence.contains(
-                      "MIXED_PREFLOP_CHAIN_CERTIFIED"
-                  )
+                  (previous.basis == "inferred" && (
+                      previous.evidence.contains(
+                          "OPENING_PREFLOP_FOLD_RECONCILED"
+                      ) || previous.evidence.contains(
+                          "MIXED_PREFLOP_CHAIN_CERTIFIED"
+                      ))) ||
+                  (previous.basis == "observed" &&
+                      actions.filter({ c in
+                          c.hand == pair.hand &&
+                          c.player == previousSeat &&
+                          c.frame == previous.frame &&
+                          c.overlay == "FOLD" &&
+                          localSemanticSupported(c)
+                      }).count == 1 &&
+                      lostBacks.contains(where: { loss in
+                          loss.hand == pair.hand &&
+                          loss.player == previousSeat &&
+                          loss.firstMissingFrame == previous.frame &&
+                          loss.confirmedFrame < f &&
+                          loss.correspondingFoldOverlay
+                      }) &&
+                      overlays.contains(where: { label in
+                          label.hand == pair.hand &&
+                          label.label == "FOLD" &&
+                          label.frame == previous.frame &&
+                          label.previous_name_same_position == previousSeat
+                      }))
               ),
               !committed.contains(where: {
                   $0.hand == pair.hand &&
@@ -6856,12 +6943,15 @@ func corroboratedLaggedSmallBlindFolds(
 func evidenceBackedDisplayFrame(_ event: Event) -> Int {
     guard event.kind == "action" &&
           event.basis == "inferred" &&
-          (event.evidence.contains("LAGGED_BLIND_FOLD_CERTIFIED") ||
+          (event.evidence.contains("STAGGERED_PREFLOP_FOLD_CERTIFIED") ||
+           event.evidence.contains("LAGGED_BLIND_FOLD_CERTIFIED") ||
            event.evidence.contains("OPENING_PREFLOP_FOLD_RECONCILED; PRIOR_NAMEPLATE") ||
            event.evidence.contains("ALL_IN_PHYSICAL_CERTIFIED"))
     else { return event.frame }
 
-    let marker = "physical_overlay_frame="
+    let marker = event.evidence.contains(
+        "STAGGERED_PREFLOP_FOLD_CERTIFIED"
+    ) ? "physical_action_frame=" : "physical_overlay_frame="
 
     guard let range = event.evidence.range(of:marker)
     else { return event.frame }
@@ -7179,5 +7269,688 @@ func live236FullReplay(_ input: URL) async throws {
     print("LIVE236_FULL_REPLAY_PASS original_events=21 new_events=4 total_events=25 " +
         "named_fold=f160_confirm167 rapid_pair=f190_confirm191 " +
         "allin=f204_confirm206 restart=YES checkpoint=236 api_calls=0")
+}
+#endif
+
+
+// Different physical disappearance frames can establish the turn order
+// of two Fold overlays first visible in the same screenshot.
+func certifiedStaggeredPreflopFolds(
+    actions: [LocalActionCandidate],
+    overlays: [LocalOverlayCandidate],
+    ocr: [LocalOCRFrame],
+    board: [LocalBoardObservation],
+    cards: [FrameCardPairs],
+    buttons: [String:BlindButtonEvidence],
+    committed: [Event]
+) -> [Event] {
+    guard ocr.count == board.count &&
+          board.count == cards.count &&
+          ocr.count >= 5 else { return [] }
+
+    let pairs = adjacentSeatOrderCandidates(actions, buttons)
+    let losses = cardBackLossCandidates(
+        cards, ocr:ocr,
+        blindPositions:Array(buttons.values),
+        actions:actions
+    )
+
+    var result = [Event]()
+
+    for pair in pairs where
+        pair.firstOverlay == "FOLD" &&
+        pair.secondOverlay == "FOLD" {
+
+        let f = pair.frame
+        let end = f+2
+
+        guard f >= 4 && end <= ocr.count,
+              let position = buttons[pair.hand],
+              position.confirmedFrame < f-2,
+              let firstIndex = position.clockwiseRing.firstIndex(
+                  of:pair.firstSeat
+              ),
+              position.clockwiseRing[
+                  (firstIndex+1)%position.clockwiseRing.count
+              ] == pair.secondSeat,
+              pair.actionEvidenceFrames == [f-1,f],
+              actions.filter({
+                  $0.hand == pair.hand && $0.frame == f
+              }).count == 2,
+              let a = actions.first(where: {
+                  $0.hand == pair.hand &&
+                  $0.frame == f &&
+                  $0.player == pair.firstSeat
+              }),
+              let b = actions.first(where: {
+                  $0.hand == pair.hand &&
+                  $0.frame == f &&
+                  $0.player == pair.secondSeat
+              }),
+              [a,b].allSatisfy({ c in
+                  c.overlay == "FOLD" &&
+                  c.sameFrameOrderUnknown &&
+                  c.labelConfidence >= 0.8 &&
+                  c.beforeFrame == f-1 &&
+                  c.beforeFingerprint == a.beforeFingerprint &&
+                  c.currentFingerprint == a.currentFingerprint &&
+                  c.afterStackBB == c.beforeStackBB
+              }),
+              pair.actionFingerprints == [
+                  a.beforeFingerprint,a.currentFingerprint
+              ]
+        else { continue }
+
+        let names = [pair.firstSeat,pair.secondSeat]
+
+        let labels = overlays.filter {
+            $0.hand == pair.hand &&
+            $0.frame == f &&
+            $0.label == "FOLD" &&
+            $0.confidence >= 0.8
+        }
+
+        guard labels.count == 2 &&
+              names.allSatisfy({ name in
+                  labels.filter({ c in
+                      c.previous_name_same_position == name &&
+                      c.previous_frame == f-1 &&
+                      c.previous_fingerprint == a.beforeFingerprint &&
+                      c.current_fingerprint == a.currentFingerprint
+                  }).count == 1
+              })
+        else { continue }
+
+        let priorSeat = position.clockwiseRing[
+            (firstIndex-1+position.clockwiseRing.count) %
+            position.clockwiseRing.count
+        ]
+
+        let previous = committed.filter {
+            $0.hand == pair.hand &&
+            $0.kind == "action" &&
+            $0.frame < f
+        }.last
+
+        guard let prior = previous,
+              prior.text == "\(priorSeat) folds.",
+              prior.basis == "inferred",
+              prior.evidence.contains(
+                  "MIXED_PREFLOP_CHAIN_CERTIFIED sequence=2/2"
+              ),
+              prior.frame < f-1,
+              !names.contains(where: { name in
+                  committed.contains(where: {
+                      $0.hand == pair.hand &&
+                      $0.kind == "action" &&
+                      $0.text == "\(name) folds."
+                  })
+              }),
+              !actions.contains(where: {
+                  $0.hand == pair.hand &&
+                  $0.frame > prior.frame &&
+                  $0.frame < f
+              }),
+              !overlays.contains(where: {
+                  $0.hand == pair.hand &&
+                  $0.label == "FOLD" &&
+                  $0.frame > prior.frame &&
+                  $0.frame < f
+              })
+        else { continue }
+
+        let window = Array((f-2)...end)
+
+        guard (prior.frame...end).allSatisfy({ n in
+            let i = n-1
+            return ocr[i].frame == n &&
+                ocr[i].capture.error == nil &&
+                currentLocalHand(ocr[i].capture) == pair.hand &&
+                board[i].frame == n &&
+                board[i].hand == pair.hand &&
+                board[i].visibleBoardCount == 0 &&
+                cards[i].frame == n &&
+                cards[i].hand == pair.hand &&
+                board[i].sourceFingerprint ==
+                    ocr[i].sourceFingerprint &&
+                cards[i].sourceFingerprint ==
+                    ocr[i].sourceFingerprint
+        }),
+              ocr[f-2].sourceFingerprint == a.beforeFingerprint,
+              ocr[f-1].sourceFingerprint == a.currentFingerprint,
+              Set(window.map({
+                  ocr[$0-1].sourceFingerprint
+              })).count == window.count
+        else { continue }
+
+        let before0 = cards[f-3]
+        let before1 = cards[f-2]
+        let firstLoss = cards[f-1]
+        let secondLoss = cards[f]
+        let stable = cards[f+1]
+
+        guard before0.pairs.count == before1.pairs.count &&
+              firstLoss.pairs.count+1 == before1.pairs.count &&
+              secondLoss.pairs.count+1 == firstLoss.pairs.count &&
+              stable.pairs.count == secondLoss.pairs.count
+        else { continue }
+
+        let first = losses.filter { loss in
+            loss.hand == pair.hand &&
+            loss.player == pair.firstSeat &&
+            loss.firstMissingFrame == f &&
+            loss.confirmedFrame == f+1 &&
+            loss.correspondingFoldOverlay &&
+            loss.sourceFrames == [f-2,f-1,f,f+1]
+        }
+
+        let second = losses.filter { loss in
+            loss.hand == pair.hand &&
+            loss.player == pair.secondSeat &&
+            loss.firstMissingFrame == f+1 &&
+            loss.confirmedFrame == end &&
+            !loss.correspondingFoldOverlay &&
+            loss.sourceFrames == [f-1,f,f+1,end]
+        }
+
+        guard first.count == 1 && second.count == 1 &&
+              first[0].sourceFingerprints ==
+                  [f-2,f-1,f,f+1].map({
+                      ocr[$0-1].sourceFingerprint
+                  }) &&
+              second[0].sourceFingerprints ==
+                  [f-1,f,f+1,end].map({
+                      ocr[$0-1].sourceFingerprint
+                  })
+        else { continue }
+
+        for (index,name) in names.enumerated() {
+            let physicalFrame = f+index
+
+            let proof =
+                "STAGGERED_PREFLOP_FOLD_CERTIFIED sequence=\(index+1)/2; " +
+                "overlay_frame=\(f); " +
+                "physical_action_frame=\(physicalFrame); " +
+                "confirmation_frame=\(end); " +
+                "prior_committed=\(prior.text) at \(prior.frame); " +
+                "button_frames=\(position.firstFrame),\(position.confirmedFrame); " +
+                "individual_card_pair_loss=YES; original fingerprints: " +
+                window.map({
+                    ocr[$0-1].sourceFingerprint
+                }).joined(separator:",") +
+                "; intra_frame_clock_times_UNKNOWN; " +
+                "prior_transactions_unchanged"
+
+            result.append(Event(
+                frame:end,
+                hand:pair.hand,
+                kind:"action",
+                basis:"inferred",
+                text:"\(name) folds.",
+                evidence:proof
+            ))
+        }
+    }
+
+    return result.sorted {
+        $0.frame == $1.frame
+            ? $0.evidence < $1.evidence
+            : $0.frame < $1.frame
+    }
+}
+
+
+func nov22RapidEvidenceProof(_ input: URL) throws {
+    let decoder = JSONDecoder()
+
+    let board = try decoder.decode(
+        [LocalBoardObservation].self,
+        from:Data(contentsOf:input.appendingPathComponent(
+            "local_board_observations.json"))
+    )
+    let cards = try decoder.decode(
+        [FrameCardPairs].self,
+        from:Data(contentsOf:input.appendingPathComponent(
+            "observed_card_back_pairs.json"))
+    )
+    let actions = try decoder.decode(
+        [LocalActionCandidate].self,
+        from:Data(contentsOf:input.appendingPathComponent(
+            "local_action_candidates.json"))
+    )
+    let overlays = try decoder.decode(
+        [LocalOverlayCandidate].self,
+        from:Data(contentsOf:input.appendingPathComponent(
+            "local_overlay_candidates.json"))
+    )
+    let positions = try decoder.decode(
+        [BlindButtonEvidence].self,
+        from:Data(contentsOf:input.appendingPathComponent(
+            "observed_button_from_blinds.json"))
+    )
+    let cp = try decoder.decode(
+        DurableState.self,
+        from:Data(contentsOf:input.appendingPathComponent(
+            "authoritative_checkpoint.json"))
+    )
+    let manifest = try decoder.decode(
+        [Frame].self,
+        from:Data(contentsOf:input.appendingPathComponent(
+            "frames.json"))
+    )
+
+    let n = manifest.count
+    let ocr = try (1...n).map { i in
+        try decoder.decode(
+            LocalOCRFrame.self,
+            from:Data(contentsOf:input.appendingPathComponent(
+                String(format:"local_ocr/%06d.json",i)
+            ))
+        )
+    }
+
+    try require(
+        n == 236 && cards.count == n && board.count == n &&
+        positions.count == 1 && cp.cursor == n,
+        "Original recording incomplete"
+    )
+
+    let buttons = Dictionary(uniqueKeysWithValues:
+        positions.map { ($0.hand,$0) }
+    )
+
+    let existing = cp.commits.flatMap { $0.accepted }
+    let prior = existing.filter { $0.frame <= 191 }
+
+    let mixed = corroboratedMixedPreflopActions(
+        actions:actions,overlays:overlays,
+        ocr:ocr,board:board,cards:cards,
+        buttons:buttons,committed:prior
+    )
+
+    try require(
+        mixed.map({$0.text}) == [
+            "JosephPLACR raises (amount unverified).",
+            "poker5068 folds."
+        ] &&
+        mixed.map({$0.frame}) == [201,201],
+        "Frame-200 physical mixed action failed"
+    )
+
+    let preceding = prior+mixed
+
+    let folds = certifiedStaggeredPreflopFolds(
+        actions:actions,overlays:overlays,
+        ocr:ocr,board:board,cards:cards,
+        buttons:buttons,committed:preceding
+    )
+
+    try require(
+        folds.map({$0.text}) == [
+            "dennnny folds.","TitoB135 folds."
+        ] &&
+        folds.map({$0.frame}) == [209,209] &&
+        evidenceBackedDisplayFrame(folds[0]) == 207 &&
+        evidenceBackedDisplayFrame(folds[1]) == 208,
+        "Staggered physical Fold order incorrect"
+    )
+
+    try require(
+        existing.count == 23,
+        "Original accepted checkpoint unexpectedly changed"
+    )
+
+    try require(
+        corroboratedMixedPreflopActions(
+            actions:actions,overlays:overlays,
+            ocr:ocr,board:board,cards:cards,
+            buttons:buttons,committed:[]
+        ).isEmpty &&
+        corroboratedMixedPreflopActions(
+            actions:actions,overlays:overlays,
+            ocr:ocr,board:board,cards:cards,
+            buttons:[:],committed:prior
+        ).isEmpty &&
+        corroboratedMixedPreflopActions(
+            actions:actions,overlays:overlays,
+            ocr:ocr,board:board,cards:cards,
+            buttons:buttons,
+            committed:prior.filter({$0.frame != 191})
+        ).isEmpty,
+        "Missing predecessor or blind ring accepted"
+    )
+
+    var badCardEvidence = cards
+    let x = cards[190]
+
+    badCardEvidence[190] = FrameCardPairs(
+        frame:x.frame,
+        sourceFingerprint:x.sourceFingerprint,
+        hand:x.hand,
+        pairs:cards[189].pairs,
+        faceUpPairs:x.faceUpPairs
+    )
+
+    try require(
+        corroboratedMixedPreflopActions(
+            actions:actions,overlays:overlays,
+            ocr:ocr,board:board,cards:badCardEvidence,
+            buttons:buttons,committed:prior
+        ).isEmpty,
+        "Missing predecessor Fold card evidence accepted"
+    )
+
+    var noHero = cards
+    let hero = cards[198]
+
+    noHero[198] = FrameCardPairs(
+        frame:hero.frame,
+        sourceFingerprint:hero.sourceFingerprint,
+        hand:hero.hand,
+        pairs:hero.pairs,
+        faceUpPairs:[]
+    )
+
+    try require(
+        corroboratedMixedPreflopActions(
+            actions:actions,overlays:overlays,
+            ocr:ocr,board:board,cards:noHero,
+            buttons:buttons,committed:prior
+        ).isEmpty,
+        "Missing hero-card evidence accepted"
+    )
+
+    try require(
+        certifiedStaggeredPreflopFolds(
+            actions:actions,overlays:overlays,
+            ocr:ocr,board:board,cards:cards,
+            buttons:buttons,committed:prior
+        ).isEmpty &&
+        certifiedStaggeredPreflopFolds(
+            actions:actions,overlays:overlays,
+            ocr:ocr,board:board,cards:cards,
+            buttons:[:],committed:preceding
+        ).isEmpty &&
+        certifiedStaggeredPreflopFolds(
+            actions:actions,overlays:[],
+            ocr:ocr,board:board,cards:cards,
+            buttons:buttons,committed:preceding
+        ).isEmpty &&
+        certifiedStaggeredPreflopFolds(
+            actions:actions,overlays:overlays,
+            ocr:ocr,board:board,
+            cards:Array(cards.prefix(208)),
+            buttons:buttons,committed:preceding
+        ).isEmpty,
+        "Staggered Fold missing-evidence gate failed"
+    )
+
+    var noSecondLoss = cards
+    let t = cards[207]
+
+    noSecondLoss[207] = FrameCardPairs(
+        frame:t.frame,
+        sourceFingerprint:t.sourceFingerprint,
+        hand:t.hand,
+        pairs:cards[206].pairs,
+        faceUpPairs:t.faceUpPairs
+    )
+
+    try require(
+        certifiedStaggeredPreflopFolds(
+            actions:actions,overlays:overlays,
+            ocr:ocr,board:board,cards:noSecondLoss,
+            buttons:buttons,committed:preceding
+        ).isEmpty &&
+        certifiedStaggeredPreflopFolds(
+            actions:actions,overlays:overlays,
+            ocr:ocr,board:board,cards:cards,
+            buttons:buttons,committed:preceding+folds
+        ).isEmpty,
+        "Second-card-loss or duplicate guard failed"
+    )
+
+    let expected = try encoded(mixed+folds)
+
+    for _ in 0..<2 {
+        let a = corroboratedMixedPreflopActions(
+            actions:actions,overlays:overlays,
+            ocr:ocr,board:board,cards:cards,
+            buttons:buttons,committed:prior
+        )
+        let b = certifiedStaggeredPreflopFolds(
+            actions:actions,overlays:overlays,
+            ocr:ocr,board:board,cards:cards,
+            buttons:buttons,committed:prior+a
+        )
+
+        try require(
+            try encoded(a+b) == expected,
+            "Nondeterministic rapid-action evidence"
+        )
+    }
+
+    print(
+        "NOV22_RAPID_EVIDENCE_PASS " +
+        "mixed_f200_confirm201=2 " +
+        "staggered_f207_f208_confirm209=2 " +
+        "negative_gates=11 deterministic=3/3 api_calls=0"
+    )
+}
+
+
+#if os(macOS)
+func nov22RapidFullRecordedReplay(_ input: URL) async throws {
+    let d = JSONDecoder()
+
+    let manifest = try d.decode(
+        [Frame].self,
+        from:Data(contentsOf:input.appendingPathComponent("frames.json"))
+    )
+    let board = try d.decode(
+        [LocalBoardObservation].self,
+        from:Data(contentsOf:input.appendingPathComponent(
+            "local_board_observations.json"))
+    )
+    let cards = try d.decode(
+        [FrameCardPairs].self,
+        from:Data(contentsOf:input.appendingPathComponent(
+            "observed_card_back_pairs.json"))
+    )
+    let original = try d.decode(
+        DurableState.self,
+        from:Data(contentsOf:input.appendingPathComponent(
+            "authoritative_checkpoint.json"))
+    )
+
+    let oldEvents = original.commits.flatMap { $0.accepted }
+
+    try require(
+        manifest.count == 236 &&
+        board.count == 236 &&
+        cards.count == 236 &&
+        original.cursor == 236 &&
+        oldEvents.count == 23,
+        "Original live recording incomplete"
+    )
+
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent(
+            "pi-rapid-nov22-" + UUID().uuidString
+        )
+
+    defer {
+        try? FileManager.default.removeItem(at:root)
+    }
+
+    for sub in ["frames","accepted","responses"] {
+        try FileManager.default.createDirectory(
+            at:root.appendingPathComponent(sub),
+            withIntermediateDirectories:true
+        )
+    }
+
+    let recorder = Recorder(
+        directory:root,
+        live:root.appendingPathComponent("live.txt"),
+        verbose:false,
+        localSemanticOnly:true
+    )
+
+    try await recorder.publish()
+
+    for n in 1...236 {
+        let f = manifest[n-1]
+
+        let ocr = try d.decode(
+            LocalOCRFrame.self,
+            from:Data(contentsOf:input.appendingPathComponent(
+                String(format:"local_ocr/%06d.json",n)
+            ))
+        )
+
+        let image = input.appendingPathComponent(f.file)
+        let data = try Data(contentsOf:image)
+        let fingerprint = frameFingerprint(data)
+
+        try require(
+            f.id == n &&
+            ocr.frame == n &&
+            fingerprint == ocr.sourceFingerprint &&
+            board[n-1].frame == n &&
+            board[n-1].sourceFingerprint == fingerprint &&
+            cards[n-1].frame == n &&
+            cards[n-1].sourceFingerprint == fingerprint &&
+            board[n-1].hand == currentLocalHand(ocr.capture) &&
+            cards[n-1].hand == currentLocalHand(ocr.capture),
+            "Original frame evidence mismatch at \(n)"
+        )
+
+        try await recorder.add(
+            data,
+            start:f.started,
+            end:f.captured,
+            width:f.width,
+            height:f.height,
+            local:ocr.capture,
+            boardCount:board[n-1].visibleBoardCount,
+            cardBackPairs:cards[n-1].pairs,
+            faceUpCardPairs:cards[n-1].faceUpPairs
+        )
+
+        if [200,201,207,208,209].contains(n) {
+            let current = await recorder.events
+
+            let additional = current.filter {
+                $0.evidence.contains(
+                    "MIXED_PREFLOP_CHAIN_CERTIFIED"
+                ) ||
+                $0.evidence.contains(
+                    "STAGGERED_PREFLOP_FOLD_CERTIFIED"
+                )
+            }
+
+            let expected = n == 200
+                ? 0 : (n <= 208 ? 2 : 4)
+
+            try require(
+                additional.count == expected,
+                "Premature or missing rapid action at frame \(n)"
+            )
+        }
+
+        if n % 60 == 0 {
+            print("NOV22_RAPID_REPLAY_PROGRESS \(n)/236")
+        }
+    }
+
+    try await recorder.finish()
+
+    let events = await recorder.events
+
+    let additions = events.filter {
+        $0.evidence.contains(
+            "MIXED_PREFLOP_CHAIN_CERTIFIED"
+        ) ||
+        $0.evidence.contains(
+            "STAGGERED_PREFLOP_FOLD_CERTIFIED"
+        )
+    }
+
+    try require(
+        events.filter({ !additions.contains($0) }) == oldEvents &&
+        events.count == 27 &&
+        additions.count == 4,
+        "Original history changed or new actions missing"
+    )
+
+    try require(
+        additions.map({$0.frame}) == [201,201,209,209] &&
+        additions.map({$0.text}) == [
+            "JosephPLACR raises (amount unverified).",
+            "poker5068 folds.",
+            "dennnny folds.",
+            "TitoB135 folds."
+        ],
+        "New action order or identity incorrect"
+    )
+
+    let cp = try d.decode(
+        DurableState.self,
+        from:Data(contentsOf:root.appendingPathComponent(
+            "authoritative_checkpoint.json"))
+    )
+
+    try require(
+        cp.cursor == 236 &&
+        cp.commits.flatMap({$0.accepted}) == events,
+        "New events not durably committed"
+    )
+
+    let displayed = try String(
+        contentsOf:root.appendingPathComponent("current_hand.txt"),
+        encoding:.utf8
+    )
+
+    let first = displayed.range(
+        of:"frame 207 (confirmed frame 209): dennnny folds."
+    )
+    let second = displayed.range(
+        of:"frame 208 (confirmed frame 209): TitoB135 folds."
+    )
+
+    try require(
+        first != nil && second != nil &&
+        first!.lowerBound < second!.lowerBound,
+        "Physical chronological display is incorrect"
+    )
+
+    let restarted = Recorder(
+        directory:root,
+        live:root.appendingPathComponent("live.txt"),
+        verbose:false,
+        localSemanticOnly:true
+    )
+
+    try await restarted.publish()
+
+    let recovered = await restarted.events
+    let status = await restarted.status()
+
+    try require(
+        recovered == events &&
+        status.stopped &&
+        status.pending == 0 &&
+        status.calls == 0,
+        "Restart changed or duplicated events"
+    )
+
+    print(
+        "NOV22_RAPID_FULL_REPLAY_PASS " +
+        "original_events=23 new_actions=4 total_events=27 " +
+        "mixed_f200_confirm201=2 " +
+        "staggered_f207_f208_confirm209=2 " +
+        "checkpoint=236 restart=YES api_calls=0"
+    )
 }
 #endif

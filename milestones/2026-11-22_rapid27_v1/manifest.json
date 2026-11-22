@@ -1,0 +1,12 @@
+{
+  "api_calls": 0,
+  "board_sha256": "8a363f2c9a88b81c68316e3770e79168e624bf0d5ca9080d2637af1d6c3d24cf",
+  "earlier_live236_events_preserved": 25,
+  "historical_355_events_preserved": 46,
+  "new_actions": 4,
+  "original_events": 23,
+  "recording": "pi_live25_20261122_120814_22589",
+  "replayed_events": 27,
+  "source_sha256": "bbc3adb0a0477985b36dc9bf614c382230a592bd97d3590d4a4a9db1ebcadeb8",
+  "status": "NATIVE_REPLAY_VERIFIED"
+}
