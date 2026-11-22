@@ -1,0 +1,8 @@
+{
+  "board_sha256": "8a363f2c9a88b81c68316e3770e79168e624bf0d5ca9080d2637af1d6c3d24cf",
+  "previous_git_tag": "pi-blind-position-action-milestone-2026-11-20-v1",
+  "regression_policy": "Do not overwrite or bypass source, positional, action, durability tests",
+  "source_sha256": "6eb6ad0b120bd6732369aa990335b404a7fc0b456b6ae0ef151de8a0abdafb80",
+  "verified_live_40_replay_actions": 6,
+  "verified_offline_355_events": 46
+}
