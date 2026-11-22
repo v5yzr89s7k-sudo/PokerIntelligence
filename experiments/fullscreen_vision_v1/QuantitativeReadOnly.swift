@@ -82,6 +82,17 @@ func parseLines(_ doc: [String:Any]) -> [OCRLine] {
     }
 }
 let rxSeatLabel = try! NSRegularExpression(pattern:"^[A-Za-z][A-Za-z0-9_ '\u{2019}\u{002D}]{1,30}$")
+// Action overlays replace nameplates, but are never player identities.
+let nonIdentityLabels: Set<String> = [
+    "FOLD", "CALL", "RAISE", "RAISER", "CHECK", "BET", "ALLIN",
+    "ANTE", "ANTER", "POSTSB", "POSTBB", "POSTANTE", "SB", "BB",
+    "WINNER", "WIN", "DONTSHOW", "SHOW", "SHOWCARDS", "MUCK",
+    "SITOUT", "SITTINGOUT", "TIMEBANK", "WAITING"
+]
+func isInterfaceLabel(_ text: String) -> Bool {
+    let normalized = text.uppercased().filter { $0.isLetter || $0.isNumber }
+    return nonIdentityLabels.contains(normalized)
+}
 func seatText(_ text: String) -> Bool {
     let range=NSRange(text.startIndex..<text.endIndex,in:text)
     return rxSeatLabel.firstMatch(in:text,range:range) != nil
@@ -111,17 +122,26 @@ func extractSnapshot(_ doc:[String:Any], knownNames: [String], pastSeats: [Strin
             abs(am.x-label.x)<0.034 && (label.y-am.y) > 0.022 && (label.y-am.y) < 0.072
         }
         if stacks.count != 1 {continue}
-        let name = knownNames.contains(label.text) ? label.text : nil
-        anchors.append(SeatAnchor(visibleLabel:label.text,x:label.x,y:label.y,knownName:name))
+        // A verified player name requires the earlier hand-scoped roster
+        // and a matching physical seat position, not an action overlay.
+        let prior = pastSeats[label.text]
+        let name: String? = (!isInterfaceLabel(label.text) &&
+            knownNames.contains(label.text) && prior != nil &&
+            hypot(label.x-prior!.0,label.y-prior!.1)<0.018)
+            ? label.text : nil
+        let visible = name ?? (isInterfaceLabel(label.text)
+            ? "UNVERIFIED_SEAT" : "OCR_NAME_CANDIDATE:"+label.text)
+        anchors.append(SeatAnchor(visibleLabel:visible,x:label.x,y:label.y,knownName:name))
     }
     // Past seats are valid only when a roster was established on a *previous* frame.
     for name in pastSeats.keys.sorted() {
-        guard let point=pastSeats[name] else {continue}
+        // Even a corrupted roster cannot promote a UI action to a name.
+        guard !isInterfaceLabel(name),let point=pastSeats[name] else {continue}
         anchors.removeAll { a in
             a.knownName == nil && hypot(a.x-point.0,a.y-point.1)<0.018
         }
         if !anchors.contains(where:{$0.knownName == name}) {
-            anchors.append(SeatAnchor(visibleLabel:"EARLIER_ROSTER",x:point.0,y:point.1,knownName:name))
+            anchors.append(SeatAnchor(visibleLabel:name,x:point.0,y:point.1,knownName:name))
         }
     }
     var wagers = [(Amount,SeatAnchor)]()
@@ -234,7 +254,25 @@ func scan(_ root:URL,_ out:URL) throws {
             guard extractSnapshot(changed,knownNames:[])?.status == "UNRESOLVED_ARITHMETIC" else {
                 throw NSError(domain:"BAD_WAGER_NOT_REJECTED",code:314)
             }
-            print("QUANTITATIVE_ANCHOR_PASS arithmetic=2/2 unresolved_pot_overlay=1 bad_wager_gate=YES fabricated_actions=0")
+            let refA = extractSnapshot(try loadOCR(a,314),knownNames:[])
+            let refB = extractSnapshot(try loadOCR(b,315),knownNames:[])
+            guard let pa=refA,let pb=refB,
+                  pa.wagers.count == 2,pb.wagers.count == 2,
+                  pa.wagers.allSatisfy({ !$0.1.visibleLabel.contains("RAISE") }),
+                  pb.wagers.allSatisfy({ !$0.1.visibleLabel.contains("Post") }),
+                  (pa.wagers+pb.wagers).allSatisfy({ $0.1.knownName == nil })
+            else {throw NSError(domain:"UNVERIFIED_UI_LABEL_AS_PLAYER",code:314)}
+            let forged = extractSnapshot(
+                try loadOCR(a,314),knownNames:["RAISE"],
+                pastSeats:["RAISE":(0.520,0.156)])
+            let forgedBB = extractSnapshot(
+                try loadOCR(b,315),knownNames:["Post BB","Post SB"],
+                pastSeats:["Post BB":(0.519,0.155),"Post SB":(0.721,0.231)])
+            guard forged?.wagers.count == 2,forgedBB?.wagers.count == 2,
+                  forged!.wagers.allSatisfy({ $0.1.knownName == nil }),
+                  forgedBB!.wagers.allSatisfy({ $0.1.knownName == nil })
+            else {throw NSError(domain:"FORGED_OVERLAY_IDENTITY_ACCEPTED",code:315)}
+            print("QUANTITATIVE_ANCHOR_PASS arithmetic=2/2 unresolved_pot_overlay=1 bad_wager_gate=YES identity_overlays_blocked=YES fabricated_actions=0")
         } else if args.count==4 && args[1]=="--scan" {
             try scan(URL(fileURLWithPath:args[2]),URL(fileURLWithPath:args[3]))
         } else {print("Usage: --check <353_root> <354_root> | --scan <run_root> <output.json>");throw NSError(domain:"ARGS",code:1)}

@@ -1,0 +1,19 @@
+{
+  "authoritative_actions_created": 0,
+  "balanced_reference_frames": [
+    314,
+    315
+  ],
+  "determinism": "3/3 per recording",
+  "network_calls": 0,
+  "recordings": [
+    353,
+    354,
+    236
+  ],
+  "source_sha256": "cf7ee1529e434efbbad08324b524b4a212f35ee5b76363e49e08a8a1c3d2bbb2",
+  "ui_overlays_never_player_identity": true,
+  "unresolved_reference_frame": 334,
+  "verified_frames": 943,
+  "verified_identity_requires_earlier_roster": true
+}
