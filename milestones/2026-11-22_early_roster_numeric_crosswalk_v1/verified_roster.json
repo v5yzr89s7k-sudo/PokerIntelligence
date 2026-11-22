@@ -1,0 +1,23 @@
+[
+  {
+    "bigBlind": "AlanCardioDoc",
+    "clockwiseRing": [
+      "AlanCardioDoc",
+      "borschevik",
+      "jarek131",
+      "mona53",
+      "poker5068",
+      "waterwalkerh2o",
+      "Solomon17"
+    ],
+    "dealer": "waterwalkerh2o",
+    "hand": "2873620503",
+    "priorFrame": 234,
+    "rosterFrame": 235,
+    "smallBlind": "Solomon17",
+    "sourceFingerprints": [
+      "sha256:a795f647aafc4778441f33de40c32ef7d6095465f459f489df9fb123b4673959",
+      "sha256:b9e3ca9f81f6101e6826cea7eda924a36b3bf070903fa525214aaa5f857fe54c"
+    ]
+  }
+]

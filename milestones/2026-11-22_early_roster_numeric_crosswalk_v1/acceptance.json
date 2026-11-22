@@ -1,0 +1,17 @@
+{
+  "api_calls": 0,
+  "authoritative_actions_created": 0,
+  "deterministic_native_scans": "3/3",
+  "early_roster_frame": 235,
+  "hand": "2873620503",
+  "hand_scoping_verified": true,
+  "numeric_arithmetic_unchanged": true,
+  "original_frames": 353,
+  "physical_players": 7,
+  "recording": "pi_rapid27_live_20261122_135243_23892",
+  "scope": "OFFLINE EVIDENCE; NOT LIVE ACTION CERTIFICATION",
+  "total_wager_observations": 550,
+  "unresolved_after": 351,
+  "verified_after": 199,
+  "verified_before": 0
+}

@@ -1,0 +1,10 @@
+{
+  "authoritative_changes": 0,
+  "frames": 353,
+  "numeric_module_sha256": "cf7ee1529e434efbbad08324b524b4a212f35ee5b76363e49e08a8a1c3d2bbb2",
+  "offline_recovery_sha256": "1a2a0ee24ba3b5e00875dc280ce09c23c392930e654f81d012e18566552beda2",
+  "original_recording_modified": false,
+  "production_observer_sha256": "04317f5a8b72a9ad18cac179f6f03e495141afe4e21b131b78f6181ea419d269",
+  "unresolved_wagers": 351,
+  "verified_wager_owners_recovered": 199
+}
