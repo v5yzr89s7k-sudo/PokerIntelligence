@@ -1190,6 +1190,12 @@ func repeatedPhysicalWinner(
 }
 
 actor Recorder {
+    var nativeCaptureTimingEnabled = false
+
+    func enableNativeCaptureTiming() {
+        nativeCaptureTimingEnabled = true
+    }
+
     let directory: URL, live: URL, session: String, verbose: Bool, localSemanticOnly: Bool, started = Date().timeIntervalSince1970
     var frames = [Frame](), events = [Event](), cursor = 0, calls = 0
     var state = "NO SCREEN OBSERVATIONS YET. No old game has been loaded."
@@ -1530,6 +1536,100 @@ actor Recorder {
         self.directory = directory; self.live = live; self.verbose = verbose
         self.localSemanticOnly = localSemanticOnly; session = directory.lastPathComponent
     }
+
+    // Recorder-owned journal. Timestamp taken after the atomic
+    // current_hand.txt write. No action is promoted by this method.
+    // Historical replay latency must remain nil.
+    func publishFoldReceipts(hand: String?) throws {
+        guard localSemanticOnly, let hand = hand else { return }
+
+        let url = directory.appendingPathComponent(
+            "observed_physical_fold_publications.json")
+
+        var receipts = [FoldPublicationReceipt]()
+
+        if FileManager.default.fileExists(atPath: url.path) {
+            receipts = try JSONDecoder().decode(
+                [FoldPublicationReceipt].self,
+                from: Data(contentsOf: url))
+        }
+
+        var changed = false
+
+        for fold in immediateFolds where fold.hand == hand {
+
+            if let i = receipts.firstIndex(where: {
+                $0.hand == fold.hand &&
+                $0.player == fold.player &&
+                $0.firstMissingFrame == fold.firstMissingFrame
+            }) {
+                // Preserve the original measurement while updating
+                // any subsequent no-show or card-reappearance status.
+                if receipts[i].classification != fold.currentStatus {
+                    receipts[i].classification = fold.currentStatus
+                    changed = true
+                }
+                continue
+            }
+
+            guard fold.currentStatus ==
+                    "FOLD_DETECTED_AT_FIRST_CARD_LOSS",
+                  fold.sourceFingerprints.count == 3,
+                  fold.firstMissingFrame >= 1,
+                  fold.firstMissingFrame <= frames.count
+            else { continue }
+
+            let frame = frames[fold.firstMissingFrame-1]
+            let written = Date().timeIntervalSince1970
+
+            let live = nativeCaptureTimingEnabled &&
+                frame.captured >= started-1 &&
+                written >= frame.captured
+
+            let milliseconds: Double? = live
+                ? (written-frame.captured)*1000 : nil
+
+            let committed = events.contains {
+                $0.hand == fold.hand &&
+                $0.kind == "action" &&
+                $0.text == "\(fold.player) folds."
+            }
+
+            receipts.append(FoldPublicationReceipt(
+                hand:fold.hand,
+                player:fold.player,
+                firstMissingFrame:fold.firstMissingFrame,
+                sourceFingerprint:fold.sourceFingerprints[2],
+                capturedAt:frame.captured,
+                writtenAt:written,
+                captureToHandFileMs:milliseconds,
+                nativeLiveTiming:live,
+                committedAtWrite:committed,
+                classification:fold.currentStatus
+            ))
+
+            changed = true
+
+            if verbose {
+                let delay = milliseconds.map {
+                    String(format:"%.1f",$0)
+                } ?? "UNMEASURED_REPLAY"
+
+                print(
+                    "[NATIVE_FOLD_WRITE] hand=\(fold.hand) " +
+                    "frame=\(fold.firstMissingFrame) " +
+                    "player=\(fold.player) " +
+                    "capture_to_hand_file_ms=\(delay)"
+                )
+            }
+        }
+
+        if changed {
+            try encoded(receipts).write(
+                to:url,options:.atomic)
+        }
+    }
+
     func publish() throws {
         try recover()
         refreshBlindEvidence()
@@ -1859,6 +1959,7 @@ actor Recorder {
         try Data(committedCurrentHand.utf8).write(
             to: directory.appendingPathComponent("current_hand.txt"),
             options: .atomic)
+        try publishFoldReceipts(hand:observedCurrentHand)
         try encoded(committedFoldFacts(events)).write(to: directory.appendingPathComponent("committed_fold_facts.json"), options: .atomic)
         try Data(text.utf8).write(to: directory.appendingPathComponent("hand.txt"), options: .atomic)
         try Data(text.utf8).write(to: live, options: .atomic)
@@ -2992,6 +3093,7 @@ struct FullScreenVision {
                     localSemanticOnly: true
                 )
 
+                await recorder.enableNativeCaptureTiming()
                 try await recorder.publish()
 
                 try require(
@@ -3504,6 +3606,20 @@ struct PhysicalDealtInRoster: Codable, Equatable {
     let smallBlind: String
     let bigBlind: String
     let sourceFingerprints: [String]
+}
+
+
+struct FoldPublicationReceipt: Codable, Equatable {
+    let hand: String
+    let player: String
+    let firstMissingFrame: Int
+    let sourceFingerprint: String
+    let capturedAt: Double
+    let writtenAt: Double
+    let captureToHandFileMs: Double?
+    let nativeLiveTiming: Bool
+    let committedAtWrite: Bool
+    var classification: String
 }
 
 struct ImmediatePhysicalFold: Codable, Equatable {
@@ -8814,6 +8930,55 @@ func verifyNoShowFoldExclusion354(_ input: URL) async throws {
         status.stopped && status.pending == 0 &&
         status.calls == 0,
         "Restart changed the corrected Fold observations")
+
+
+    let publicationFile = root.appendingPathComponent(
+        "observed_physical_fold_publications.json")
+
+    let publicationRows = try d.decode(
+        [FoldPublicationReceipt].self,
+        from: Data(contentsOf: publicationFile))
+
+    let publicationKeys = Set(publicationRows.map {
+        "\($0.hand)#\($0.player)#\($0.firstMissingFrame)"
+    })
+
+    try require(
+        publicationRows.count == 8 &&
+        publicationKeys.count == 8 &&
+        publicationRows.allSatisfy({ row in
+            row.firstMissingFrame > 0 &&
+            row.firstMissingFrame <= frames.count &&
+            row.capturedAt ==
+                frames[row.firstMissingFrame-1].captured &&
+            row.captureToHandFileMs == nil &&
+            !row.nativeLiveTiming &&
+            repaired.contains(where: { fold in
+                fold.hand == row.hand &&
+                fold.player == row.player &&
+                fold.firstMissingFrame == row.firstMissingFrame &&
+                fold.sourceFingerprints.count == 3 &&
+                fold.sourceFingerprints[2] == row.sourceFingerprint
+            })
+        }) &&
+        !publicationRows.contains(where: {
+            $0.hand == "2873886866" &&
+            $0.player == "CHIpmagNIT" &&
+            $0.firstMissingFrame == 300
+        }) &&
+        publicationRows.contains(where: {
+            $0.hand == "2873888194" &&
+            $0.player == "CHIpmagNIT" &&
+            $0.firstMissingFrame == 324
+        }),
+        "Fold publication journal corrupted, duplicated, or mislabeled"
+    )
+
+    print(
+        "FOLD_NATIVE_JOURNAL_354_PASS receipts=8 " +
+        "no_show_f300_excluded=YES replay_latency=null " +
+        "restart=YES authoritative_unchanged=YES"
+    )
 
     print(
         "NOSHOW_NOT_FOLD_354_PASS frames=354 " +

@@ -1,0 +1,15 @@
+{
+  "api_calls": 0,
+  "existing_authoritative_events": 35,
+  "false_fold_frame300_excluded": true,
+  "frames_replayed": 354,
+  "historical_replay_latency": "null",
+  "latency_measurement": "native screenshot capture to completed current_hand.txt write",
+  "new_authoritative_events": 0,
+  "parent_sha256": "7e20d7390816ca994841f25a0171d86ca298f8b0c9a92ea5938a4ff74d164a79",
+  "real_fold_frame324_preserved": true,
+  "recording": "pi_physical_fold_live_20261122_171036_25314",
+  "regression_suites_passed": 18,
+  "source_sha256": "33e6046f65a76e6ce4af49128ce2a59fc4e1cb7402db22e8102ba73b9dfba2c8",
+  "verified_physical_folds": 8
+}
