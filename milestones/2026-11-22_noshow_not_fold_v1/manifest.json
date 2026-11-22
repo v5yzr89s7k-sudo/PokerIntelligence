@@ -1,0 +1,24 @@
+{
+  "api_calls": 0,
+  "corrected_fold_candidates": 8,
+  "excluded_false_fold": {
+    "frame": 300,
+    "hand": "2873886866",
+    "player": "CHIpmagNIT",
+    "reason": "DON'T SHOW at same seat"
+  },
+  "new_authoritative_events": 0,
+  "original_card_loss_candidates": 9,
+  "original_frames": 354,
+  "parent_sha256": "a817f97dcb7f6a16f2c243a9bd94f6007d6490409f050d1c607ad418e80231a9",
+  "preserved_fold": {
+    "frame": 324,
+    "hand": "2873888194",
+    "player": "CHIpmagNIT"
+  },
+  "prior_authoritative_events": 35,
+  "recording": "pi_physical_fold_live_20261122_171036_25314",
+  "regression_suites_passed": 18,
+  "source_sha256": "7e20d7390816ca994841f25a0171d86ca298f8b0c9a92ea5938a4ff74d164a79",
+  "winner_evidence": "Roman1963PL WINNER at frame 304"
+}

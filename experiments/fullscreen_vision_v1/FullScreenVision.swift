@@ -1296,6 +1296,15 @@ actor Recorder {
                     }
 
                     if names.count == 1 &&
+                       noShowAtSeat(localOCR[n-1].capture,names[0]) {
+                        // Retract an earlier provisional card-loss
+                        // report if the no-show label arrives later.
+                        immediateFolds[i].currentStatus =
+                            "NO_SHOW_NOT_A_FOLD"
+                        continue
+                    }
+
+                    if names.count == 1 &&
                        currentPairs.contains(where: {
                            physicalCardPairAt(
                                $0,name:names[0]
@@ -2883,6 +2892,14 @@ struct FullScreenVision {
                 return
             }
             #endif
+            #if os(macOS)
+            if CommandLine.arguments.count == 3 &&
+                CommandLine.arguments[1] == "--noshow-not-fold-354" {
+                try await verifyNoShowFoldExclusion354(
+                    URL(fileURLWithPath:CommandLine.arguments[2]))
+                return
+            }
+            #endif
             if CommandLine.arguments.contains("--self-test") { try await selfTest(); return }
             if CommandLine.arguments.contains("--parallel-self-test") { try await parallelSelfTest(); return }
             #if os(macOS)
@@ -3591,6 +3608,23 @@ func physicalRosterCandidate(
 // A Fold is visible immediately on the first missing-card frame.
 // It does NOT wait for an OCR Fold overlay or an additional screenshot.
 // The authoritative event ledger is still independently validated.
+
+// DON'T SHOW is a showdown/no-show label, NOT a poker Fold.
+// A WINNER or payout must be established by separate result evidence.
+func noShowAtSeat(_ capture: LocalOCRCapture, _ seat: LocalOCRLine) -> Bool {
+    capture.lines.contains { line in
+        guard line.confidence >= 0.8 else { return false }
+        let normalized = line.text.uppercased()
+            .replacingOccurrences(of:" ",with:"")
+            .replacingOccurrences(of:"'",with:"")
+            .replacingOccurrences(of:"’",with:"")
+            .replacingOccurrences(of:"-",with:"")
+        return normalized == "DONTSHOW" &&
+            abs(line.x-seat.x) < 0.030 &&
+            abs(line.y-seat.y) < 0.022
+    }
+}
+
 func immediatePhysicalFoldAt(
     older: LocalOCRFrame,
     previous: LocalOCRFrame,
@@ -3656,6 +3690,9 @@ func immediatePhysicalFoldAt(
         guard labels.count == 1 else { continue }
 
         let name = labels[0]
+        // A seat-local DON'T SHOW is not a Fold.
+        guard !noShowAtSeat(previous.capture,name) &&
+              !noShowAtSeat(current.capture,name) else { continue }
         guard a.filter({
             physicalCardPairAt($0,name:name)
         }).count == 1 &&
@@ -8617,5 +8654,173 @@ func verifyPerHandRosterAndImmediateFolds(_ input: URL) async throws {
         "hand_move_gate=YES checkpoint=353 " +
         "restart=YES api_calls=0"
     )
+}
+#endif
+
+
+#if os(macOS)
+func verifyNoShowFoldExclusion354(_ input: URL) async throws {
+    let d = JSONDecoder()
+    let frames = try d.decode([Frame].self,
+        from:Data(contentsOf:input.appendingPathComponent("frames.json")))
+    let boards = try d.decode([LocalBoardObservation].self,
+        from:Data(contentsOf:input.appendingPathComponent(
+            "local_board_observations.json")))
+    let pairs = try d.decode([FrameCardPairs].self,
+        from:Data(contentsOf:input.appendingPathComponent(
+            "observed_card_back_pairs.json")))
+    let old = try d.decode(DurableState.self,
+        from:Data(contentsOf:input.appendingPathComponent(
+            "authoritative_checkpoint.json")))
+    let oldEvents = old.commits.flatMap { $0.accepted }
+    let originalFolds = try d.decode([ImmediatePhysicalFold].self,
+        from:Data(contentsOf:input.appendingPathComponent(
+            "observed_immediate_physical_folds.json")))
+    let ocr = try (1...354).map { n in
+        try d.decode(LocalOCRFrame.self,
+            from:Data(contentsOf:input.appendingPathComponent(
+                String(format:"local_ocr/%06d.json",n))))
+    }
+
+    try require(
+        frames.count == 354 && boards.count == 354 &&
+        pairs.count == 354 && old.cursor == 354 &&
+        oldEvents.count == 35 && originalFolds.count == 9,
+        "Original 354-frame evidence changed")
+
+    guard let seat = ocr[207].capture.lines.first(where: {
+        $0.text == "CHIpmagNIT" && $0.confidence >= 0.8
+    }), let roman = ocr[298].capture.lines.first(where: {
+        $0.text == "Roman1963PL" && $0.confidence >= 0.8
+    }) else { throw Problem("Original seat labels missing") }
+
+    try require(
+        !noShowAtSeat(ocr[298].capture,seat) &&
+        noShowAtSeat(ocr[299].capture,seat) &&
+        noShowAtSeat(ocr[300].capture,seat) &&
+        !noShowAtSeat(ocr[299].capture,roman) &&
+        oldEvents.contains(where: {
+            $0.hand == "2873886866" &&
+            $0.frame == 304 &&
+            $0.text.contains("Roman1963PL WINNER")
+        }),
+        "Seat-local no-show or independent winner evidence incorrect")
+
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("pi-noshow-fold-"+UUID().uuidString)
+
+    defer { try? FileManager.default.removeItem(at:root) }
+
+    for sub in ["frames","accepted","responses"] {
+        try FileManager.default.createDirectory(
+            at:root.appendingPathComponent(sub),
+            withIntermediateDirectories:true)
+    }
+
+    let recorder = Recorder(
+        directory:root,
+        live:root.appendingPathComponent("live.txt"),
+        verbose:false,localSemanticOnly:true)
+
+    try await recorder.publish()
+
+    for n in 1...354 {
+        let f = frames[n-1]
+        let bytes = try Data(
+            contentsOf:input.appendingPathComponent(f.file))
+        let fingerprint = frameFingerprint(bytes)
+
+        try require(
+            f.id == n && ocr[n-1].frame == n &&
+            ocr[n-1].sourceFingerprint == fingerprint &&
+            boards[n-1].sourceFingerprint == fingerprint &&
+            pairs[n-1].sourceFingerprint == fingerprint,
+            "Original screenshot mismatch at frame \(n)")
+
+        try await recorder.add(
+            bytes,start:f.started,end:f.captured,
+            width:f.width,height:f.height,
+            local:ocr[n-1].capture,
+            boardCount:boards[n-1].visibleBoardCount,
+            cardBackPairs:pairs[n-1].pairs,
+            faceUpCardPairs:pairs[n-1].faceUpPairs)
+
+        if n == 300 || n == 324 {
+            let text = try String(contentsOf:
+                root.appendingPathComponent("current_hand.txt"),
+                encoding:.utf8)
+
+            if n == 300 {
+                try require(
+                    !text.contains("frame 300: CHIpmagNIT folds"),
+                    "DON'T SHOW incorrectly displayed as Fold")
+            } else {
+                try require(
+                    text.contains("frame 324: CHIpmagNIT folds"),
+                    "Real Fold in next hand was lost")
+            }
+        }
+
+        if n % 100 == 0 {
+            print("NOSHOW_354_PROGRESS \(n)/354")
+        }
+    }
+
+    try await recorder.finish()
+
+    let events = await recorder.events
+    let cp = try d.decode(DurableState.self,
+        from:Data(contentsOf:root.appendingPathComponent(
+            "authoritative_checkpoint.json")))
+    let repaired = try d.decode([ImmediatePhysicalFold].self,
+        from:Data(contentsOf:root.appendingPathComponent(
+            "observed_immediate_physical_folds.json")))
+
+    let expected = originalFolds.filter {
+        !($0.hand == "2873886866" &&
+          $0.player == "CHIpmagNIT" &&
+          $0.firstMissingFrame == 300)
+    }
+
+    try require(
+        cp.cursor == 354 &&
+        cp.commits.flatMap({$0.accepted}) == oldEvents &&
+        events == oldEvents &&
+        repaired == expected &&
+        repaired.count == 8 &&
+        repaired.contains(where: {
+            $0.hand == "2873888194" &&
+            $0.player == "CHIpmagNIT" &&
+            $0.firstMissingFrame == 324
+        }),
+        "Fold correction or historical chronology incorrect")
+
+    let journal = root.appendingPathComponent(
+        "observed_immediate_physical_folds.json")
+    let before = try Data(contentsOf:journal)
+
+    let restarted = Recorder(
+        directory:root,
+        live:root.appendingPathComponent("live.txt"),
+        verbose:false,localSemanticOnly:true)
+    try await restarted.publish()
+
+    let after = try Data(contentsOf:journal)
+    let recovered = await restarted.events
+    let status = await restarted.status()
+
+    try require(
+        before == after && recovered == oldEvents &&
+        status.stopped && status.pending == 0 &&
+        status.calls == 0,
+        "Restart changed the corrected Fold observations")
+
+    print(
+        "NOSHOW_NOT_FOLD_354_PASS frames=354 " +
+        "old_physical_candidates=9 valid_fold_candidates=8 " +
+        "frame300_no_show_excluded=YES " +
+        "frame324_fold_preserved=YES " +
+        "authoritative_events=35 unchanged=YES " +
+        "checkpoint=354 restart=YES api_calls=0")
 }
 #endif
