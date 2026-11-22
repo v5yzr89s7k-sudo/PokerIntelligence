@@ -1,0 +1,19 @@
+{
+  "api_calls": 0,
+  "blind_position_authority": "unchanged",
+  "new_authoritative_actions": 0,
+  "observed_first_card_losses": {
+    "borschevik": 236,
+    "jarek131": 277
+  },
+  "parent_source_sha256": "bbc3adb0a0477985b36dc9bf614c382230a592bd97d3590d4a4a9db1ebcadeb8",
+  "physical_roster_frame": 235,
+  "previous_replay_events_preserved": [
+    27,
+    25,
+    46
+  ],
+  "regression_suites_passed": 17,
+  "source_sha256": "a817f97dcb7f6a16f2c243a9bd94f6007d6490409f050d1c607ad418e80231a9",
+  "verified_dealt_in_seats": 7
+}

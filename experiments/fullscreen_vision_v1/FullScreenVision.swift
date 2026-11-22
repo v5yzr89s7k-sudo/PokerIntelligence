@@ -1204,6 +1204,9 @@ actor Recorder {
     var localOCR = [LocalOCRFrame]()
     var blindPositions = [String:BlindButtonEvidence]()
     var blindEvidenceExaminedThrough = 1
+    var physicalRosters = [String:PhysicalDealtInRoster]()
+    var immediateFolds = [ImmediatePhysicalFold]()
+    var physicalExaminedThrough = 0
 
     func refreshBlindEvidence() {
         while blindEvidenceExaminedThrough < localOCR.count {
@@ -1220,6 +1223,98 @@ actor Recorder {
             blindEvidenceExaminedThrough += 1
         }
     }
+    func refreshPhysicalSeatEvidence() {
+        let count = min(
+            localOCR.count,localBoard.count,localCardBacks.count
+        )
+        guard physicalExaminedThrough < count else { return }
+
+        for n in (physicalExaminedThrough+1)...count {
+            if n >= 2,
+               let candidate = physicalRosterCandidate(
+                   previous:localOCR[n-2],
+                   current:localOCR[n-1],
+                   previousBoard:localBoard[n-2],
+                   currentBoard:localBoard[n-1],
+                   previousCards:localCardBacks[n-2],
+                   currentCards:localCardBacks[n-1]
+               ) {
+                if let old = physicalRosters[candidate.hand] {
+                    if candidate.clockwiseRing.count >
+                       old.clockwiseRing.count {
+                        physicalRosters[candidate.hand] = candidate
+                    }
+                } else {
+                    physicalRosters[candidate.hand] = candidate
+                }
+            }
+
+            if n >= 3,
+               let hand = currentLocalHand(
+                   localOCR[n-1].capture
+               ),
+               let roster = physicalRosters[hand],
+               roster.rosterFrame < n {
+
+                let fresh = immediatePhysicalFoldAt(
+                    older:localOCR[n-3],
+                    previous:localOCR[n-2],
+                    current:localOCR[n-1],
+                    olderBoard:localBoard[n-3],
+                    previousBoard:localBoard[n-2],
+                    currentBoard:localBoard[n-1],
+                    olderCards:localCardBacks[n-3],
+                    previousCards:localCardBacks[n-2],
+                    currentCards:localCardBacks[n-1],
+                    roster:roster,
+                    rosterOCR:localOCR[roster.rosterFrame-1],
+                    overlays:localCandidates
+                )
+
+                for candidate in fresh
+                    where !immediateFolds.contains(where: {
+                        $0.hand == candidate.hand &&
+                        $0.player == candidate.player
+                    }) {
+                    immediateFolds.append(candidate)
+                }
+
+                let currentPairs = localCardBacks[n-1].pairs +
+                    (localCardBacks[n-1].faceUpPairs ?? [])
+
+                for i in immediateFolds.indices
+                    where immediateFolds[i].hand == hand &&
+                    immediateFolds[i].firstMissingFrame < n &&
+                    immediateFolds[i].reappearedFrame == nil {
+
+                    let player = immediateFolds[i].player
+                    let names = localOCR[
+                        roster.rosterFrame-1
+                    ].capture.lines.filter {
+                        $0.text == player &&
+                        $0.confidence >= 0.8
+                    }
+
+                    if names.count == 1 &&
+                       currentPairs.contains(where: {
+                           physicalCardPairAt(
+                               $0,name:names[0]
+                           )
+                       }) {
+                        immediateFolds[i].currentStatus =
+                            "CARD_REAPPEARED_NOT_CERTIFIED_FOLD"
+                        immediateFolds[i].reappearedFrame = n
+                    }
+                }
+            }
+
+            physicalExaminedThrough = n
+        }
+    }
+
+    // Early dealt-in rosters are observation-only.
+    // Certified blind-based action positions are unchanged.
+
     var localBoard = [LocalBoardObservation]()
     var localCardBacks = [FrameCardPairs]()
 
@@ -1429,6 +1524,7 @@ actor Recorder {
     func publish() throws {
         try recover()
         refreshBlindEvidence()
+        refreshPhysicalSeatEvidence()
         let age = cursor > 0 ? Date().timeIntervalSince1970 - frames[cursor-1].captured : -1
         let stats = "captured=\(frames.count) analyzed=\(cursor) pending=\(frames.count-cursor) api_calls=\(calls) evidence_age_s=\(Int(max(-1, age))) hidden_table_frames=\(hiddenFrames.count)"
         let shownState = lastTableVisible == false
@@ -1484,6 +1580,40 @@ actor Recorder {
             ]
             if let position = blindPositions[hand] {
                 lines.append("  BUTTON INFERRED FROM BLINDS (candidate, not independently certified): \(position.dealer); SB \(position.smallBlind); BB \(position.bigBlind); evidence frames \(position.firstFrame),\(position.confirmedFrame)")
+            }
+
+            if let roster = physicalRosters[hand] {
+                lines.append(
+                    "  DEALT-IN ROSTER: " +
+                    roster.clockwiseRing.joined(separator:", ") +
+                    "; evidence frames \(roster.priorFrame),\(roster.rosterFrame); current hand only"
+                )
+            }
+
+            let firstLosses = immediateFolds.filter { fold in
+                fold.hand == hand &&
+                fold.currentStatus ==
+                    "FOLD_DETECTED_AT_FIRST_CARD_LOSS" &&
+                !accepted.contains(where: { event in
+                    event.kind == "action" &&
+                    event.text == "\(fold.player) folds."
+                })
+            }
+
+            if !firstLosses.isEmpty {
+                lines.append(
+                    "IMMEDIATE FOLDS — PHYSICAL CARD LOSS; " +
+                    "LEGAL ORDER PENDING"
+                )
+
+                for fold in firstLosses {
+                    lines.append(
+                        "  frame \(fold.firstMissingFrame): " +
+                        "\(fold.player) folds " +
+                        "[physical cards disappeared; " +
+                        "authoritative order not yet certified]"
+                    )
+                }
             }
             let positioning = relativeSeatCandidates.filter {
                 $0.hand == hand
@@ -1677,6 +1807,22 @@ actor Recorder {
         try encoded(blindPositions.values.sorted { $0.firstFrame < $1.firstFrame }).write(
             to:directory.appendingPathComponent("observed_button_from_blinds.json"),
             options:.atomic)
+        try encoded(
+            physicalRosters.values.sorted {
+                $0.rosterFrame < $1.rosterFrame
+            }
+        ).write(
+            to:directory.appendingPathComponent(
+                "observed_verified_dealt_in_rosters.json"
+            ),options:.atomic
+        )
+
+        try encoded(immediateFolds).write(
+            to:directory.appendingPathComponent(
+                "observed_immediate_physical_folds.json"
+            ),options:.atomic
+        )
+
         try encoded(localCardBacks).write(
             to:directory.appendingPathComponent(
                 "observed_card_back_pairs.json"
@@ -2011,6 +2157,7 @@ actor Recorder {
                 $0.frame == id && localSemanticSupported($0)
             }
             refreshBlindEvidence()
+            refreshPhysicalSeatEvidence()
             let freshOpening = recoveredOpeningPreflopFolds(
                 overlays:localCandidates,ocr:localOCR,board:localBoard,
                 cards:localCardBacks,buttons:blindPositions,
@@ -2727,6 +2874,15 @@ struct FullScreenVision {
                 return
             }
             #endif
+            #if os(macOS)
+            if CommandLine.arguments.count == 3 &&
+                CommandLine.arguments[1] == "--f277-roster-test" {
+                try await verifyPerHandRosterAndImmediateFolds(
+                    URL(fileURLWithPath:CommandLine.arguments[2])
+                )
+                return
+            }
+            #endif
             if CommandLine.arguments.contains("--self-test") { try await selfTest(); return }
             if CommandLine.arguments.contains("--parallel-self-test") { try await parallelSelfTest(); return }
             #if os(macOS)
@@ -3320,6 +3476,227 @@ func bestBlindButtonEvidence(_ frames: [LocalOCRFrame]) -> [BlindButtonEvidence]
     return byHand.values.sorted { $0.firstFrame < $1.firstFrame }
 }
 
+
+
+struct PhysicalDealtInRoster: Codable, Equatable {
+    let hand: String
+    let rosterFrame: Int
+    let priorFrame: Int
+    let clockwiseRing: [String]
+    let dealer: String
+    let smallBlind: String
+    let bigBlind: String
+    let sourceFingerprints: [String]
+}
+
+struct ImmediatePhysicalFold: Codable, Equatable {
+    let hand: String
+    let player: String
+    let priorFrame: Int
+    let firstMissingFrame: Int
+    let rosterFrame: Int
+    let sourceFingerprints: [String]
+    var currentStatus: String
+    var reappearedFrame: Int?
+}
+
+func physicalCardPairAt(_ p: LocalCardPair, name: LocalOCRLine) -> Bool {
+    abs(p.x-name.x) < 0.030 &&
+    (1.0-name.y)-p.y > 0.030 &&
+    (1.0-name.y)-p.y < 0.085
+}
+
+// This proof is owned by ONE hand. It never inherits another table's
+// participants. All occupied seats require actual hole-card evidence.
+func physicalRosterCandidate(
+    previous: LocalOCRFrame, current: LocalOCRFrame,
+    previousBoard: LocalBoardObservation,
+    currentBoard: LocalBoardObservation,
+    previousCards: FrameCardPairs,
+    currentCards: FrameCardPairs
+) -> PhysicalDealtInRoster? {
+    guard previous.frame+1 == current.frame,
+          previous.capture.error == nil &&
+          current.capture.error == nil,
+          let hand = currentLocalHand(current.capture),
+          currentLocalHand(previous.capture) == hand,
+          previous.sourceFingerprint != current.sourceFingerprint,
+          previousBoard.hand == hand &&
+          currentBoard.hand == hand &&
+          previousBoard.frame == previous.frame &&
+          currentBoard.frame == current.frame &&
+          previousBoard.visibleBoardCount == 0 &&
+          currentBoard.visibleBoardCount == 0 &&
+          previousCards.hand == hand &&
+          currentCards.hand == hand &&
+          previousCards.frame == previous.frame &&
+          currentCards.frame == current.frame &&
+          previousBoard.sourceFingerprint == previous.sourceFingerprint &&
+          currentBoard.sourceFingerprint == current.sourceFingerprint &&
+          previousCards.sourceFingerprint == previous.sourceFingerprint &&
+          currentCards.sourceFingerprint == current.sourceFingerprint,
+          let snapshot = blindButtonSnapshot(current),
+          snapshot.hand == hand else { return nil }
+
+    let ring = Array(snapshot.ring.reversed())
+    let before = previousCards.pairs +
+        (previousCards.faceUpPairs ?? [])
+    let after = currentCards.pairs +
+        (currentCards.faceUpPairs ?? [])
+
+    guard (3...10).contains(ring.count) &&
+          before.count == ring.count &&
+          after.count == ring.count &&
+          Set(ring.map { $0.lowercased() }).count == ring.count
+    else { return nil }
+
+    var usedBefore = Set<Int>()
+    var usedAfter = Set<Int>()
+
+    for player in ring {
+        let labels = current.capture.lines.filter {
+            $0.text == player && $0.confidence >= 0.8
+        }
+        guard labels.count == 1 else { return nil }
+        let a = before.indices.filter {
+            physicalCardPairAt(before[$0],name:labels[0])
+        }
+        let b = after.indices.filter {
+            physicalCardPairAt(after[$0],name:labels[0])
+        }
+
+        guard a.count == 1 && b.count == 1 &&
+              usedBefore.insert(a[0]).inserted &&
+              usedAfter.insert(b[0]).inserted &&
+              abs(before[a[0]].x-after[b[0]].x) < 0.018 &&
+              abs(before[a[0]].y-after[b[0]].y) < 0.018
+        else { return nil }
+    }
+
+    return PhysicalDealtInRoster(
+        hand:hand,
+        rosterFrame:current.frame,
+        priorFrame:previous.frame,
+        clockwiseRing:ring,
+        dealer:snapshot.dealer,
+        smallBlind:snapshot.smallBlind,
+        bigBlind:snapshot.bigBlind,
+        sourceFingerprints:[
+            previous.sourceFingerprint,
+            current.sourceFingerprint
+        ]
+    )
+}
+
+// A Fold is visible immediately on the first missing-card frame.
+// It does NOT wait for an OCR Fold overlay or an additional screenshot.
+// The authoritative event ledger is still independently validated.
+func immediatePhysicalFoldAt(
+    older: LocalOCRFrame,
+    previous: LocalOCRFrame,
+    current: LocalOCRFrame,
+    olderBoard: LocalBoardObservation,
+    previousBoard: LocalBoardObservation,
+    currentBoard: LocalBoardObservation,
+    olderCards: FrameCardPairs,
+    previousCards: FrameCardPairs,
+    currentCards: FrameCardPairs,
+    roster: PhysicalDealtInRoster,
+    rosterOCR: LocalOCRFrame,
+    overlays: [LocalOverlayCandidate]
+) -> [ImmediatePhysicalFold] {
+    let hand = roster.hand
+    let n = current.frame
+
+    guard roster.rosterFrame < n &&
+          older.frame == n-2 &&
+          previous.frame == n-1 &&
+          currentLocalHand(older.capture) == hand &&
+          currentLocalHand(previous.capture) == hand &&
+          currentLocalHand(current.capture) == hand &&
+          older.capture.error == nil &&
+          previous.capture.error == nil &&
+          current.capture.error == nil &&
+          [olderBoard,previousBoard,currentBoard].allSatisfy({
+              $0.hand == hand
+          }) &&
+          olderBoard.visibleBoardCount ==
+              previousBoard.visibleBoardCount &&
+          previousBoard.visibleBoardCount ==
+              currentBoard.visibleBoardCount &&
+          olderBoard.sourceFingerprint == older.sourceFingerprint &&
+          previousBoard.sourceFingerprint == previous.sourceFingerprint &&
+          currentBoard.sourceFingerprint == current.sourceFingerprint &&
+          [olderCards,previousCards,currentCards].allSatisfy({
+              $0.hand == hand
+          }) &&
+          olderCards.sourceFingerprint == older.sourceFingerprint &&
+          previousCards.sourceFingerprint == previous.sourceFingerprint &&
+          currentCards.sourceFingerprint == current.sourceFingerprint &&
+          rosterOCR.frame == roster.rosterFrame &&
+          currentLocalHand(rosterOCR.capture) == hand &&
+          rosterOCR.sourceFingerprint == roster.sourceFingerprints[1] &&
+          !overlays.contains(where: {
+              $0.hand == hand &&
+              $0.frame >= n-1 &&
+              $0.frame <= n &&
+              $0.label == "WINNER"
+          }) else { return [] }
+
+    let a = olderCards.pairs + (olderCards.faceUpPairs ?? [])
+    let b = previousCards.pairs + (previousCards.faceUpPairs ?? [])
+    let c = currentCards.pairs + (currentCards.faceUpPairs ?? [])
+
+    var detected = [ImmediatePhysicalFold]()
+
+    for player in roster.clockwiseRing {
+        let labels = rosterOCR.capture.lines.filter {
+            $0.text == player && $0.confidence >= 0.8
+        }
+        guard labels.count == 1 else { continue }
+
+        let name = labels[0]
+        guard a.filter({
+            physicalCardPairAt($0,name:name)
+        }).count == 1 &&
+        b.filter({
+            physicalCardPairAt($0,name:name)
+        }).count == 1 &&
+        c.filter({
+            physicalCardPairAt($0,name:name)
+        }).isEmpty else { continue }
+
+        let survivors = roster.clockwiseRing.contains { other in
+            guard other != player else { return false }
+            let names = rosterOCR.capture.lines.filter {
+                $0.text == other && $0.confidence >= 0.8
+            }
+            return names.count == 1 &&
+                c.contains(where: {
+                    physicalCardPairAt($0,name:names[0])
+                })
+        }
+
+        guard survivors else { continue }
+
+        detected.append(ImmediatePhysicalFold(
+            hand:hand,
+            player:player,
+            priorFrame:n-1,
+            firstMissingFrame:n,
+            rosterFrame:roster.rosterFrame,
+            sourceFingerprints:[
+                older.sourceFingerprint,
+                previous.sourceFingerprint,
+                current.sourceFingerprint
+            ],
+            currentStatus:"FOLD_DETECTED_AT_FIRST_CARD_LOSS",
+            reappearedFrame:nil
+        ))
+    }
+
+    return detected.sorted { $0.player < $1.player }
+}
 
 func originalBlindButtonRegression(_ input: URL) throws {
     let frames = try JSONDecoder().decode([Frame].self,
@@ -7951,6 +8328,294 @@ func nov22RapidFullRecordedReplay(_ input: URL) async throws {
         "mixed_f200_confirm201=2 " +
         "staggered_f207_f208_confirm209=2 " +
         "checkpoint=236 restart=YES api_calls=0"
+    )
+}
+#endif
+
+
+#if os(macOS)
+func verifyPerHandRosterAndImmediateFolds(_ input: URL) async throws {
+    let decoder = JSONDecoder()
+    let manifest = try decoder.decode([Frame].self,
+        from:Data(contentsOf:input.appendingPathComponent("frames.json")))
+    let board = try decoder.decode([LocalBoardObservation].self,
+        from:Data(contentsOf:input.appendingPathComponent(
+            "local_board_observations.json")))
+    let cards = try decoder.decode([FrameCardPairs].self,
+        from:Data(contentsOf:input.appendingPathComponent(
+            "observed_card_back_pairs.json")))
+    let original = try decoder.decode(DurableState.self,
+        from:Data(contentsOf:input.appendingPathComponent(
+            "authoritative_checkpoint.json")))
+    let originalEvents = original.commits.flatMap { $0.accepted }
+
+    try require(
+        manifest.count == 353 && board.count == 353 &&
+        cards.count == 353 && original.cursor == 353 &&
+        originalEvents.count == 27,
+        "Original 353-frame checkpoint mismatch"
+    )
+
+    let ocr = try (1...353).map { n in
+        try decoder.decode(LocalOCRFrame.self,
+            from:Data(contentsOf:input.appendingPathComponent(
+                String(format:"local_ocr/%06d.json",n))))
+    }
+
+    let overlays = try decoder.decode([LocalOverlayCandidate].self,
+        from:Data(contentsOf:input.appendingPathComponent(
+            "local_overlay_candidates.json")))
+
+    for n in [234,235,236,275,276,277,278] {
+        let bytes = try Data(contentsOf:
+            input.appendingPathComponent(manifest[n-1].file))
+        let fingerprint = frameFingerprint(bytes)
+
+        try require(
+            manifest[n-1].id == n &&
+            ocr[n-1].frame == n &&
+            ocr[n-1].sourceFingerprint == fingerprint &&
+            board[n-1].sourceFingerprint == fingerprint &&
+            cards[n-1].sourceFingerprint == fingerprint,
+            "Original frame fingerprint mismatch at \(n)"
+        )
+    }
+
+    guard let roster = physicalRosterCandidate(
+        previous:ocr[233],current:ocr[234],
+        previousBoard:board[233],currentBoard:board[234],
+        previousCards:cards[233],currentCards:cards[234])
+    else { throw Problem("Seven-player roster not recovered") }
+
+    try require(
+        roster.hand == "2873620503" &&
+        roster.rosterFrame == 235 &&
+        roster.clockwiseRing.count == 7 &&
+        roster.clockwiseRing.contains("borschevik") &&
+        roster.clockwiseRing.contains("jarek131") &&
+        roster.dealer == "waterwalkerh2o" &&
+        roster.smallBlind == "Solomon17" &&
+        roster.bigBlind == "AlanCardioDoc",
+        "Dealt-in roster or blind positions incorrect"
+    )
+
+    func observe(_ n:Int,_ proof:PhysicalDealtInRoster)
+        -> [ImmediatePhysicalFold] {
+        immediatePhysicalFoldAt(
+            older:ocr[n-3],
+            previous:ocr[n-2],
+            current:ocr[n-1],
+            olderBoard:board[n-3],
+            previousBoard:board[n-2],
+            currentBoard:board[n-1],
+            olderCards:cards[n-3],
+            previousCards:cards[n-2],
+            currentCards:cards[n-1],
+            roster:proof,
+            rosterOCR:ocr[234],
+            overlays:overlays
+        )
+    }
+
+    let first = observe(236,roster)
+    let second = observe(277,roster)
+
+    try require(
+        first.map({$0.player}) == ["borschevik"] &&
+        second.map({$0.player}) == ["jarek131"] &&
+        first[0].firstMissingFrame == 236 &&
+        second[0].firstMissingFrame == 277,
+        "Immediate physical Fold recognition incorrect"
+    )
+
+    let wrongHand = PhysicalDealtInRoster(
+        hand:"9999999999",
+        rosterFrame:roster.rosterFrame,
+        priorFrame:roster.priorFrame,
+        clockwiseRing:roster.clockwiseRing,
+        dealer:roster.dealer,
+        smallBlind:roster.smallBlind,
+        bigBlind:roster.bigBlind,
+        sourceFingerprints:roster.sourceFingerprints
+    )
+
+    try require(
+        observe(277,wrongHand).isEmpty,
+        "Old table roster leaked into different hand"
+    )
+
+    var lostEvidence = cards
+    let c = cards[275]
+    lostEvidence[275] = FrameCardPairs(
+        frame:c.frame,
+        sourceFingerprint:c.sourceFingerprint,
+        hand:c.hand,pairs:[],faceUpPairs:[]
+    )
+
+    try require(
+        immediatePhysicalFoldAt(
+            older:ocr[274],previous:ocr[275],current:ocr[276],
+            olderBoard:board[274],
+            previousBoard:board[275],
+            currentBoard:board[276],
+            olderCards:cards[274],
+            previousCards:lostEvidence[275],
+            currentCards:cards[276],
+            roster:roster,rosterOCR:ocr[234],
+            overlays:overlays
+        ).isEmpty,
+        "Missing prior card evidence falsely declared Fold"
+    )
+
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent(
+            "pi-f277-roster-"+UUID().uuidString
+        )
+
+    defer { try? FileManager.default.removeItem(at:root) }
+
+    for sub in ["frames","accepted","responses"] {
+        try FileManager.default.createDirectory(
+            at:root.appendingPathComponent(sub),
+            withIntermediateDirectories:true
+        )
+    }
+
+    let recorder = Recorder(
+        directory:root,
+        live:root.appendingPathComponent("live.txt"),
+        verbose:false,
+        localSemanticOnly:true
+    )
+
+    try await recorder.publish()
+
+    for n in 1...353 {
+        let f = manifest[n-1]
+        let bytes = try Data(
+            contentsOf:input.appendingPathComponent(f.file)
+        )
+
+        try require(
+            f.id == n &&
+            frameFingerprint(bytes) == ocr[n-1].sourceFingerprint &&
+            board[n-1].sourceFingerprint == ocr[n-1].sourceFingerprint &&
+            cards[n-1].sourceFingerprint == ocr[n-1].sourceFingerprint,
+            "Original replay fingerprint mismatch at \(n)"
+        )
+
+        try await recorder.add(
+            bytes,start:f.started,end:f.captured,
+            width:f.width,height:f.height,
+            local:ocr[n-1].capture,
+            boardCount:board[n-1].visibleBoardCount,
+            cardBackPairs:cards[n-1].pairs,
+            faceUpCardPairs:cards[n-1].faceUpPairs
+        )
+
+        if n == 236 || n == 277 {
+            let text = try String(contentsOf:
+                root.appendingPathComponent("current_hand.txt"),
+                encoding:.utf8)
+            let player = n == 236 ? "borschevik" : "jarek131"
+
+            try require(
+                text.contains(
+                    "frame \(n): \(player) folds [physical cards disappeared"
+                ),
+                "Fold not displayed at first missing frame \(n)"
+            )
+        }
+
+        if n % 90 == 0 {
+            print("F277_REPLAY_PROGRESS \(n)/353")
+        }
+    }
+
+    try await recorder.finish()
+
+    let events = await recorder.events
+    try require(events == originalEvents,
+        "Previously accepted 27 events changed")
+
+    let checkpoint = try decoder.decode(DurableState.self,
+        from:Data(contentsOf:
+            root.appendingPathComponent(
+                "authoritative_checkpoint.json")))
+
+    try require(
+        checkpoint.cursor == 353 &&
+        checkpoint.commits.flatMap({$0.accepted}) == events,
+        "Durable checkpoint changed"
+    )
+
+    let savedRosters = try decoder.decode(
+        [PhysicalDealtInRoster].self,
+        from:Data(contentsOf:root.appendingPathComponent(
+            "observed_verified_dealt_in_rosters.json")))
+
+    let savedFolds = try decoder.decode(
+        [ImmediatePhysicalFold].self,
+        from:Data(contentsOf:root.appendingPathComponent(
+            "observed_immediate_physical_folds.json")))
+
+    try require(
+        savedRosters.contains(where: {
+            $0.hand == roster.hand &&
+            $0.rosterFrame == 235 &&
+            $0.clockwiseRing.count == 7
+        }) &&
+        savedFolds.contains(where: {
+            $0.hand == roster.hand &&
+            $0.player == "borschevik" &&
+            $0.firstMissingFrame == 236 &&
+            $0.reappearedFrame == nil
+        }) &&
+        savedFolds.contains(where: {
+            $0.hand == roster.hand &&
+            $0.player == "jarek131" &&
+            $0.firstMissingFrame == 277 &&
+            $0.reappearedFrame == nil
+        }),
+        "Physical evidence sidecars incomplete"
+    )
+
+    let before = try Data(contentsOf:
+        root.appendingPathComponent(
+            "observed_immediate_physical_folds.json"))
+
+    let restored = Recorder(
+        directory:root,
+        live:root.appendingPathComponent("live.txt"),
+        verbose:false,
+        localSemanticOnly:true
+    )
+
+    try await restored.publish()
+
+    let recovered = await restored.events
+    let status = await restored.status()
+
+    let after = try Data(contentsOf:
+        root.appendingPathComponent(
+            "observed_immediate_physical_folds.json"))
+
+    try require(
+        recovered == events &&
+        status.stopped &&
+        status.pending == 0 &&
+        status.calls == 0 &&
+        before == after,
+        "Checkpoint recovery changed observation or chronology"
+    )
+
+    print(
+        "F277_ROSTER_FULL_REPLAY_PASS frames=353 " +
+        "verified_roster=7 immediate_folds=2 " +
+        "borschevik=f236 jarek131=f277 " +
+        "old_events=27 changed_events=0 " +
+        "hand_move_gate=YES checkpoint=353 " +
+        "restart=YES api_calls=0"
     )
 }
 #endif
