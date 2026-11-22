@@ -1301,12 +1301,23 @@ actor Recorder {
                         $0.confidence >= 0.8
                     }
 
+                    let independentlyCommitted = events.contains { event in
+                        event.hand == hand &&
+                        event.kind == "action" &&
+                        event.text == "\(player) folds." &&
+                        event.frame <= n
+                    }
+
                     if names.count == 1 &&
                        noShowAtSeat(localOCR[n-1].capture,names[0]) {
-                        // Retract an earlier provisional card-loss
-                        // report if the no-show label arrives later.
+                        // Later no-show evidence cannot reverse
+                        // an already committed physical Fold.
                         immediateFolds[i].currentStatus =
-                            "NO_SHOW_NOT_A_FOLD"
+                            correctedPhysicalFoldStatus(
+                                committed:independentlyCommitted,
+                                laterNoShow:true,
+                                cardsRevisible:false
+                            )
                         continue
                     }
 
@@ -1316,8 +1327,14 @@ actor Recorder {
                                $0,name:names[0]
                            )
                        }) {
+                        // Reappearance alone does not prove active
+                        // participation, nor hero-only card review.
                         immediateFolds[i].currentStatus =
-                            "CARD_REAPPEARED_NOT_CERTIFIED_FOLD"
+                            correctedPhysicalFoldStatus(
+                                committed:independentlyCommitted,
+                                laterNoShow:false,
+                                cardsRevisible:true
+                            )
                         immediateFolds[i].reappearedFrame = n
                     }
                 }
@@ -3001,6 +3018,15 @@ struct FullScreenVision {
                 return
             }
             #endif
+            #if os(macOS)
+            if CommandLine.arguments.count == 3 &&
+                CommandLine.arguments[1] == "--hero-only-fold-236" {
+                try await verifyHeroOnlyFoldVisibility236(
+                    URL(fileURLWithPath:CommandLine.arguments[2])
+                )
+                return
+            }
+            #endif
             if CommandLine.arguments.contains("--self-test") { try await selfTest(); return }
             if CommandLine.arguments.contains("--parallel-self-test") { try await parallelSelfTest(); return }
             #if os(macOS)
@@ -3741,6 +3767,56 @@ func noShowAtSeat(_ capture: LocalOCRCapture, _ seat: LocalOCRLine) -> Bool {
     }
 }
 
+
+// These controls identify the HERO decision seat only.
+// A player can review their own previously folded cards in
+// desaturated form. Opponents cannot invoke that hero-only UI.
+func heroCanStillAct(
+    _ capture: LocalOCRCapture,
+    seat: LocalOCRLine
+) -> Bool {
+    let folds = capture.lines.filter {
+        $0.text.lowercased() == "fold" && $0.confidence >= 0.8
+    }
+    let calls = capture.lines.filter {
+        $0.text.lowercased() == "call" && $0.confidence >= 0.8
+    }
+
+    return folds.contains { fold in
+        fold.x > seat.x &&
+        fold.x-seat.x < 0.16 &&
+        seat.y > fold.y &&
+        seat.y-fold.y < 0.20 &&
+        calls.contains { call in
+            call.x > fold.x &&
+            call.x-fold.x < 0.30 &&
+            abs(call.y-fold.y) < 0.04 &&
+            call.y < seat.y
+        }
+    }
+}
+
+// Do not infer folded-card review from reappearance.
+// It is available only to hero, and requires separate gray-card
+// visual evidence before that specific explanation is certified.
+func correctedPhysicalFoldStatus(
+    committed: Bool,
+    laterNoShow: Bool,
+    cardsRevisible: Bool
+) -> String {
+    if committed && laterNoShow {
+        return "COMMITTED_FOLD_LATER_NO_SHOW_OBSERVED"
+    }
+    if committed && cardsRevisible {
+        return "COMMITTED_FOLD_CARDS_REVISIBLE_CAUSE_UNVERIFIED"
+    }
+    if laterNoShow { return "NO_SHOW_NOT_A_FOLD" }
+    if cardsRevisible {
+        return "CARD_REAPPEARED_NOT_CERTIFIED_FOLD"
+    }
+    return "FOLD_DETECTED_AT_FIRST_CARD_LOSS"
+}
+
 func immediatePhysicalFoldAt(
     older: LocalOCRFrame,
     previous: LocalOCRFrame,
@@ -3806,9 +3882,24 @@ func immediatePhysicalFoldAt(
         guard labels.count == 1 else { continue }
 
         let name = labels[0]
-        // A seat-local DON'T SHOW is not a Fold.
+        // Hero action buttons still present are evidence
+        // against an executed hero Fold. A same-seat Fold overlay
+        // is separate action evidence and must not be suppressed.
+        let seatFoldLabel = overlays.contains { label in
+            label.hand == hand &&
+            label.frame == n &&
+            label.label == "FOLD" &&
+            label.confidence >= 0.8 &&
+            label.previous_name_same_position == player
+        }
+
         guard !noShowAtSeat(previous.capture,name) &&
-              !noShowAtSeat(current.capture,name) else { continue }
+              !noShowAtSeat(current.capture,name) &&
+              !(heroCanStillAct(previous.capture,seat:name) &&
+                heroCanStillAct(current.capture,seat:name) &&
+                !seatFoldLabel)
+        else { continue }
+
         guard a.filter({
             physicalCardPairAt($0,name:name)
         }).count == 1 &&
@@ -8987,5 +9078,218 @@ func verifyNoShowFoldExclusion354(_ input: URL) async throws {
         "frame324_fold_preserved=YES " +
         "authoritative_events=35 unchanged=YES " +
         "checkpoint=354 restart=YES api_calls=0")
+}
+#endif
+
+
+#if os(macOS)
+func verifyHeroOnlyFoldVisibility236(_ input: URL) async throws {
+    let d = JSONDecoder()
+
+    let frames = try d.decode([Frame].self,
+        from:Data(contentsOf:input.appendingPathComponent("frames.json")))
+    let boards = try d.decode([LocalBoardObservation].self,
+        from:Data(contentsOf:input.appendingPathComponent(
+            "local_board_observations.json")))
+    let cards = try d.decode([FrameCardPairs].self,
+        from:Data(contentsOf:input.appendingPathComponent(
+            "observed_card_back_pairs.json")))
+    let old = try d.decode(DurableState.self,
+        from:Data(contentsOf:input.appendingPathComponent(
+            "authoritative_checkpoint.json")))
+    let originalEvents = old.commits.flatMap { $0.accepted }
+
+    try require(
+        frames.count == 236 &&
+        boards.count == 236 &&
+        cards.count == 236 &&
+        old.cursor == 236 &&
+        originalEvents.count == 22,
+        "Original 236-frame recording changed"
+    )
+
+    let ocr = try (1...236).map { n in
+        try d.decode(LocalOCRFrame.self,
+            from:Data(contentsOf:input.appendingPathComponent(
+                String(format:"local_ocr/%06d.json",n))))
+    }
+
+    for n in [52,53,54] {
+        guard let hero = ocr[n-1].capture.lines.first(where: {
+            $0.text == "poker5068" && $0.confidence >= 0.8
+        }), let opponent = ocr[n-1].capture.lines.first(where: {
+            $0.text == "Worldtreez" && $0.confidence >= 0.8
+        }) else {
+            throw Problem("Original seat identity absent at \(n)")
+        }
+
+        try require(
+            heroCanStillAct(ocr[n-1].capture,seat:hero) &&
+            !heroCanStillAct(ocr[n-1].capture,seat:opponent),
+            "Hero-only action-control identity failed at \(n)"
+        )
+    }
+
+    try require(
+        cards[51].faceUpPairs?.count == 1 &&
+        cards[52].faceUpPairs?.isEmpty == true &&
+        cards[53].faceUpPairs?.isEmpty == true &&
+        cards[54].faceUpPairs?.count == 1,
+        "Tooltip face-up-card evidence differs"
+    )
+
+    try require(
+        correctedPhysicalFoldStatus(
+            committed:true,laterNoShow:true,cardsRevisible:false
+        ) == "COMMITTED_FOLD_LATER_NO_SHOW_OBSERVED" &&
+        correctedPhysicalFoldStatus(
+            committed:true,laterNoShow:false,cardsRevisible:true
+        ) == "COMMITTED_FOLD_CARDS_REVISIBLE_CAUSE_UNVERIFIED",
+        "Fold permanence contract failed"
+    )
+
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent(
+            "pi-hero-only-fold-"+UUID().uuidString
+        )
+
+    defer { try? FileManager.default.removeItem(at:root) }
+
+    for sub in ["frames","accepted","responses"] {
+        try FileManager.default.createDirectory(
+            at:root.appendingPathComponent(sub),
+            withIntermediateDirectories:true
+        )
+    }
+
+    let recorder = Recorder(
+        directory:root,
+        live:root.appendingPathComponent("live.txt"),
+        verbose:false,
+        localSemanticOnly:true
+    )
+
+    try await recorder.publish()
+
+    for n in 1...236 {
+        let f = frames[n-1]
+        let bytes = try Data(
+            contentsOf:input.appendingPathComponent(f.file))
+        let fingerprint = frameFingerprint(bytes)
+
+        try require(
+            f.id == n &&
+            ocr[n-1].frame == n &&
+            ocr[n-1].sourceFingerprint == fingerprint &&
+            boards[n-1].sourceFingerprint == fingerprint &&
+            cards[n-1].sourceFingerprint == fingerprint,
+            "Original frame fingerprint mismatch at \(n)"
+        )
+
+        try await recorder.add(
+            bytes,start:f.started,end:f.captured,
+            width:f.width,height:f.height,
+            local:ocr[n-1].capture,
+            boardCount:boards[n-1].visibleBoardCount,
+            cardBackPairs:cards[n-1].pairs,
+            faceUpCardPairs:cards[n-1].faceUpPairs
+        )
+
+        if n == 53 || n == 54 {
+            let display = try String(
+                contentsOf:root.appendingPathComponent("current_hand.txt"),
+                encoding:.utf8
+            )
+            try require(
+                !display.contains("frame 53: poker5068 folds"),
+                "Tooltip incorrectly published an immediate Fold"
+            )
+        }
+
+        if n == 129 {
+            let display = try String(
+                contentsOf:root.appendingPathComponent("current_hand.txt"),
+                encoding:.utf8
+            )
+            try require(
+                display.contains("Worldtreez folds."),
+                "Later DON'T SHOW removed the committed Fold"
+            )
+        }
+    }
+
+    try await recorder.finish()
+
+    let actualEvents = await recorder.events
+    let checkpoint = try d.decode(DurableState.self,
+        from:Data(contentsOf:root.appendingPathComponent(
+            "authoritative_checkpoint.json")))
+    let physical = try d.decode([ImmediatePhysicalFold].self,
+        from:Data(contentsOf:root.appendingPathComponent(
+            "observed_immediate_physical_folds.json")))
+    let receipts = try d.decode([FoldPublicationReceipt].self,
+        from:Data(contentsOf:root.appendingPathComponent(
+            "observed_physical_fold_publications.json")))
+
+    try require(
+        actualEvents == originalEvents &&
+        checkpoint.cursor == 236 &&
+        checkpoint.commits.flatMap({$0.accepted}) == originalEvents,
+        "Authoritative action chronology changed"
+    )
+
+    try require(
+        !physical.contains(where: {
+            $0.player == "poker5068" &&
+            $0.firstMissingFrame == 53
+        }) &&
+        physical.contains(where: {
+            $0.player == "poker5068" &&
+            $0.firstMissingFrame == 77
+        }) &&
+        physical.contains(where: {
+            $0.player == "Worldtreez" &&
+            $0.firstMissingFrame == 125 &&
+            $0.currentStatus ==
+                "COMMITTED_FOLD_LATER_NO_SHOW_OBSERVED"
+        }) &&
+        !receipts.contains(where: {
+            $0.player == "poker5068" &&
+            $0.firstMissingFrame == 53
+        }),
+        "Hero false Fold or committed opponent Fold regression"
+    )
+
+    let before = try Data(contentsOf:
+        root.appendingPathComponent(
+            "observed_immediate_physical_folds.json"))
+
+    let restored = Recorder(
+        directory:root,
+        live:root.appendingPathComponent("live.txt"),
+        verbose:false,
+        localSemanticOnly:true
+    )
+    try await restored.publish()
+
+    let recovered = await restored.events
+    let after = try Data(contentsOf:
+        root.appendingPathComponent(
+            "observed_immediate_physical_folds.json"))
+
+    try require(
+        before == after && recovered == originalEvents,
+        "Restart modified Fold history"
+    )
+
+    print(
+        "HERO_ONLY_FOLD_VISIBILITY_236_PASS " +
+        "frames=236 false_fold_f53=0 " +
+        "real_hero_fold_f77=YES " +
+        "worldtreez_committed_fold_f125=YES " +
+        "later_no_show_does_not_retract=YES " +
+        "opponent_peek_assumed=NO " +
+        "events=22 checkpoint=236 restart=YES api_calls=0"
+    )
 }
 #endif

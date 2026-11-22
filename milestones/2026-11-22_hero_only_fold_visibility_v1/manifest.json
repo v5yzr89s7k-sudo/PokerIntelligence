@@ -1,0 +1,20 @@
+{
+  "actual_hero_fold": 77,
+  "api_calls": 0,
+  "authoritative_histories_preserved": [
+    22,
+    35,
+    27,
+    25,
+    46
+  ],
+  "false_hero_fold": 53,
+  "folded_card_review": "HERO ONLY; grayscale detection unverified",
+  "later_no_show": 129,
+  "new_authoritative_events": 0,
+  "opponent_committed_fold": 125,
+  "parent_source_sha256": "33e6046f65a76e6ce4af49128ce2a59fc4e1cb7402db22e8102ba73b9dfba2c8",
+  "recording": "pi_native_fold_latency_20261122_174226_27146",
+  "regression_suites_passed": 19,
+  "source_sha256": "04317f5a8b72a9ad18cac179f6f03e495141afe4e21b131b78f6181ea419d269"
+}
