@@ -1,0 +1,9 @@
+{
+  "action_publication": "NONE",
+  "ambiguous_values": "UNRESOLVED",
+  "api_calls": 0,
+  "frames": 943,
+  "module_sha256": "af0870e7bbb6df1749d7200ac6750a0b6a16a7b64e28dfdfed8c37665a942472",
+  "production_sha256": "04317f5a8b72a9ad18cac179f6f03e495141afe4e21b131b78f6181ea419d269",
+  "purpose": "Read-only native numeric evidence"
+}

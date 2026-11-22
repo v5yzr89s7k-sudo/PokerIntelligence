@@ -1,0 +1,36 @@
+{
+  "authoritative_actions_created": 0,
+  "balanced_reference_frames": [
+    314,
+    315
+  ],
+  "determinism": "3/3 per recording",
+  "frames_verified": 943,
+  "network_calls": 0,
+  "recordings": [
+    353,
+    354,
+    236
+  ],
+  "status_counts": {
+    "236": {
+      "BALANCED_NO_WAGERS": 57,
+      "BALANCED_WAGERS": 135,
+      "INCOMPLETE_OCR": 27,
+      "UNRESOLVED_ARITHMETIC": 17
+    },
+    "353": {
+      "BALANCED_NO_WAGERS": 108,
+      "BALANCED_WAGERS": 196,
+      "INCOMPLETE_OCR": 46,
+      "UNRESOLVED_ARITHMETIC": 2
+    },
+    "354": {
+      "BALANCED_NO_WAGERS": 98,
+      "BALANCED_WAGERS": 100,
+      "INCOMPLETE_OCR": 85,
+      "UNRESOLVED_ARITHMETIC": 58
+    }
+  },
+  "unresolved_reference_frame": 334
+}
