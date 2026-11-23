@@ -1,0 +1,49 @@
+{
+  "actions_created" : 0,
+  "amounts" : [
+    {
+      "from_frame" : 249,
+      "hand" : "2873620503",
+      "not_authoritative" : true,
+      "observed_contribution_bb" : "2.10",
+      "overlay" : "RAISE",
+      "player" : "poker5068",
+      "raise_to" : "UNVERIFIED",
+      "sourceFingerprints" : [
+        "sha256:6293847b7900957ae6040b142750c7e0f96346275956155e5508fb0536d8a527",
+        "sha256:163a57153b18830ae6dd67f5811fdd9ddfafc4277115c0fc3b45cc4d53c5f97f"
+      ],
+      "to_frame" : 250
+    },
+    {
+      "from_frame" : 304,
+      "hand" : "2873620503",
+      "not_authoritative" : true,
+      "observed_contribution_bb" : "3.33",
+      "overlay" : "BET",
+      "player" : "AlanCardioDoc",
+      "raise_to" : "UNVERIFIED",
+      "sourceFingerprints" : [
+        "sha256:856576df3ec2f31ff4e221e7334e376da8bece636f4fa0477285468f43d17d8d",
+        "sha256:179a73e9d7e1615796fa14f74b8c91b5f42fe5449dbafeff6f47dc6e8b072102"
+      ],
+      "to_frame" : 305
+    },
+    {
+      "from_frame" : 313,
+      "hand" : "2873620503",
+      "not_authoritative" : true,
+      "observed_contribution_bb" : "8.16",
+      "overlay" : "RAISE",
+      "player" : "poker5068",
+      "raise_to" : "UNVERIFIED",
+      "sourceFingerprints" : [
+        "sha256:d875920014bce36444ac2384f3b355eed0a1064195c8f17fdbc8ff83c30e238f",
+        "sha256:fb1472c0c06a52df42e124f5de6e472d20396fca3aec414285078624c780cd84"
+      ],
+      "to_frame" : 314
+    }
+  ],
+  "schema" : "PI_NATIVE_WAGER_PROVENANCE_V1",
+  "unreviewed_events_admitted" : 0
+}
