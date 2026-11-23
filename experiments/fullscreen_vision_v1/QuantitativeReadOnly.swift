@@ -763,6 +763,120 @@ struct NumericFollowCursor {
     }
 }
 
+// Read-only numeric display. The Recorder remains the sole owner of
+// current_hand.txt and all authoritative poker actions.
+func numericHandAtFrame(_ root:URL,_ frame:Int) -> String? {
+    guard frame>=1,let doc=try? loadOCR(root,frame) else {return nil}
+    let hands=parseLines(doc).compactMap{captureMatch(rxHand,$0.text)}
+    return hands.count==1 ? hands[0] : nil
+}
+
+func renderNumericState(_ snapshots:[[String:Any]], currentHand:String?, through:Int) -> String {
+    var lines=[
+        "NATIVE NUMERIC OBSERVATIONS — READ-ONLY",
+        "Analyzed through frame: \(through)",
+        "Authoritative actions: NONE — see current_hand.txt"
+    ]
+    guard let hand=currentHand else {
+        lines.append("Current hand: UNKNOWN — numeric observations withheld")
+        return lines.joined(separator:"\n")+"\n"
+    }
+    lines.append("Current hand: \(hand)")
+    guard let latest=snapshots.last(where: { $0["hand"] as? String == hand }),
+          let frame=latest["frame"] as? Int, frame<=through else {
+        lines.append("No frame-owned numeric OCR available for this hand")
+        return lines.joined(separator:"\n")+"\n"
+    }
+    lines.append("Latest numeric evidence frame: \(frame) (age \(through-frame) frames)")
+    let fp=latest["source_fingerprint"] as? String ?? "UNKNOWN"
+    lines.append("Original screenshot fingerprint: \(fp)")
+    lines.append("Pot OCR: \(latest["pot_bb"] as? String ?? "UNKNOWN") BB")
+    lines.append("Total OCR: \(latest["total_bb"] as? String ?? "UNKNOWN") BB")
+    lines.append("Outstanding visible chips OCR: \(latest["expected_outstanding_bb"] as? String ?? "UNKNOWN") BB")
+    lines.append("Arithmetic status: \(latest["status"] as? String ?? "UNRESOLVED")")
+    lines.append("VISIBLE CHIP LABELS — NOT BET OR RAISE ACTIONS")
+    let wagers=latest["wagers"] as? [[String:Any]] ?? []
+    if wagers.isEmpty {lines.append("  None reliably associated with a seat")}
+    for wager in wagers {
+        let amount=wager["amount_bb"] as? String ?? "UNKNOWN"
+        let identity=wager["identity_status"] as? String ?? "UNRESOLVED"
+        let name=wager["player"] as? String ?? ""
+        let seat=wager["seat_label"] as? String ?? ""
+        let owner=(identity=="EARLIER_FRAME_VERIFIED" &&
+                   name==seat && !name.isEmpty &&
+                   !isInterfaceLabel(name) && !name.hasPrefix("UNRESOLVED_"))
+                   ? name+" [earlier-frame verified seat]"
+                   : "UNKNOWN OWNER [unresolved physical seat]"
+        lines.append("  \(amount) BB — \(owner)")
+    }
+    let extra=latest["unassigned_numeric_labels"] as? [[String:Any]] ?? []
+    if !extra.isEmpty {
+        lines.append("UNASSIGNED NUMBER LABELS — NOT A WAGER")
+        for item in extra {
+            lines.append("  \(item["amount_bb"] as? String ?? "UNKNOWN") BB — source ambiguous")
+        }
+    }
+    lines.append("PROVENANCE: screenshot OCR only; no numeric actions committed")
+    return lines.joined(separator:"\n")+"\n"
+}
+
+func writeNumericState(_ root:URL, through:Int, snapshots:[[String:Any]], to output:URL) throws {
+    guard output.lastPathComponent == "observed_numeric_state.txt" else {
+        throw NSError(domain:"NUMERIC_TEXT_OUTPUT_OWNERSHIP",code:1)
+    }
+    let text=renderNumericState(snapshots,currentHand:numericHandAtFrame(root,through),through:through)
+    try Data(text.utf8).write(to:output,options:.atomic)
+}
+
+func numericPresentationSelfTest() throws {
+    let a:[String:Any]=[
+        "hand":"TEST_HAND_1", "frame":41,
+        "pot_bb":"6.66","total_bb":"18.15",
+        "expected_outstanding_bb":"11.49", "status":"BALANCED_WAGERS",
+        "source_fingerprint":"sha256:fixture",
+        "wagers":[
+            ["amount_bb":"3.33","identity_status":"EARLIER_FRAME_VERIFIED", "seat_label":"AlanCardioDoc", "player":"AlanCardioDoc"],
+            ["amount_bb":"8.16","identity_status":"UNRESOLVED","seat_label":"UNVERIFIED_SEAT"]
+        ],
+        "unassigned_numeric_labels":[["amount_bb":"3.33"]]
+    ]
+    let b:[String:Any]=[
+        "hand":"TEST_HAND_2", "frame":50, "pot_bb":"1",
+        "total_bb":"2.5", "source_fingerprint":"sha256:other",
+        "status":"BALANCED_WAGERS", "wagers":[],
+        "unassigned_numeric_labels":[]
+    ]
+    let view=renderNumericState([a,b],currentHand:"TEST_HAND_1",through:52)
+    guard view.contains("3.33 BB — AlanCardioDoc [earlier-frame verified seat]"),
+          view.contains("8.16 BB — UNKNOWN OWNER"),
+          view.contains("UNASSIGNED NUMBER LABELS — NOT A WAGER"),
+          view.contains("age 11 frames"),
+          !view.contains("Current hand: TEST_HAND_2") else {
+        throw NSError(domain:"NUMERIC_PRESENTATION_IDENTITY",code:1)
+    }
+    var forged=a
+    forged["wagers"]=[
+        ["amount_bb":"1","identity_status":"EARLIER_FRAME_VERIFIED","seat_label":"RAISE","player":"RAISE"],
+        ["amount_bb":"0.5","identity_status":"EARLIER_FRAME_VERIFIED","seat_label":"Betliio","player":"BetliiO"]
+    ]
+    let forgedView=renderNumericState([forged],currentHand:"TEST_HAND_1",through:42)
+    guard forgedView.components(separatedBy:"UNKNOWN OWNER").count==3,
+          !forgedView.contains("RAISE [earlier-frame verified seat]"),
+          !forgedView.contains("BetliiO [earlier-frame verified seat]") else {
+        throw NSError(domain:"NUMERIC_PRESENTATION_FALSE_IDENTITY",code:2)
+    }
+    let different=renderNumericState([a],currentHand:"TEST_HAND_2",through:52)
+    guard different.contains("No frame-owned numeric OCR available for this hand"),
+          !different.contains("6.66 BB") else {
+        throw NSError(domain:"NUMERIC_PRESENTATION_CROSS_HAND",code:3)
+    }
+    let unknown=renderNumericState([a],currentHand:nil,through:52)
+    guard unknown.contains("Current hand: UNKNOWN"),!unknown.contains("6.66 BB") else {
+        throw NSError(domain:"NUMERIC_PRESENTATION_UNKNOWN_HAND",code:4)
+    }
+    print("NUMERIC_PRESENTATION_SELF_TEST_PASS unknown=YES forged_overlay_blocked=YES cross_hand_blocked=YES action_publication=0")
+}
+
 func numericFollowerReplayTest(_ root: URL, _ output: URL) throws {
     guard let frames = try jsonFile(
         root.appendingPathComponent("frames.json")
@@ -825,6 +939,9 @@ func followNumericSession(
             if analyzed > cursor.through {
                 try cursor.consume(frames:frames,through:analyzed)
                 try cursor.data().write(to:output,options:.atomic)
+                try writeNumericState(root,through:cursor.through,
+                    snapshots:cursor.snapshots,
+                    to:root.appendingPathComponent("observed_numeric_state.txt"))
 
                 lastObserved = analyzed
 
@@ -845,6 +962,11 @@ func followNumericSession(
                     )
                 }
 
+                if !FileManager.default.fileExists(atPath:root.appendingPathComponent("observed_numeric_state.txt").path) {
+                    try writeNumericState(root,through:cursor.through,
+                        snapshots:cursor.snapshots,
+                        to:root.appendingPathComponent("observed_numeric_state.txt"))
+                }
                 print(
                     "NUMERIC_FOLLOW_PASS frames=\(cursor.through) actions=0"
                 )
@@ -864,7 +986,19 @@ func followNumericSession(
 @main struct QuantitativeReadOnly {
     static func main() throws {
         let args=CommandLine.arguments
-        if args.count==4 && args[1]=="--native-roster-proof" {
+        if args.count==2 && args[1]=="--numeric-presentation-self-test" {
+            try numericPresentationSelfTest()
+        } else if args.count==5 && args[1]=="--render-numeric-state" {
+            let root=URL(fileURLWithPath:args[2])
+            guard let obj=try jsonFile(URL(fileURLWithPath:args[3])) as? [String:Any],
+                  let snapshots=obj["numeric_snapshots"] as? [[String:Any]],
+                  let through=obj["total_frames"] as? Int else {
+                throw NSError(domain:"NUMERIC_REPORT_SCHEMA",code:1)
+            }
+            try writeNumericState(root,through:through,snapshots:snapshots,
+                to:URL(fileURLWithPath:args[4]))
+            print("NUMERIC_PRESENTATION_PASS frame=\(through) actions=0")
+        } else if args.count==4 && args[1]=="--native-roster-proof" {
             guard let n=Int(args[3]) else {throw NSError(domain:"BAD_FRAME",code:1)}
             let items=allNumericRosters(URL(fileURLWithPath:args[2]),through:n)
             let data=try JSONSerialization.data(withJSONObject:items,options:[.prettyPrinted,.sortedKeys])

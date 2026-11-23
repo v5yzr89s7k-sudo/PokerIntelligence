@@ -1,0 +1,37 @@
+{
+  "api_calls": 0,
+  "authoritative_actions_created": 0,
+  "never_writes_current_hand": true,
+  "observer_sha256": "04317f5a8b72a9ad18cac179f6f03e495141afe4e21b131b78f6181ea419d269",
+  "parent_sha256": "4628b6a396a2ff4208297242fd6ce9fe941ba03cca3d6ea5363bcb7b47ed1a11",
+  "regressions": {
+    "live236": {
+      "frames": 236,
+      "full_equals_incremental": true,
+      "numeric_unchanged": true
+    },
+    "old236": {
+      "frames": 236,
+      "full_equals_incremental": true,
+      "numeric_unchanged": true
+    },
+    "old237": {
+      "frames": 237,
+      "full_equals_incremental": true,
+      "numeric_unchanged": true
+    },
+    "old353": {
+      "frames": 353,
+      "full_equals_incremental": true,
+      "numeric_unchanged": true
+    },
+    "old354": {
+      "frames": 354,
+      "full_equals_incremental": true,
+      "numeric_unchanged": true
+    }
+  },
+  "source_frames_verified": 1416,
+  "source_sha256": "88e60aafaf8b2e8995ba10b627da15567523c73b19cc6a1f57b1b28eb2cc6630",
+  "test": "Native follower writes separate observed_numeric_state.txt"
+}
