@@ -1369,6 +1369,7 @@ actor Recorder {
     var blindPositions = [String:BlindButtonEvidence]()
     var blindEvidenceExaminedThrough = 1
     var physicalRosters = [String:PhysicalDealtInRoster]()
+    var namedCardEvidence = [String:NamedCardPresence]()
     var immediateFolds = [ImmediatePhysicalFold]()
     var physicalExaminedThrough = 0
 
@@ -1394,6 +1395,45 @@ actor Recorder {
         guard physicalExaminedThrough < count else { return }
 
         for n in (physicalExaminedThrough+1)...count {
+            if n >= 2 && frames.count >= n {
+                let fresh = namedCardPresence(
+                    previous:localOCR[n-2],
+                    current:localOCR[n-1],
+                    previousBoard:localBoard[n-2],
+                    currentBoard:localBoard[n-1],
+                    previousCards:localCardBacks[n-2],
+                    currentCards:localCardBacks[n-1]
+                ).filter {
+                    namedCardEvidence[
+                        $0.hand + "|" + $0.player
+                    ] == nil
+                }
+
+                if !fresh.isEmpty {
+                    func original(_ n:Int,_ fp:String) -> Bool {
+                        let frame=frames[n-1]
+                        guard frame.id == n,
+                              frame.file.hasPrefix("frames/"),
+                              !frame.file.contains(".."),
+                              let bytes=try? Data(contentsOf:
+                                directory.appendingPathComponent(frame.file))
+                        else { return false }
+                        return frameFingerprint(bytes)==fp
+                    }
+
+                    if original(
+                        n-1,localOCR[n-2].sourceFingerprint
+                    ) && original(
+                        n,localOCR[n-1].sourceFingerprint
+                    ) {
+                        for row in fresh {
+                            namedCardEvidence[
+                                row.hand + "|" + row.player
+                            ]=row
+                        }
+                    }
+                }
+            }
             if n >= 2,
                let candidate = physicalRosterCandidate(
                    previous:localOCR[n-2],
@@ -2147,6 +2187,17 @@ actor Recorder {
         try encoded(blindPositions.values.sorted { $0.firstFrame < $1.firstFrame }).write(
             to:directory.appendingPathComponent("observed_button_from_blinds.json"),
             options:.atomic)
+        // Recorder-owned observation only; no action authority.
+        try encoded(namedCardEvidence.values.sorted {
+            $0.hand == $1.hand
+                ? $0.player < $1.player
+                : $0.hand < $1.hand
+        }).write(
+            to:directory.appendingPathComponent(
+                "observed_named_hole_card_pairs.json"),
+            options:.atomic
+        )
+
         try encoded(
             physicalRosters.values.sorted {
                 $0.rosterFrame < $1.rosterFrame
@@ -3288,11 +3339,235 @@ func readOnlyRecorderWagerRegression(_ root:URL) throws {
     print("RECORDER_READ_ONLY_WAGER_TEST_PASS frames=197_WITHHELD,250_2.1,305_3.33,314_8.16 negative=8 actions_created=0")
 }
 
+import Foundation
+
+func readOnlyNamedCardRegression(_ root:URL) throws {
+    let dec = JSONDecoder()
+
+    let boards = try dec.decode(
+        [LocalBoardObservation].self,
+        from:Data(contentsOf:root.appendingPathComponent(
+            "local_board_observations.json"))
+    )
+    let cards = try dec.decode(
+        [FrameCardPairs].self,
+        from:Data(contentsOf:root.appendingPathComponent(
+            "observed_card_back_pairs.json"))
+    )
+
+    try require(
+        boards.count == 354 && cards.count == 354,
+        "NAMED_CARD_RECORDING_LENGTH"
+    )
+
+    func ocr(_ n:Int) throws -> LocalOCRFrame {
+        try dec.decode(
+            LocalOCRFrame.self,
+            from:Data(contentsOf:root.appendingPathComponent(
+                String(format:"local_ocr/%06d.json",n)))
+        )
+    }
+
+    let ocrs = try (1...354).map { try ocr($0) }
+    let manifest = try dec.decode(
+        [Frame].self,
+        from:Data(contentsOf:root.appendingPathComponent("frames.json"))
+    )
+    try require(manifest.count == 354,"MANIFEST_LENGTH")
+
+    // Original JPEG provenance for the decisive second-hand pair.
+    for n in [166,167] {
+        let frame = manifest[n-1]
+        let relative = frame.file
+
+        try require(
+            frame.id == n &&
+            relative.hasPrefix("frames/") &&
+            !relative.contains(".."),
+            "INVALID_FRAME_PATH"
+        )
+
+        let bytes = try Data(contentsOf:
+            root.appendingPathComponent(relative))
+        let fingerprint = frameFingerprint(bytes)
+
+        try require(
+            fingerprint == ocrs[n-1].sourceFingerprint &&
+            fingerprint == boards[n-1].sourceFingerprint &&
+            fingerprint == cards[n-1].sourceFingerprint,
+            "ORIGINAL_FRAME_PROVENANCE"
+        )
+    }
+
+    var earliest = [String:NamedCardPresence]()
+
+    for i in 1..<354 {
+        let found = namedCardPresence(
+            previous:ocrs[i-1],
+            current:ocrs[i],
+            previousBoard:boards[i-1],
+            currentBoard:boards[i],
+            previousCards:cards[i-1],
+            currentCards:cards[i]
+        )
+
+        for row in found {
+            let key = row.hand + "|" + row.player
+            if earliest[key] == nil {
+                earliest[key] = row
+            }
+        }
+    }
+
+    let names = Set([
+        "Santiago1516jf","GeauxTigaz","luckycryak",
+        "urchdog07","Kkos101","poker5068"
+    ])
+    let hands = [
+        "2874688303":8,
+        "2874689539":167
+    ]
+
+    for (hand,frame) in hands {
+        let rows = earliest.values.filter {$0.hand == hand}
+
+        try require(
+            rows.count == 6 &&
+            Set(rows.map {$0.player}) == names &&
+            rows.allSatisfy {
+                $0.confirmedFrame == frame &&
+                $0.priorFrame == frame-1
+            },
+            "HAND_CARD_PROOF_CHANGED"
+        )
+    }
+
+    try require(
+        earliest.count == 12 &&
+        !earliest.values.contains {
+            $0.player.uppercased().contains("SITTING")
+        },
+        "UNSUPPORTED_PLAYER_IDENTITY"
+    )
+
+    let a=ocrs[165], b=ocrs[166]
+    let ba=boards[165], bb=boards[166]
+    let ca=cards[165], cb=cards[166]
+
+    func attempt(
+        _ x:LocalOCRFrame,_ y:LocalOCRFrame,
+        _ u:LocalBoardObservation,_ v:LocalBoardObservation,
+        _ p:FrameCardPairs,_ q:FrameCardPairs
+    ) -> [NamedCardPresence] {
+        namedCardPresence(
+            previous:x,current:y,
+            previousBoard:u,currentBoard:v,
+            previousCards:p,currentCards:q
+        )
+    }
+
+    let forged=LocalOCRFrame(
+        frame:b.frame,
+        sourceFingerprint:"sha256:"+String(repeating:"0",count:64),
+        capture:b.capture
+    )
+    try require(
+        attempt(a,forged,ba,bb,ca,cb).isEmpty,
+        "FORGED_FINGERPRINT_ACCEPTED"
+    )
+
+    let empty=FrameCardPairs(
+        frame:cb.frame,
+        sourceFingerprint:cb.sourceFingerprint,
+        hand:cb.hand,pairs:[],faceUpPairs:[]
+    )
+    try require(
+        attempt(a,b,ba,bb,ca,empty).isEmpty,
+        "MISSING_CARDS_ACCEPTED"
+    )
+
+    let partial=FrameCardPairs(
+        frame:cb.frame,
+        sourceFingerprint:cb.sourceFingerprint,
+        hand:cb.hand,
+        pairs:Array(cb.pairs.dropLast()),
+        faceUpPairs:cb.faceUpPairs
+    )
+    let five=attempt(a,b,ba,bb,ca,partial)
+
+    try require(
+        five.count == 5 &&
+        !five.contains {$0.player == "Kkos101"},
+        "UNCERTAINTY_NOT_LOCALIZED"
+    )
+
+    let maskedCapture=LocalOCRCapture(
+        elapsed_ms:b.capture.elapsed_ms,
+        lines:b.capture.lines.map { row in
+            row.text == "Kkos101"
+            ? LocalOCRLine(
+                text:"SITTING OUT",
+                confidence:row.confidence,
+                x:row.x,y:row.y)
+            : row
+        },
+        error:b.capture.error
+    )
+    let masked=LocalOCRFrame(
+        frame:b.frame,
+        sourceFingerprint:b.sourceFingerprint,
+        capture:maskedCapture
+    )
+    let maskedResults=attempt(a,masked,ba,bb,ca,cb)
+
+    try require(
+        maskedResults.count == 5 &&
+        !maskedResults.contains {
+            $0.player == "Kkos101" ||
+            $0.player == "SITTING OUT"
+        },
+        "MASKED_NAME_WAS_INVENTED"
+    )
+
+    try require(
+        attempt(
+            ocrs[158],ocrs[159],
+            boards[158],boards[159],
+            cards[158],cards[159]
+        ).isEmpty,
+        "CROSS_HAND_IDENTITY_REUSE"
+    )
+
+    try require(
+        attempt(
+            ocrs[200],ocrs[201],
+            boards[200],boards[201],
+            cards[200],cards[201]
+        ).isEmpty,
+        "STREET_BOUNDARY_PROOF"
+    )
+
+    try require(
+        attempt(b,b,bb,bb,cb,cb).isEmpty,
+        "SAME_FRAME_PROOF"
+    )
+
+    print(
+        "NAMED_CARD_MEMBERSHIP_PASS hand1=6@8 hand2=6@167 negative=7 unknown_blind=WITHHELD actions_created=0"
+    )
+}
+
 @main
 struct FullScreenVision {
     @MainActor static func main() async {
         setbuf(stdout, nil)
         do {
+            if CommandLine.arguments.count == 3 &&
+                CommandLine.arguments[1] == "--named-card-membership-test" {
+                try readOnlyNamedCardRegression(
+                    URL(fileURLWithPath:CommandLine.arguments[2]))
+                return
+            }
             if CommandLine.arguments.count == 3 &&
                 CommandLine.arguments[1] == "--recorder-wager-proof-test" {
                 try readOnlyRecorderWagerRegression(
@@ -3955,6 +4230,132 @@ func bestBlindButtonEvidence(_ frames: [LocalOCRFrame]) -> [BlindButtonEvidence]
 }
 
 
+
+import Foundation
+
+struct NamedCardPresence: Codable, Equatable {
+    let hand: String
+    let player: String
+    let priorFrame: Int
+    let confirmedFrame: Int
+    let sourceFingerprints: [String]
+    let cardX: Double
+    let cardY: Double
+    let basis: String
+}
+
+// Per-seat observation, independent of dealer and blind positions.
+// Never creates a poker action or a complete positional roster.
+func namedCardPresence(
+    previous: LocalOCRFrame, current: LocalOCRFrame,
+    previousBoard: LocalBoardObservation,
+    currentBoard: LocalBoardObservation,
+    previousCards: FrameCardPairs,
+    currentCards: FrameCardPairs
+) -> [NamedCardPresence] {
+
+    guard previous.frame + 1 == current.frame,
+          previous.capture.error == nil,
+          current.capture.error == nil,
+          let hand = currentLocalHand(current.capture),
+          currentLocalHand(previous.capture) == hand,
+          previous.sourceFingerprint != current.sourceFingerprint,
+          previousBoard.hand == hand,
+          currentBoard.hand == hand,
+          previousBoard.frame == previous.frame,
+          currentBoard.frame == current.frame,
+          previousBoard.visibleBoardCount == 0,
+          currentBoard.visibleBoardCount == 0,
+          previousCards.hand == hand,
+          currentCards.hand == hand,
+          previousCards.frame == previous.frame,
+          currentCards.frame == current.frame,
+          previousBoard.sourceFingerprint == previous.sourceFingerprint,
+          currentBoard.sourceFingerprint == current.sourceFingerprint,
+          previousCards.sourceFingerprint == previous.sourceFingerprint,
+          currentCards.sourceFingerprint == current.sourceFingerprint
+    else { return [] }
+
+    let older = previousCards.pairs + (previousCards.faceUpPairs ?? [])
+    let newer = currentCards.pairs + (currentCards.faceUpPairs ?? [])
+
+    func uniqueStack(
+        _ lines: [LocalOCRLine],
+        _ name: LocalOCRLine
+    ) -> Bool {
+        lines.filter { line in
+            line.confidence >= 0.8 &&
+            abs(line.x-name.x) < 0.028 &&
+            name.y-line.y > 0.025 &&
+            name.y-line.y < 0.058 &&
+            line.text.range(
+                of: "^[0-9]{1,4}(\\.[0-9]{1,3})?\\s+BB$",
+                options: [.regularExpression,.caseInsensitive]
+            ) != nil
+        }.count == 1
+    }
+
+    var matched = [(NamedCardPresence,Int,Int)]()
+
+    for now in current.capture.lines {
+        let name = now.text.trimmingCharacters(in: .whitespaces)
+
+        guard now.confidence >= 0.8,
+              plausibleACRPlayerName(name),
+              current.capture.lines.filter({
+                  $0.text == name && $0.confidence >= 0.8
+              }).count == 1,
+              let prior = previous.capture.lines.first(where: {
+                  $0.text == name &&
+                  $0.confidence >= 0.8 &&
+                  abs($0.x-now.x) < 0.018 &&
+                  abs($0.y-now.y) < 0.018
+              }),
+              previous.capture.lines.filter({
+                  $0.text == name && $0.confidence >= 0.8
+              }).count == 1,
+              uniqueStack(previous.capture.lines,prior),
+              uniqueStack(current.capture.lines,now)
+        else { continue }
+
+        let before = older.indices.filter {
+            physicalCardPairAt(older[$0],name:prior)
+        }
+        let after = newer.indices.filter {
+            physicalCardPairAt(newer[$0],name:now)
+        }
+
+        guard before.count == 1,
+              after.count == 1,
+              abs(older[before[0]].x-newer[after[0]].x) < 0.018,
+              abs(older[before[0]].y-newer[after[0]].y) < 0.018
+        else { continue }
+
+        let observation = NamedCardPresence(
+            hand:hand,
+            player:name,
+            priorFrame:previous.frame,
+            confirmedFrame:current.frame,
+            sourceFingerprints:[
+                previous.sourceFingerprint,
+                current.sourceFingerprint
+            ],
+            cardX:newer[after[0]].x,
+            cardY:newer[after[0]].y,
+            basis:"TWO_SAME_HAND_NAMED_CARD_PAIR_FRAMES; NO_BLIND_OR_POSITION_CLAIM"
+        )
+
+        matched.append((observation,before[0],after[0]))
+    }
+
+    return matched.filter { item in
+        matched.filter {$0.1 == item.1}.count == 1 &&
+        matched.filter {$0.2 == item.2}.count == 1 &&
+        matched.filter {
+            $0.0.player == item.0.player
+        }.count == 1
+    }.map {$0.0}.sorted {$0.player < $1.player}
+}
 
 struct PhysicalDealtInRoster: Codable, Equatable {
     let hand: String

@@ -1,0 +1,19 @@
+{
+  "authoritative_actions_created": 0,
+  "determinism": "3/3",
+  "earliest_proof_frames": {
+    "2874688303": 8,
+    "2874689539": 167
+  },
+  "hand_2874688303_named_card_pairs": 6,
+  "hand_2874689539_named_card_pairs": 6,
+  "hand_history_changed": false,
+  "negative_tests": 7,
+  "new_source_sha256": "f2359a6a2dbc15ee019d7daf0cad7511df35d1d9506363ed38b19c78257cd657",
+  "parent_commit": "e09827c6881dce84d441aa9a3f394dfd51a58fe1",
+  "previous_source_sha256": "754862527a884bbc0dfd8b934328f93aa2294d182493035f35b2adab8027c4c3",
+  "rapid_action_regression": "3/3",
+  "read_only_sidecar": "observed_named_hole_card_pairs.json",
+  "second_hand_big_blind_identity": "UNRESOLVED",
+  "wager_regression": "3/3"
+}
