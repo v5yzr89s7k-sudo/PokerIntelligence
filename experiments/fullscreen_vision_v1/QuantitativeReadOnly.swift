@@ -30,14 +30,21 @@ struct NumericSnapshot {
     let extraneous: [Amount]
     let status: String
     let expectedOutstanding: Int?
-    func jsonValue() -> [String: Any] {
+    func jsonValue(unknownSeatAnchors:[(Double,Double)] = []) -> [String: Any] {
         var d: [String:Any] = ["hand":hand,"frame":frame,"source_fingerprint":sourceFingerprint,"status":status,"not_authoritative":true]
         if let pot = pot { d["pot_bb"] = pot.display }
         if let total = total { d["total_bb"] = total.display }
         if let e = expectedOutstanding { d["expected_outstanding_bb"] = formatBB(e) }
         d["wagers"] = wagers.map { amount,seat in
-            var w:[String:Any] = ["amount_bb":amount.display,"source_text":amount.line.text,"x":amount.line.x,"y":amount.line.y,"seat_label":seat.visibleLabel,"identity_status":seat.knownName == nil ? "UNRESOLVED" : "EARLIER_FRAME_VERIFIED"]
-            if let name = seat.knownName { w["player"] = name }
+            // Unknown physical seats are geometric blockers, not names.
+            // A chip near an unknown seat cannot inherit a nearby name.
+            let distance=hypot(amount.line.x-seat.x,amount.line.y-seat.y)
+            let ambiguous=unknownSeatAnchors.contains { unknown in
+                hypot(amount.line.x-unknown.0,amount.line.y-unknown.1) <= distance+0.020
+            }
+            let verified=seat.knownName != nil && !ambiguous
+            var w:[String:Any] = ["amount_bb":amount.display,"source_text":amount.line.text,"x":amount.line.x,"y":amount.line.y,"seat_label":ambiguous ? "UNVERIFIED_SEAT" : seat.visibleLabel,"identity_status":verified ? "EARLIER_FRAME_VERIFIED" : "UNRESOLVED"]
+            if verified,let name=seat.knownName {w["player"]=name}
             return w
         }
         d["unassigned_numeric_labels"] = extraneous.map { ["amount_bb":$0.display,"x":$0.line.x,"y":$0.line.y] as [String : Any] }
@@ -200,10 +207,9 @@ func sample(_ r:URL,_ n:Int,_ expected:String,_ amounts:[Int]) throws {
 func scan(_ root:URL,_ out:URL) throws {
     guard let frames=try jsonFile(root.appendingPathComponent("frames.json")) as? [[String:Any]] else {throw NSError(domain:"MISSING_FRAMES",code:1)}
     // Hand-scoped roster metadata; future rosters cannot be used on earlier frames.
-    var rosters = [[String:Any]]()
-    let path=root.appendingPathComponent("observed_verified_dealt_in_rosters.json")
-    if let array=try? jsonFile(path) as? [[String:Any]] {rosters=array}
+    let rosters = allNumericRosters(root,through:frames.count)
     var priorSeatsByHand = [String:[String:(Double,Double)]]()
+    var unknownAnchorsByHand = [String:[(Double,Double)]]()
     var rosterLoaded = Set<String>()
     var history = [[String:Any]]()
     var counts=[String:Int]()
@@ -214,7 +220,7 @@ func scan(_ root:URL,_ out:URL) throws {
         guard doc["frame"] as? Int == n else{throw NSError(domain:"OCR_SEQUENCE",code:n)}
         let lines=parseLines(doc)
         let hand=lines.compactMap{captureMatch(rxHand,$0.text)}.first
-        if let hand=hand, let r=rosters.first(where:{($0["hand"] as? String)==hand && ($0["rosterFrame"] as? Int ?? Int.max)<n}),!rosterLoaded.contains(hand) {
+        if let hand=hand, let r=rosters.first(where:{($0["hand"] as? String)==hand && ($0["eligibleFromFrame"] as? Int ?? $0["rosterFrame"] as? Int ?? Int.max)<n}),!rosterLoaded.contains(hand) {
             let rosterFrame=r["rosterFrame"] as? Int ?? 0
             if rosterFrame>=1 && rosterFrame<n,let names=r["clockwiseRing"] as? [String] {
                 let rdoc=try loadOCR(root,rosterFrame)
@@ -223,13 +229,14 @@ func scan(_ root:URL,_ out:URL) throws {
                     if known[line.text] == nil { known[line.text]=(line.x,line.y) }
                 }
                 priorSeatsByHand[hand]=known
+                unknownAnchorsByHand[hand]=unknownNumericSeatAnchors(r)
                 rosterLoaded.insert(hand)
             }
         }
         if let r=extractSnapshot(doc, knownNames:hand.flatMap{priorSeatsByHand[$0].map { Array($0.keys) }} ?? [],pastSeats:hand.flatMap{priorSeatsByHand[$0]} ?? [:]) {
             counts[r.status,default:0]+=1
             if r.pot != nil || r.total != nil {
-                history.append(r.jsonValue())
+                history.append(r.jsonValue(unknownSeatAnchors:hand.flatMap{unknownAnchorsByHand[$0]} ?? []))
             }
         }
     }
@@ -237,6 +244,172 @@ func scan(_ root:URL,_ out:URL) throws {
     let data=try JSONSerialization.data(withJSONObject:object,options:[.sortedKeys,.prettyPrinted])
     try data.write(to:out,options:.atomic)
     print("NUMERIC_SCAN_PASS frames=\(frames.count) status=\(counts.sorted{$0.key<$1.key}.map{"\($0.key):\($0.value)"}.joined(separator:",")) output=\(out.path)")
+}
+
+// Read-only, frame-proven partial seat roster recovery for numeric evidence.
+// A truncated nameplate is a physical seat, never a verified player name.
+func recoveredPartialNumericRosters(_ root:URL, through:Int) -> [[String:Any]] {
+    let buttonsURL = root.appendingPathComponent("observed_button_from_blinds.json")
+    let cardsURL = root.appendingPathComponent("observed_card_back_pairs.json")
+    let boardURL = root.appendingPathComponent("local_board_observations.json")
+    guard let buttons = try? jsonFile(buttonsURL) as? [[String:Any]],
+          let cards = try? jsonFile(cardsURL) as? [[String:Any]],
+          let boards = try? jsonFile(boardURL) as? [[String:Any]],
+          cards.count == boards.count else {return []}
+
+    let unknown = "UNRESOLVED_PHYSICAL_SEAT"
+    let pattern = try! NSRegularExpression(pattern:"^[A-Za-z0-9_]{3,31}(?:\\.\\.\\.)?$")
+    func candidateName(_ name:String) -> Bool {
+        guard pattern.firstMatch(in:name,range:NSRange(name.startIndex..<name.endIndex,in:name)) != nil,
+              name.rangeOfCharacter(from:.letters) != nil,
+              !isInterfaceLabel(name) else {return false}
+        return true
+    }
+    func pairAt(_ pair:[String:Any],_ line:OCRLine) -> Bool {
+        guard let x=pair["x"] as? Double,let y=pair["y"] as? Double else {return false}
+        return abs(x-line.x)<0.030 && (1-line.y)-y > 0.030 && (1-line.y)-y < 0.085
+    }
+    func pairs(_ row:[String:Any]) -> [[String:Any]] {
+        (row["pairs"] as? [[String:Any]] ?? []) +
+        (row["faceUpPairs"] as? [[String:Any]] ?? [])
+    }
+    func sameCycle(_ a:[String],_ b:[String]) -> Bool {
+        guard a.count == b.count else {return false}
+        return a.indices.contains { i in Array(a[i...])+Array(a[..<i]) == b }
+    }
+    func sourceMatches(_ n:Int,_ doc:[String:Any],_ hand:String) -> Bool {
+        guard n>=1,n<=cards.count,
+              let fp=doc["sourceFingerprint"] as? String,
+              doc["frame"] as? Int == n,
+              cards[n-1]["frame"] as? Int == n,
+              boards[n-1]["frame"] as? Int == n,
+              cards[n-1]["sourceFingerprint"] as? String == fp,
+              boards[n-1]["sourceFingerprint"] as? String == fp,
+              cards[n-1]["hand"] as? String == hand,
+              boards[n-1]["hand"] as? String == hand,
+              boards[n-1]["visibleBoardCount"] as? Int == 0
+        else {return false}
+        let ids=parseLines(doc).compactMap {captureMatch(rxHand,$0.text)}
+        return ids.count==1 && ids[0]==hand
+    }
+
+    var recovered = [[String:Any]]()
+    for proof in buttons {
+        guard let hand=proof["hand"] as? String,
+              let f=proof["firstFrame"] as? Int,
+              let c=proof["confirmedFrame"] as? Int,
+              c==f+1,c<=through,c<=cards.count,
+              let blindRing=proof["clockwiseRing"] as? [String],
+              let dealer=proof["dealer"] as? String,
+              let sb=proof["smallBlind"] as? String,
+              let bb=proof["bigBlind"] as? String,
+              let firstDoc=try? loadOCR(root,f),
+              let confirmDoc=try? loadOCR(root,c),
+              sourceMatches(f,firstDoc,hand),sourceMatches(c,confirmDoc,hand),
+              firstDoc["sourceFingerprint"] as? String == proof["firstFingerprint"] as? String,
+              confirmDoc["sourceFingerprint"] as? String == proof["confirmedFingerprint"] as? String
+        else {continue}
+
+        for n in stride(from:c,through:max(2,f-18),by:-1) {
+            guard n>=2,n<=through,
+                  let prior=try? loadOCR(root,n-1),
+                  let current=try? loadOCR(root,n),
+                  sourceMatches(n-1,prior,hand),
+                  sourceMatches(n,current,hand)
+            else {continue}
+            let older=pairs(cards[n-2]), newer=pairs(cards[n-1])
+            guard older.count==newer.count,(3...10).contains(older.count) else {continue}
+            let nowLines=parseLines(current)
+            var usedBefore=Set<Int>(),usedNow=Set<Int>()
+            var seats=[(name:String,x:Double,y:Double)]()
+            var truncatedCount=0
+            for line in nowLines where line.confidence>=0.8 && candidateName(line.text) {
+                let stacks=nowLines.filter {
+                    $0.confidence>=0.8 && captureMatch(rxAmount,$0.text) != nil &&
+                    abs($0.x-line.x)<0.028 && line.y-$0.y>0.025 && line.y-$0.y<0.058
+                }
+                guard stacks.count==1 else {continue}
+                // The previous nameplate may be an action overlay.
+                // Prove the seat with physical cards in both frames.
+                let beforeMatches=older.indices.filter {pairAt(older[$0],line)}
+                let nowMatches=newer.indices.filter {pairAt(newer[$0],line)}
+                guard beforeMatches.count==1,nowMatches.count==1,
+                      !usedBefore.contains(beforeMatches[0]),
+                      !usedNow.contains(nowMatches[0]),
+                      let px=older[beforeMatches[0]]["x"] as? Double,
+                      let py=older[beforeMatches[0]]["y"] as? Double,
+                      let qx=newer[nowMatches[0]]["x"] as? Double,
+                      let qy=newer[nowMatches[0]]["y"] as? Double,
+                      abs(px-qx)<0.018,abs(py-qy)<0.018
+                else {continue}
+                usedBefore.insert(beforeMatches[0]);usedNow.insert(nowMatches[0])
+                let truncated=line.text.hasSuffix("...")
+                if truncated {truncatedCount+=1}
+                seats.append((truncated ? unknown : line.text,line.x,line.y))
+            }
+            guard seats.count==older.count,
+                  usedBefore.count==older.count,
+                  usedNow.count==newer.count,
+                  truncatedCount<=1,
+                  Set(seats.map{$0.name}).count==seats.count
+            else {continue}
+            let centerX=(seats.map{$0.x}.min()!+seats.map{$0.x}.max()!)/2
+            let centerY=(seats.map{$0.y}.min()!+seats.map{$0.y}.max()!)/2
+            let ring=seats.sorted {
+                atan2($0.y-centerY,$0.x-centerX)>atan2($1.y-centerY,$1.x-centerX)
+            }.map{$0.name}
+            let knownRing=ring.filter{blindRing.contains($0)}
+            guard Set(blindRing).isSubset(of:Set(ring)),
+                  sameCycle(knownRing,blindRing),
+                  let d=ring.firstIndex(of:dealer),
+                  ring[(d+1)%ring.count]==sb,
+                  ring[(d+2)%ring.count]==bb
+            else {continue}
+            recovered.append([
+                "hand":hand,"rosterFrame":n,"priorFrame":n-1,
+                "eligibleFromFrame":c,"clockwiseRing":ring,
+                "dealer":dealer,"smallBlind":sb,"bigBlind":bb,
+                "unresolvedPhysicalSeats":truncatedCount,
+                "unresolvedSeatAnchors":seats.filter{$0.name == unknown}.map {
+                    ["x":$0.x,"y":$0.y]
+                },
+                "sourceFingerprints":[prior["sourceFingerprint"]!,current["sourceFingerprint"]!]
+            ])
+            break
+        }
+    }
+    return recovered
+}
+func unknownNumericSeatAnchors(_ roster:[String:Any]) -> [(Double,Double)] {
+    let entries=roster["unresolvedSeatAnchors"] as? [[String:Any]] ?? []
+    return entries.compactMap { item in
+        guard let x=item["x"] as? Double,let y=item["y"] as? Double,
+              x>=0,x<=1,y>=0,y<=1 else {return nil}
+        return (x,y)
+    }
+}
+func allNumericRosters(_ root:URL, through:Int) -> [[String:Any]] {
+    let file=root.appendingPathComponent("observed_verified_dealt_in_rosters.json")
+    var existing=(try? jsonFile(file) as? [[String:Any]]) ?? []
+    for candidate in recoveredPartialNumericRosters(root,through:through) {
+        guard let hand=candidate["hand"] as? String else {continue}
+        if let i=existing.firstIndex(where:{$0["hand"] as? String == hand}) {
+            // A historical partial-roster sidecar may omit the unknown
+            // seat's geometry. Enrich only when the ring and frame agree.
+            if let priorRing=existing[i]["clockwiseRing"] as? [String],
+               let newRing=candidate["clockwiseRing"] as? [String],
+               priorRing.count==newRing.count,
+               zip(priorRing,newRing).allSatisfy({ pair in
+                   pair.0==pair.1 || (pair.0.hasPrefix("UNRESOLVED_") && pair.1.hasPrefix("UNRESOLVED_"))
+               }),
+               existing[i]["rosterFrame"] as? Int == candidate["rosterFrame"] as? Int {
+                existing[i]["unresolvedSeatAnchors"] = candidate["unresolvedSeatAnchors"]
+            }
+        } else {
+            existing.append(candidate)
+        }
+    }
+    return existing
 }
 
 // Read-only incremental numeric projection.
@@ -247,6 +420,7 @@ struct NumericFollowCursor {
     var snapshots = [[String:Any]]()
     var counts = [String:Int]()
     var priorSeatsByHand = [String:[String:(Double,Double)]]()
+    var unknownAnchorsByHand = [String:[(Double,Double)]]()
     var rosterLoaded = Set<String>()
 
     mutating func consume(frames: [[String:Any]], through end: Int) throws {
@@ -255,13 +429,7 @@ struct NumericFollowCursor {
         }
         guard end > through else { return }
 
-        var rosters = [[String:Any]]()
-        let rosterURL = root.appendingPathComponent(
-            "observed_verified_dealt_in_rosters.json"
-        )
-        if let array = try? jsonFile(rosterURL) as? [[String:Any]] {
-            rosters = array
-        }
+        let rosters = allNumericRosters(root,through:end)
 
         for n in (through+1)...end {
             let frame = frames[n-1]
@@ -304,7 +472,7 @@ struct NumericFollowCursor {
             if let hand = hand,
                let roster = rosters.first(where:{
                    ($0["hand"] as? String) == hand &&
-                   ($0["rosterFrame"] as? Int ?? Int.max) < n
+                   ($0["eligibleFromFrame"] as? Int ?? $0["rosterFrame"] as? Int ?? Int.max) < n
                }), !rosterLoaded.contains(hand) {
 
                 let rosterFrame = roster["rosterFrame"] as? Int ?? 0
@@ -324,6 +492,7 @@ struct NumericFollowCursor {
                     }
 
                     priorSeatsByHand[hand] = known
+                    unknownAnchorsByHand[hand] = unknownNumericSeatAnchors(roster)
                     rosterLoaded.insert(hand)
                 }
             }
@@ -345,7 +514,7 @@ struct NumericFollowCursor {
                 counts[observation.status,default:0] += 1
 
                 if observation.pot != nil || observation.total != nil {
-                    snapshots.append(observation.jsonValue())
+                    snapshots.append(observation.jsonValue(unknownSeatAnchors:hand.flatMap{unknownAnchorsByHand[$0]} ?? []))
                 }
             }
 
@@ -470,7 +639,12 @@ func followNumericSession(
 @main struct QuantitativeReadOnly {
     static func main() throws {
         let args=CommandLine.arguments
-        if args.count==4 && args[1]=="--check" {
+        if args.count==4 && args[1]=="--native-roster-proof" {
+            guard let n=Int(args[3]) else {throw NSError(domain:"BAD_FRAME",code:1)}
+            let items=recoveredPartialNumericRosters(URL(fileURLWithPath:args[2]),through:n)
+            let data=try JSONSerialization.data(withJSONObject:items,options:[.prettyPrinted,.sortedKeys])
+            print(String(decoding:data,as:UTF8.self))
+        } else if args.count==4 && args[1]=="--check" {
             let a=URL(fileURLWithPath:args[2]),b=URL(fileURLWithPath:args[3])
             try sample(a,314,"BALANCED_WAGERS",[3330,8160])
             try sample(b,315,"BALANCED_WAGERS",[1000,500])

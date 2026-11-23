@@ -1,0 +1,41 @@
+{
+  "api_calls": 0,
+  "baseline_237_reported_owners": 292,
+  "corrected_237_owners": 251,
+  "deterministic": "3/3 per recording",
+  "hand_scope_and_blind_proof": "PASS",
+  "incremental_equals_scan": true,
+  "native_partial_rosters": 2,
+  "new_authoritative_actions": 0,
+  "numeric_reports": {
+    "236": {
+      "owners_after": 231,
+      "owners_before": 231,
+      "unresolved": 185,
+      "wagers": 416
+    },
+    "237": {
+      "owners_after": 251,
+      "owners_before": 0,
+      "unresolved": 193,
+      "wagers": 444
+    },
+    "353": {
+      "owners_after": 191,
+      "owners_before": 0,
+      "unresolved": 359,
+      "wagers": 550
+    },
+    "354": {
+      "owners_after": 207,
+      "owners_before": 207,
+      "unresolved": 288,
+      "wagers": 495
+    }
+  },
+  "original_frames_verified": 1180,
+  "parent_source_sha256": "62c230e311debf9c34fee576ac4f42896c447c5dc6cf4e65e563d6c113e1ffcf",
+  "production_observer_sha256": "04317f5a8b72a9ad18cac179f6f03e495141afe4e21b131b78f6181ea419d269",
+  "source_sha256": "85560d3c3970b05a88daee6d68e64917c6e694339cbcabe80754a989342654be",
+  "unknown_seat_spatial_blocker": "ACTIVE"
+}
