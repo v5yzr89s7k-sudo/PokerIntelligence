@@ -1025,6 +1025,164 @@ func localHandChronology(_ actions: [LocalActionCandidate],
 }
 
 
+// Read-only projection of physical wager movement. This is NOT a poker action,
+// a verified dealt-in roster, a raise-to amount, or an extra writer.
+struct RecorderObservedWager: Codable, Equatable {
+    let hand: String
+    let player: String
+    let overlay: String
+    let fromFrame: Int
+    let toFrame: Int
+    let contributionBB: String
+    let fromFingerprint: String
+    let toFingerprint: String
+    let matchedCommittedAction: Bool
+    let authority: String
+}
+
+func physicalWagerContribution(
+    _ c: LocalActionCandidate,
+    previous: LocalOCRFrame, current: LocalOCRFrame,
+    previousBoard: LocalBoardObservation, currentBoard: LocalBoardObservation,
+    previousImage: Frame, currentImage: Frame,
+    sameFrameCandidates: [LocalActionCandidate],
+    blind: BlindButtonEvidence, blindFirst: Frame, blindSecond: Frame,
+    roster: PhysicalDealtInRoster, rosterFirst: Frame, rosterSecond: Frame,
+    root: URL
+) -> String? {
+    guard Set(["BET", "RAISE", "CALL"]).contains(c.overlay),
+          localSemanticSupported(c), !c.sameFrameOrderUnknown,
+          c.labelConfidence >= 0.8,
+          c.beforeFrame >= 2, c.beforeFrame + 1 == c.frame,
+          previous.frame == c.beforeFrame, current.frame == c.frame,
+          previousImage.id == previous.frame, currentImage.id == current.frame,
+          c.beforeFingerprint != c.currentFingerprint,
+          previous.sourceFingerprint == c.beforeFingerprint,
+          current.sourceFingerprint == c.currentFingerprint,
+          previousBoard.frame == c.beforeFrame,
+          currentBoard.frame == c.frame,
+          previousBoard.hand == c.hand && currentBoard.hand == c.hand,
+          previousBoard.sourceFingerprint == c.beforeFingerprint,
+          currentBoard.sourceFingerprint == c.currentFingerprint,
+          previousBoard.visibleBoardCount == currentBoard.visibleBoardCount,
+          [0,3,4,5].contains(previousBoard.visibleBoardCount),
+          currentImage.captured > previousImage.captured,
+          currentImage.captured - previousImage.captured < 1.5,
+          previous.capture.error == nil, current.capture.error == nil,
+          currentLocalHand(previous.capture) == c.hand,
+          currentLocalHand(current.capture) == c.hand,
+          sameFrameCandidates.count == 1,
+          sameFrameCandidates[0] == c,
+          blind.hand == c.hand, blind.firstFrame+1 == blind.confirmedFrame,
+          blind.confirmedFrame <= c.beforeFrame,
+          blind.clockwiseRing.contains(c.player),
+          Set(blind.clockwiseRing).count == blind.clockwiseRing.count,
+          blindFirst.id == blind.firstFrame, blindSecond.id == blind.confirmedFrame,
+          // The blind ring proves seat order, NOT dealt-in participation.
+          // Require a frozen hand-specific two-frame hole-card roster,
+          // established before this wager. Later arrivals never inherit it.
+          roster.hand == c.hand,
+          roster.priorFrame >= 1,
+          roster.priorFrame + 1 == roster.rosterFrame,
+          roster.rosterFrame < c.beforeFrame,
+          roster.sourceFingerprints.count == 2,
+          rosterFirst.id == roster.priorFrame,
+          rosterSecond.id == roster.rosterFrame,
+          rosterFirst.id < c.beforeFrame,
+          rosterSecond.id < c.beforeFrame,
+          roster.sourceFingerprints[0] != roster.sourceFingerprints[1],
+          roster.dealer == blind.dealer,
+          roster.smallBlind == blind.smallBlind,
+          roster.bigBlind == blind.bigBlind,
+          roster.clockwiseRing.contains(c.player),
+          Set(roster.clockwiseRing).count == roster.clockwiseRing.count,
+          Set(blind.clockwiseRing).isSubset(of:Set(roster.clockwiseRing)),
+          // A partial table's current nameplates may omit players who
+          // already folded, but may not add participants mid-hand.
+          blind.clockwiseRing.indices.contains(where: { i in
+              let rotated=Array(blind.clockwiseRing[i...]) + Array(blind.clockwiseRing[..<i])
+              return rotated == roster.clockwiseRing.filter { blind.clockwiseRing.contains($0) }
+          }),
+          let displayed = c.displayedWager, displayed.confidence >= 0.8,
+          displayed.priorDisplayedWagerBB == nil,
+          let after = c.afterStackBB,
+          let stack0 = Decimal(string:c.beforeStackBB,locale:Locale(identifier:"en_US_POSIX")),
+          let stack1 = Decimal(string:after,locale:Locale(identifier:"en_US_POSIX")),
+          let value = Decimal(string:displayed.amountBB,locale:Locale(identifier:"en_US_POSIX")),
+          value > 0, stack0-stack1 == value,
+          c.observedStackDeltaBB == String(describing:stack1-stack0)
+    else {return nil}
+
+    func original(_ image:Frame,_ fingerprint:String) -> Bool {
+        guard image.file.hasPrefix("frames/"),
+              !image.file.contains(".."),
+              let data=try? Data(contentsOf:root.appendingPathComponent(image.file))
+        else {return false}
+        return frameFingerprint(data)==fingerprint
+    }
+    guard original(previousImage,c.beforeFingerprint),
+          original(currentImage,c.currentFingerprint),
+          original(blindFirst,blind.firstFingerprint),
+          original(blindSecond,blind.confirmedFingerprint),
+          original(rosterFirst,roster.sourceFingerprints[0]),
+          original(rosterSecond,roster.sourceFingerprints[1])
+    else {return nil}
+
+    let older=previous.capture.lines.filter{$0.confidence>=0.8}
+    let newer=current.capture.lines.filter{$0.confidence>=0.8}
+    func nearby(_ r:LocalOCRLine,_ x:Double,_ y:Double,
+                _ dx:Double=0.017,_ dy:Double=0.020) -> Bool {
+        abs(r.x-x)<dx && abs(r.y-y)<dy
+    }
+    func exact(_ rows:[LocalOCRLine],_ value:String,_ x:Double,_ y:Double) -> Bool {
+        rows.filter{
+            $0.text.trimmingCharacters(in:.whitespaces)==value && nearby($0,x,y)
+        }.count==1
+    }
+    guard exact(older,c.player,c.x,c.y),
+          exact(newer,c.overlay,c.x,c.y),
+          exact(newer,displayed.text,displayed.x,displayed.y),
+          !older.contains(where:{
+              $0.text.trimmingCharacters(in:.whitespaces)==displayed.text &&
+              nearby($0,displayed.x,displayed.y)
+          })
+    else {return nil}
+
+    func parseAmount(_ text:String,kind:String) -> Decimal? {
+        let regex:String
+        switch kind {
+        case "stack": regex = #"^\s*([0-9]+(?:\.[0-9]{1,2})?)\s*BB\s*$"#
+        case "total": regex = #"^\s*Total\s*:\s*([0-9]+(?:\.[0-9]{1,2})?)\s*BB\s*$"#
+        case "pot": regex = #"^\s*Pot\s+([0-9]+(?:\.[0-9]{1,2})?)\s*BB\s*$"#
+        default: return nil
+        }
+        guard let re=try? NSRegularExpression(pattern:regex,options:[.caseInsensitive]),
+              let m=re.firstMatch(in:text,range:NSRange(text.startIndex...,in:text)),
+              let r=Range(m.range(at:1),in:text)
+        else {return nil}
+        return Decimal(string:String(text[r]),locale:Locale(identifier:"en_US_POSIX"))
+    }
+    func unique(_ rows:[LocalOCRLine],_ kind:String,
+                near:(Double,Double,Double,Double)?=nil) -> Decimal? {
+        let values=rows.compactMap{ r -> Decimal? in
+            if let p=near,!nearby(r,p.0,p.1,p.2,p.3) {return nil}
+            return parseAmount(r.text,kind:kind)
+        }
+        return values.count == 1 ? values[0] : nil
+    }
+    guard unique(newer,"stack",near:(displayed.x,displayed.y,0.017,0.020)) == value,
+          unique(older,"stack",near:(displayed.x,displayed.y,0.017,0.020)) == nil,
+          unique(older,"stack",near:(c.x,c.y-0.042,0.020,0.023)) == stack0,
+          unique(newer,"stack",near:(c.x,c.y-0.042,0.020,0.023)) == stack1,
+          let total0=unique(older,"total"),let total1=unique(newer,"total"),
+          total1-total0==value,
+          let pot0=unique(older,"pot"),let pot1=unique(newer,"pot"),
+          pot0==pot1
+    else {return nil}
+    // Increment to chips wagered now, not total bet-to/raise-to.
+    return String(describing:value)
+}
+
 // Only evidence-backed local OCR transitions may enter semantic history.
 // No wager or raise-to amount is certified by the stack difference alone.
 func localSemanticSupported(_ c: LocalActionCandidate) -> Bool {
@@ -1422,6 +1580,9 @@ actor Recorder {
     }
     var localCandidates = [LocalOverlayCandidate]()
     var localActions = [LocalActionCandidate]()
+    var recorderWagerScannedThrough = 0
+    var recorderWagerEvidence = [RecorderObservedWager]()
+
     var localOCRDirectory: URL { directory.appendingPathComponent("local_ocr") }
     func restoreLocalOCR() throws {
         let fm = FileManager.default
@@ -1647,10 +1808,58 @@ actor Recorder {
         }
     }
 
+    // From already committed screenshots; no new semantic actions.
+    // Proof remains weaker than independently certified DEALT_IN roster ownership.
+    func refreshRecorderWagerEvidence() {
+        let upper = min(cursor,frames.count,localOCR.count,localBoard.count)
+        guard upper >= 2 && upper > recorderWagerScannedThrough else { return }
+        for n in max(2,recorderWagerScannedThrough+1)...upper {
+            let candidates=localActions.filter{$0.frame==n}
+            for c in candidates {
+                guard let blind=blindPositions[c.hand],
+                      let roster=physicalRosters[c.hand],
+                      blind.firstFrame >= 1,
+                      blind.confirmedFrame <= frames.count,
+                      roster.priorFrame >= 1,
+                      roster.rosterFrame <= frames.count,
+                      roster.rosterFrame < c.beforeFrame,
+                      let contribution=physicalWagerContribution(
+                        c,
+                        previous:localOCR[n-2],current:localOCR[n-1],
+                        previousBoard:localBoard[n-2],currentBoard:localBoard[n-1],
+                        previousImage:frames[n-2],currentImage:frames[n-1],
+                        sameFrameCandidates:candidates,
+                        blind:blind,
+                        blindFirst:frames[blind.firstFrame-1],
+                        blindSecond:frames[blind.confirmedFrame-1],
+                        roster:roster,
+                        rosterFirst:frames[roster.priorFrame-1],
+                        rosterSecond:frames[roster.rosterFrame-1],
+                        root:directory
+                      ) else {continue}
+                let eventMatched=events.contains { event in
+                    event.hand==c.hand && event.frame==c.frame &&
+                    event.kind=="action" && event.text==localSemanticText(c)
+                }
+                recorderWagerEvidence.append(RecorderObservedWager(
+                    hand:c.hand,player:c.player,overlay:c.overlay,
+                    fromFrame:c.beforeFrame,toFrame:c.frame,
+                    contributionBB:contribution,
+                    fromFingerprint:c.beforeFingerprint,
+                    toFingerprint:c.currentFingerprint,
+                    matchedCommittedAction:eventMatched,
+                    authority:"READ_ONLY_ORIGINAL_FRAMES_AND_BLIND_PROOF; DEALT_IN_NUMERIC_OWNER_NOT_CERTIFIED; NO_RAISE_TO"
+                ))
+            }
+        }
+        recorderWagerScannedThrough=upper
+    }
+
     func publish() throws {
         try recover()
         refreshBlindEvidence()
         refreshPhysicalSeatEvidence()
+        refreshRecorderWagerEvidence()
         let age = cursor > 0 ? Date().timeIntervalSince1970 - frames[cursor-1].captured : -1
         let stats = "captured=\(frames.count) analyzed=\(cursor) pending=\(frames.count-cursor) api_calls=\(calls) evidence_age_s=\(Int(max(-1, age))) hidden_table_frames=\(hiddenFrames.count)"
         let shownState = lastTableVisible == false
@@ -1924,6 +2133,11 @@ actor Recorder {
             to: directory.appendingPathComponent(
                 "local_action_candidates.json"
             ), options: .atomic
+        )
+        // One Recorder-owned read-only projection, never authoritative history.
+        try encoded(recorderWagerEvidence).write(
+            to:directory.appendingPathComponent("observed_native_wager_correlations.json"),
+            options:.atomic
         )
         try encoded(relativeSeatCandidates).write(
             to: directory.appendingPathComponent(
@@ -2961,11 +3175,130 @@ func replayOriginalLocalOCR(_ input: URL, _ output: URL) async throws {
 }
 #endif
 
+// Targeted original-frame regression, no capture, API calls, or semantic writes.
+func readOnlyRecorderWagerRegression(_ root:URL) throws {
+    let decoder=JSONDecoder()
+    let manifest=try decoder.decode([Frame].self,
+        from:Data(contentsOf:root.appendingPathComponent("frames.json")))
+    let boards=try decoder.decode([LocalBoardObservation].self,
+        from:Data(contentsOf:root.appendingPathComponent("local_board_observations.json")))
+    let actions=try decoder.decode([LocalActionCandidate].self,
+        from:Data(contentsOf:root.appendingPathComponent("local_action_candidates.json")))
+    let blinds=try decoder.decode([BlindButtonEvidence].self,
+        from:Data(contentsOf:root.appendingPathComponent("observed_button_from_blinds.json")))
+    try require(manifest.count==353 && boards.count==353,
+        "RECORDER_WAGER_REGRESSION_EXPECTS_353_ORIGINAL_FRAMES")
+    func ocr(_ n:Int) throws -> LocalOCRFrame {
+        try decoder.decode(LocalOCRFrame.self,from:Data(contentsOf:
+            root.appendingPathComponent(String(format:"local_ocr/%06d.json",n))))
+    }
+    let cards=try decoder.decode([FrameCardPairs].self,
+        from:Data(contentsOf:root.appendingPathComponent("observed_card_back_pairs.json")))
+    try require(cards.count == manifest.count,"CARD_BACK_FRAME_COUNT_MISMATCH")
+    let ocrFrames = try (1...manifest.count).map { try ocr($0) }
+    func earlierRoster(_ item: LocalActionCandidate) -> PhysicalDealtInRoster? {
+        guard item.beforeFrame >= 3 else {return nil}
+        var first: PhysicalDealtInRoster? = nil
+        // No roster created after the action. The first valid hand roster is
+        // frozen, so mid-hand new seats cannot retroactively change eligibility.
+        for n in 2..<item.beforeFrame {
+            guard let proof=physicalRosterCandidate(
+                previous:ocrFrames[n-2],current:ocrFrames[n-1],
+                previousBoard:boards[n-2],currentBoard:boards[n-1],
+                previousCards:cards[n-2],currentCards:cards[n-1]),
+                proof.hand==item.hand else {continue}
+            if first == nil { first=proof }
+        }
+        return first
+    }
+    func attempt(_ item:LocalActionCandidate,_ peers:[LocalActionCandidate],
+                 alternateRoster: PhysicalDealtInRoster? = nil) throws -> String? {
+        let n=item.frame
+        guard n>=2,n<=manifest.count,
+              let blind=blinds.first(where:{$0.hand==item.hand}),
+              let roster=alternateRoster ?? earlierRoster(item),
+              roster.priorFrame>=1,roster.rosterFrame<=manifest.count
+        else {return nil}
+        return physicalWagerContribution(item,
+            previous:try ocr(n-1),current:try ocr(n),
+            previousBoard:boards[n-2],currentBoard:boards[n-1],
+            previousImage:manifest[n-2],currentImage:manifest[n-1],
+            sameFrameCandidates:peers,blind:blind,
+            blindFirst:manifest[blind.firstFrame-1],
+            blindSecond:manifest[blind.confirmedFrame-1],
+            roster:roster,rosterFirst:manifest[roster.priorFrame-1],
+            rosterSecond:manifest[roster.rosterFrame-1],root:root)
+    }
+    var observed=[Int:String]()
+    for n in [197,250,305,314] {
+        let peers=actions.filter{$0.frame==n}
+        try require(peers.count==1,"REGRESSION_EXPECTED_ONE_OVERLAY_FRAME_\(n)")
+        if let value=try attempt(peers[0],peers) {observed[n]=value}
+    }
+    try require(observed == [250:"2.1",305:"3.33",314:"8.16"],
+        "RECORDER_WAGER_ORIGINAL_CONTRIBUTIONS_OR_ELIGIBILITY_CHANGED_\(observed)")
+    let original=actions.first{$0.frame==314}!
+    func tamper(_ key:String,_ value:Any) throws -> LocalActionCandidate {
+        var object=try JSONSerialization.jsonObject(with:encoded(original)) as! [String:Any]
+        object[key]=value
+        return try decoder.decode(LocalActionCandidate.self,from:json(object))
+    }
+    let invalid:[LocalActionCandidate]=try [
+        tamper("player","FORGED"),
+        tamper("currentFingerprint","sha256:"+String(repeating:"0",count:64)),
+        tamper("sameFrameOrderUnknown",true)
+    ]
+    for candidate in invalid {
+        try require(try attempt(candidate,[candidate]) == nil,
+            "RECORDER_WAGER_FORGED_EVIDENCE_ACCEPTED")
+    }
+    guard let valid=earlierRoster(original) else {
+        throw Problem("NO_NATIVE_ROSTER_FOR_CERTIFIED_WAGER")
+    }
+    let forgedHand = PhysicalDealtInRoster(
+        hand:"FORGED", rosterFrame:valid.rosterFrame,
+        priorFrame:valid.priorFrame, clockwiseRing:valid.clockwiseRing,
+        dealer:valid.dealer,smallBlind:valid.smallBlind,bigBlind:valid.bigBlind,
+        sourceFingerprints:valid.sourceFingerprints)
+    try require(try attempt(original,[original],alternateRoster:forgedHand)==nil,
+        "CROSS_HAND_ROSTER_ACCEPTED")
+    let futureRoster = PhysicalDealtInRoster(
+        hand:valid.hand,rosterFrame:original.frame+1,
+        priorFrame:original.frame,clockwiseRing:valid.clockwiseRing,
+        dealer:valid.dealer,smallBlind:valid.smallBlind,bigBlind:valid.bigBlind,
+        sourceFingerprints:valid.sourceFingerprints)
+    try require(try attempt(original,[original],alternateRoster:futureRoster)==nil,
+        "FUTURE_ROSTER_ACCEPTED")
+    let forgedFingerprints=PhysicalDealtInRoster(
+        hand:valid.hand,rosterFrame:valid.rosterFrame,
+        priorFrame:valid.priorFrame,clockwiseRing:valid.clockwiseRing,
+        dealer:valid.dealer,smallBlind:valid.smallBlind,bigBlind:valid.bigBlind,
+        sourceFingerprints:["sha256:"+String(repeating:"0",count:64),valid.sourceFingerprints[1]])
+    try require(try attempt(original,[original],alternateRoster:forgedFingerprints)==nil,
+        "FORGED_ROSTER_FINGERPRINT_ACCEPTED")
+    var changed=try JSONSerialization.jsonObject(with:encoded(original)) as! [String:Any]
+    var display=changed["displayedWager"] as! [String:Any]
+    display["amountBB"]="8.15"
+    changed["displayedWager"]=display
+    let altered=try decoder.decode(LocalActionCandidate.self,from:json(changed))
+    try require(try attempt(altered,[altered]) == nil,
+        "RECORDER_WAGER_WRONG_VALUE_ACCEPTED")
+    try require(try attempt(original,[original,original]) == nil,
+        "RECORDER_WAGER_SIMULTANEOUS_EPISODE_ACCEPTED")
+    print("RECORDER_READ_ONLY_WAGER_TEST_PASS frames=197_WITHHELD,250_2.1,305_3.33,314_8.16 negative=8 actions_created=0")
+}
+
 @main
 struct FullScreenVision {
     @MainActor static func main() async {
         setbuf(stdout, nil)
         do {
+            if CommandLine.arguments.count == 3 &&
+                CommandLine.arguments[1] == "--recorder-wager-proof-test" {
+                try readOnlyRecorderWagerRegression(
+                    URL(fileURLWithPath:CommandLine.arguments[2]))
+                return
+            }
             if CommandLine.arguments.count == 3 &&
                 CommandLine.arguments[1] == "--turn-progression-test" {
                 try testPreflopTurnProgression(
