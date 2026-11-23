@@ -388,6 +388,84 @@ func unknownNumericSeatAnchors(_ roster:[String:Any]) -> [(Double,Double)] {
         return (x,y)
     }
 }
+
+// Seated players can be visible in the later nameplate/position ring
+// without having had cards in the initial dealt-in ring. No extra
+// seated player is promoted to a dealt-in participant. A case-only OCR
+// variant is accepted only if it occupies the *same physical seat*.
+func corroboratedSeatedOnlyExtras(
+    dealtRing: [String], seatedRing: [String],
+    dealtPositions: [String:(Double,Double)],
+    earlierCards: [[String:Any]], currentCards: [[String:Any]],
+    rosterOCR: [String:Any], blindFirstOCR: [String:Any],
+    blindConfirmedOCR: [String:Any]
+) -> Bool {
+    guard dealtRing.count >= 3, seatedRing.count > dealtRing.count,
+          dealtRing.count <= 10, seatedRing.count <= 10,
+          dealtRing.allSatisfy({!$0.hasPrefix("UNRESOLVED_")}),
+          seatedRing.allSatisfy({!isInterfaceLabel($0)})
+    else {return false}
+
+    func normalized(_ s:String) -> String {s.lowercased()}
+    let dealtKeys=dealtRing.map(normalized)
+    let seatedKeys=seatedRing.map(normalized)
+    guard Set(dealtKeys).count==dealtKeys.count,
+          Set(seatedKeys).count==seatedKeys.count,
+          Set(dealtKeys).isSubset(of:Set(seatedKeys)) else {return false}
+
+    let dealtSet=Set(dealtKeys)
+    let projected=seatedKeys.filter{dealtSet.contains($0)}
+    guard projected.count==dealtKeys.count,
+          dealtKeys.indices.contains(where:{i in
+              Array(dealtKeys[i...])+Array(dealtKeys[..<i]) == projected
+          }) else {return false}
+
+    let earlyLines=parseLines(rosterOCR)
+    let laterLines=parseLines(blindConfirmedOCR)
+    let firstLines=parseLines(blindFirstOCR)
+
+    func nameplate(_ name:String,_ lines:[OCRLine]) -> OCRLine? {
+        let exact=lines.filter{$0.text==name && $0.confidence>=0.8}
+        return exact.count==1 ? exact[0] : nil
+    }
+    func stableLabel(_ a:OCRLine,_ b:OCRLine) -> Bool {
+        hypot(a.x-b.x,a.y-b.y)<0.012
+    }
+    func cardsAt(_ x:Double,_ y:Double,_ cards:[[String:Any]]) -> Bool {
+        cards.contains{card in
+            guard let cx=card["x"] as? Double,
+                  let cy=card["y"] as? Double else{return false}
+            return abs(cx-x)<0.030 && (1-y)-cy>0.030 && (1-y)-cy<0.085
+        }
+    }
+    // Every already-dealt-in name must map to the same physical seat,
+    // even when capitalization changed between OCR frames.
+    for early in dealtRing {
+        guard let point=dealtPositions[early],
+              let laterName=seatedRing.first(where:{normalized($0)==normalized(early)}),
+              let earlyLabel=nameplate(early,earlyLines),
+              let laterLabel=nameplate(laterName,laterLines),
+              stableLabel(earlyLabel,laterLabel),
+              hypot(earlyLabel.x-point.0,earlyLabel.y-point.1)<0.012
+        else {return false}
+    }
+    // Additional seated names are not evidence of being dealt in.
+    // They must be stable in both blind frames and have *no* pair
+    // at that seat in either early hand frame.
+    var extraPositions=[(Double,Double)]()
+    for late in seatedRing where !dealtSet.contains(normalized(late)) {
+        guard let a=nameplate(late,firstLines),
+              let b=nameplate(late,laterLines),
+              stableLabel(a,b),
+              !cardsAt(b.x,b.y,earlierCards),
+              !cardsAt(b.x,b.y,currentCards),
+              !extraPositions.contains(where:{hypot($0.0-b.x,$0.1-b.y)<0.025})
+        else {return false}
+        extraPositions.append((b.x,b.y))
+    }
+    return !extraPositions.isEmpty
+}
+
 // A Recorder roster is observational until its original frames and a
 // same-hand two-frame blind proof establish a causal eligibility point.
 // Never carry a player's name across hands or grant it before that point.
@@ -512,8 +590,15 @@ func certifiedImportedNumericRoster(_ root:URL, _ row:[String:Any], through:Int)
           fdoc["sourceFingerprint"] as? String == blind["firstFingerprint"] as? String,
           cdoc["sourceFingerprint"] as? String == blind["confirmedFingerprint"] as? String,
           let blindRing=blind["clockwiseRing"] as? [String],
-          Set(blindRing).isSubset(of:Set(ring)),
-          sameCycle(ring.filter{blindRing.contains($0)},blindRing),
+          (
+              (Set(blindRing).isSubset(of:Set(ring)) &&
+               sameCycle(ring.filter{blindRing.contains($0)},blindRing)) ||
+              corroboratedSeatedOnlyExtras(
+                  dealtRing:ring, seatedRing:blindRing,
+                  dealtPositions:points, earlierCards:p, currentCards:q,
+                  rosterOCR:now, blindFirstOCR:fdoc, blindConfirmedOCR:cdoc
+              )
+          ),
           let index=ring.firstIndex(of:dealer),
           ring[(index+1)%ring.count]==sb,
           ring[(index+2)%ring.count]==bb

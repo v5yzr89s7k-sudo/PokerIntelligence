@@ -1,0 +1,42 @@
+{
+  "case_alias": "POSITION_CONFIRMED_ONLY",
+  "deterministic": "3/3",
+  "forged_blind_proof": "REJECTED",
+  "historic_owner_counts_preserved": true,
+  "new_authoritative_actions": 0,
+  "new_live_verified_wagers": 172,
+  "numeric_amounts_changed": false,
+  "observer_sha256": "04317f5a8b72a9ad18cac179f6f03e495141afe4e21b131b78f6181ea419d269",
+  "original_frames_verified": 1416,
+  "parent_sha256": "5e555cfddf78939c1c7549786570c364f0b862060c9edf49173edb2470c1a52b",
+  "regressions": {
+    "live236": {
+      "before": 0,
+      "certified": 172,
+      "rosters": 2
+    },
+    "old236": {
+      "before": 229,
+      "certified": 229,
+      "rosters": 1
+    },
+    "old237": {
+      "before": 251,
+      "certified": 251,
+      "rosters": 1
+    },
+    "old353": {
+      "before": 191,
+      "certified": 191,
+      "rosters": 1
+    },
+    "old354": {
+      "before": 181,
+      "certified": 181,
+      "rosters": 2
+    }
+  },
+  "seated_only_players": "NOT_DEALT_IN",
+  "source_sha256": "4628b6a396a2ff4208297242fd6ce9fe941ba03cca3d6ea5363bcb7b47ed1a11",
+  "two_frame_blind_and_card_proof": "REQUIRED"
+}
