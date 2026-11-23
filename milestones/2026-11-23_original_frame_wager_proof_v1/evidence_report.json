@@ -1,0 +1,55 @@
+{
+  "amount_corroborated": 3,
+  "authoritative_actions_created": 0,
+  "authority": "READ_ONLY_NOT_HAND_HISTORY",
+  "input_observations": 14,
+  "negative_tests_rejected": 10,
+  "network_calls": 0,
+  "proofs": [
+    {
+      "from_frame": 249,
+      "hand": "2873620503",
+      "not_authoritative": true,
+      "original_fingerprints": [
+        "sha256:6293847b7900957ae6040b142750c7e0f96346275956155e5508fb0536d8a527",
+        "sha256:163a57153b18830ae6dd67f5811fdd9ddfafc4277115c0fc3b45cc4d53c5f97f"
+      ],
+      "overlay": "RAISE",
+      "player": "poker5068",
+      "to_frame": 250,
+      "wager_contribution_bb": "2.1"
+    },
+    {
+      "from_frame": 304,
+      "hand": "2873620503",
+      "not_authoritative": true,
+      "original_fingerprints": [
+        "sha256:856576df3ec2f31ff4e221e7334e376da8bece636f4fa0477285468f43d17d8d",
+        "sha256:179a73e9d7e1615796fa14f74b8c91b5f42fe5449dbafeff6f47dc6e8b072102"
+      ],
+      "overlay": "BET",
+      "player": "AlanCardioDoc",
+      "to_frame": 305,
+      "wager_contribution_bb": "3.33"
+    },
+    {
+      "from_frame": 313,
+      "hand": "2873620503",
+      "not_authoritative": true,
+      "original_fingerprints": [
+        "sha256:d875920014bce36444ac2384f3b355eed0a1064195c8f17fdbc8ff83c30e238f",
+        "sha256:fb1472c0c06a52df42e124f5de6e472d20396fca3aec414285078624c780cd84"
+      ],
+      "overlay": "RAISE",
+      "player": "poker5068",
+      "to_frame": 314,
+      "wager_contribution_bb": "8.16"
+    }
+  ],
+  "schema": "PI_ORIGINAL_FRAME_WAGER_CONTRIBUTION_V1",
+  "withheld": 11,
+  "withheld_reasons": {
+    "AMBIGUOUS_SAME_FRAME_ACTIONS": 3,
+    "NOT_PLAYER_WAGER": 8
+  }
+}

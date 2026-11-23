@@ -1,0 +1,24 @@
+{
+  "authoritative_actions_created": 0,
+  "corroborated_wager_contributions": 3,
+  "deterministic_replays": "3/3",
+  "evidence_hashes": {
+    "runtime/debug/action_numeric_crosslink_20261123_140055_36384/old353_crosslink_1.json": "b26313b009b6090a20d3a4a43ebe3fd6b692bb683c62442de0fd0537d3bc3326",
+    "runtime/debug/pi_numeric_continuity_20261123_134841_36072/old353.continuity_1.json": "3adc605c415e3bd33f1f21bb5b884ffaed0389d5908262c1e18d0b9995f970e2",
+    "runtime/debug/pi_rapid27_live_20261122_135243_23892/frames.json": "dc6b6a54ee0e06a5a09e1b4fdd22a6efbd3a440fd61969e716a254610f7cdd56",
+    "runtime/debug/pi_rapid27_live_20261122_135243_23892/local_action_candidates.json": "1116992472fb2bd0487355934eb552cc983a6864445484490a4a84ef8c80eae8",
+    "runtime/debug/pi_rapid27_live_20261122_135243_23892/local_board_observations.json": "2739c8c327293a8c48b8182115d3285a0213d8a578599e331775b768ade5e0a2"
+  },
+  "negative_tests": "10/10",
+  "original_recording": "pi_rapid27_live_20261122_135243_23892",
+  "parent_commit": "b723a168db49345ab14acfed2d245f8550b8a31a",
+  "protected_sources": {
+    "ActionNumericCrosslink.py": "08fe23c9c896be4113a37a9caacd3d4ea3e154bb47246f0e7b71d5558c549d3f",
+    "FullScreenVision.swift": "04317f5a8b72a9ad18cac179f6f03e495141afe4e21b131b78f6181ea419d269",
+    "NumericContinuity.swift": "42bac06c1a120a1036b45587c2a89582e96aca6954d4b0167e941773af7d1d73",
+    "QuantitativeReadOnly.swift": "88e60aafaf8b2e8995ba10b627da15567523c73b19cc6a1f57b1b28eb2cc6630"
+  },
+  "read_only": true,
+  "source_sha256": "32e6da8cf8945661b24e67b7a21dfc511608dec3871324703a9ba82785062a97",
+  "withheld_observations": 11
+}
