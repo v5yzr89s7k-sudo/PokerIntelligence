@@ -1,0 +1,16 @@
+{
+  "authoritative_actions_created": 0,
+  "deterministic": "3/3",
+  "hand": "2874006932",
+  "historical_control_verified_wagers": 199,
+  "new_verified_wager_observations": 292,
+  "numeric_source_sha256": "62c230e311debf9c34fee576ac4f42896c447c5dc6cf4e65e563d6c113e1ffcf",
+  "numeric_values_changed": false,
+  "observer_source_sha256": "04317f5a8b72a9ad18cac179f6f03e495141afe4e21b131b78f6181ea419d269",
+  "original_frames": 237,
+  "production_changed": false,
+  "recording": "pi_numeric_parallel_live_20261122_185310_29549",
+  "remaining_unresolved_wager_observations": 152,
+  "unresolved_physical_seats": 1,
+  "verified_seats": 7
+}

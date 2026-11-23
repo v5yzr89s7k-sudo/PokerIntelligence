@@ -1,0 +1,26 @@
+{
+  "authoritative_action_changes": 0,
+  "blind_ring_consistent": true,
+  "fully_verified_named_seats": [
+    "Vs96691",
+    "Pokerqueen1331",
+    "Simplysim",
+    "SVOBODA007",
+    "danny508",
+    "poker5068",
+    "natcool"
+  ],
+  "hand": "2874006932",
+  "original_frames": [
+    91,
+    92
+  ],
+  "physical_card_pairs_per_frame": 8,
+  "source_fingerprints": [
+    "sha256:ce413c8f2c1f37d3af75a18444e124316c1be67705b3d4e8bdf573d016a8226c",
+    "sha256:5be150fd167dd511951b06dffb8df02a4e349d33643ccc8a0cc08570fdc7c483"
+  ],
+  "truncated_name_is_not_full_identity": true,
+  "truncated_nameplate": "StealthDevilDog...",
+  "unresolved_physical_seat": "UNRESOLVED_LOWER_LEFT_SEAT"
+}
