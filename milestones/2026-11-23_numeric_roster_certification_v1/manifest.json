@@ -1,0 +1,43 @@
+{
+  "authoritative_actions_created": 0,
+  "deterministic": "3/3",
+  "forged_blind": "REJECTED",
+  "frames_verified": 1416,
+  "numeric_values_changed": false,
+  "observer_sha256": "04317f5a8b72a9ad18cac179f6f03e495141afe4e21b131b78f6181ea419d269",
+  "parent_sha256": "85560d3c3970b05a88daee6d68e64917c6e694339cbcabe80754a989342654be",
+  "regressions": {
+    "live236": {
+      "before": 375,
+      "certified": 0,
+      "frames": 236,
+      "rosters": 0
+    },
+    "old236": {
+      "before": 231,
+      "certified": 229,
+      "frames": 236,
+      "rosters": 1
+    },
+    "old237": {
+      "before": 251,
+      "certified": 251,
+      "frames": 237,
+      "rosters": 1
+    },
+    "old353": {
+      "before": 191,
+      "certified": 191,
+      "frames": 353,
+      "rosters": 1
+    },
+    "old354": {
+      "before": 207,
+      "certified": 181,
+      "frames": 354,
+      "rosters": 2
+    }
+  },
+  "source_sha256": "5e555cfddf78939c1c7549786570c364f0b862060c9edf49173edb2470c1a52b",
+  "unknown_seat": "BLOCKED"
+}

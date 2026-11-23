@@ -388,9 +388,149 @@ func unknownNumericSeatAnchors(_ roster:[String:Any]) -> [(Double,Double)] {
         return (x,y)
     }
 }
+// A Recorder roster is observational until its original frames and a
+// same-hand two-frame blind proof establish a causal eligibility point.
+// Never carry a player's name across hands or grant it before that point.
+func certifiedImportedNumericRoster(_ root:URL, _ row:[String:Any], through:Int) -> [String:Any]? {
+    guard let hand=row["hand"] as? String,
+          let ring=row["clockwiseRing"] as? [String],
+          let prior=row["priorFrame"] as? Int,
+          let frame=row["rosterFrame"] as? Int,
+          frame==prior+1, prior>=1, frame<=through,
+          (3...10).contains(ring.count),Set(ring).count==ring.count,
+          let fingerprint=row["sourceFingerprints"] as? [String],fingerprint.count==2,
+          let dealer=row["dealer"] as? String,
+          let sb=row["smallBlind"] as? String,
+          let bb=row["bigBlind"] as? String,
+          let btn=try? jsonFile(root.appendingPathComponent("observed_button_from_blinds.json")) as? [[String:Any]],
+          let boards=try? jsonFile(root.appendingPathComponent("local_board_observations.json")) as? [[String:Any]],
+          let cards=try? jsonFile(root.appendingPathComponent("observed_card_back_pairs.json")) as? [[String:Any]],
+          boards.count==cards.count,frame<=cards.count,
+          let older=try? loadOCR(root,prior),
+          let now=try? loadOCR(root,frame)
+    else {return nil}
+
+    let manifest=(try? jsonFile(root.appendingPathComponent("frames.json")) as? [[String:Any]]) ?? []
+    func sameHand(_ n:Int,_ doc:[String:Any]) -> Bool {
+        guard n>=1,n<=boards.count,n<=manifest.count,
+              let fp=doc["sourceFingerprint"] as? String,
+              doc["frame"] as? Int == n,
+              boards[n-1]["frame"] as? Int == n,
+              cards[n-1]["frame"] as? Int == n,
+              boards[n-1]["sourceFingerprint"] as? String == fp,
+              cards[n-1]["sourceFingerprint"] as? String == fp,
+              boards[n-1]["hand"] as? String == hand,
+              cards[n-1]["hand"] as? String == hand,
+              boards[n-1]["visibleBoardCount"] as? Int == 0
+        else {return false}
+        let ids=parseLines(doc).compactMap{captureMatch(rxHand,$0.text)}
+        guard ids.count==1,ids[0]==hand,
+              manifest[n-1]["id"] as? Int == n,
+              let relative=manifest[n-1]["file"] as? String,
+              !relative.hasPrefix("/"),!relative.contains("..")
+        else {return false}
+        #if canImport(CryptoKit)
+        guard let bytes=try? Data(contentsOf:root.appendingPathComponent(relative)) else {return false}
+        let digest=SHA256.hash(data:bytes).map{String(format:"%02x",$0)}.joined()
+        guard fp=="sha256:"+digest else {return false}
+        #endif
+        return true
+    }
+    guard sameHand(prior,older),sameHand(frame,now),
+          fingerprint[0] != fingerprint[1],
+          older["sourceFingerprint"] as? String == fingerprint[0],
+          now["sourceFingerprint"] as? String == fingerprint[1]
+    else {return nil}
+
+    // Physical card-back/face-up pairs are required for every seat.
+    func pairs(_ n:Int) -> [[String:Any]] {
+        (cards[n-1]["pairs"] as? [[String:Any]] ?? []) +
+        (cards[n-1]["faceUpPairs"] as? [[String:Any]] ?? [])
+    }
+    let p=pairs(prior),q=pairs(frame)
+    guard p.count==q.count,p.count==ring.count else {return nil}
+    var points=[String:(Double,Double)]()
+    let nowLines=parseLines(now)
+    let unknowns=ring.filter{$0.hasPrefix("UNRESOLVED_")}
+    let anchors=unknownNumericSeatAnchors(row)
+    guard unknowns.count<=1,unknowns.count==anchors.count else {return nil}
+    for name in ring {
+        if isInterfaceLabel(name) {return nil}
+        let x:Double,y:Double
+        if name.hasPrefix("UNRESOLVED_") {
+            guard let point=anchors.first else {return nil}
+            x=point.0;y=point.1
+        } else {
+            let lines=nowLines.filter{$0.text==name && $0.confidence>=0.8}
+            guard lines.count==1 else {return nil}
+            x=lines[0].x;y=lines[0].y
+            let stacks=nowLines.filter {
+                $0.confidence>=0.8 && captureMatch(rxAmount,$0.text) != nil &&
+                abs($0.x-x)<0.034 && y-$0.y>0.022 && y-$0.y<0.072
+            }
+            guard stacks.count==1 else {return nil}
+        }
+        for cardList in [p,q] {
+            let found=cardList.filter { card in
+                guard let px=card["x"] as? Double,let py=card["y"] as? Double else {return false}
+                return abs(px-x)<0.030 && (1-y)-py>0.030 && (1-y)-py<0.085
+            }
+            guard found.count==1 else {return nil}
+        }
+        points[name]=(x,y)
+    }
+    // A different seat may not claim the same physical card.
+    for cardList in [p,q] {
+        var claimed=Set<Int>()
+        for name in ring {
+            let point=points[name]!
+            let matches=cardList.indices.filter { i in
+                guard let x=cardList[i]["x"] as? Double,
+                      let y=cardList[i]["y"] as? Double else {return false}
+                return abs(x-point.0)<0.030 && (1-point.1)-y>0.030 && (1-point.1)-y<0.085
+            }
+            guard matches.count==1,claimed.insert(matches[0]).inserted else {return nil}
+        }
+        guard claimed.count==ring.count else {return nil}
+    }
+    func sameCycle(_ a:[String],_ b:[String]) -> Bool {
+        guard a.count==b.count else {return false}
+        return a.indices.contains{i in Array(a[i...])+Array(a[..<i]) == b}
+    }
+    let proofs=btn.filter { b in
+        b["hand"] as? String == hand &&
+        b["dealer"] as? String == dealer &&
+        b["smallBlind"] as? String == sb &&
+        b["bigBlind"] as? String == bb
+    }
+    guard proofs.count==1,let blind=proofs.first,
+          let f=blind["firstFrame"] as? Int,
+          let c=blind["confirmedFrame"] as? Int,
+          c==f+1,c<=through,
+          let fdoc=try? loadOCR(root,f),let cdoc=try? loadOCR(root,c),
+          sameHand(f,fdoc),sameHand(c,cdoc),
+          fdoc["sourceFingerprint"] as? String == blind["firstFingerprint"] as? String,
+          cdoc["sourceFingerprint"] as? String == blind["confirmedFingerprint"] as? String,
+          let blindRing=blind["clockwiseRing"] as? [String],
+          Set(blindRing).isSubset(of:Set(ring)),
+          sameCycle(ring.filter{blindRing.contains($0)},blindRing),
+          let index=ring.firstIndex(of:dealer),
+          ring[(index+1)%ring.count]==sb,
+          ring[(index+2)%ring.count]==bb
+    else {return nil}
+
+    var certified=row
+    certified["eligibleFromFrame"]=max(c,frame)
+    certified["unresolvedPhysicalSeats"]=unknowns.count
+    certified["unresolvedSeatAnchors"]=anchors.map{["x":$0.0,"y":$0.1]}
+    certified["identityProof"]="BLIND_AND_ORIGINAL_CARD_FRAMES"
+    return certified
+}
+
 func allNumericRosters(_ root:URL, through:Int) -> [[String:Any]] {
     let file=root.appendingPathComponent("observed_verified_dealt_in_rosters.json")
-    var existing=(try? jsonFile(file) as? [[String:Any]]) ?? []
+    let untrusted=(try? jsonFile(file) as? [[String:Any]]) ?? []
+    var existing=untrusted.compactMap{certifiedImportedNumericRoster(root,$0,through:through)}
     for candidate in recoveredPartialNumericRosters(root,through:through) {
         guard let hand=candidate["hand"] as? String else {continue}
         if let i=existing.firstIndex(where:{$0["hand"] as? String == hand}) {
@@ -641,7 +781,7 @@ func followNumericSession(
         let args=CommandLine.arguments
         if args.count==4 && args[1]=="--native-roster-proof" {
             guard let n=Int(args[3]) else {throw NSError(domain:"BAD_FRAME",code:1)}
-            let items=recoveredPartialNumericRosters(URL(fileURLWithPath:args[2]),through:n)
+            let items=allNumericRosters(URL(fileURLWithPath:args[2]),through:n)
             let data=try JSONSerialization.data(withJSONObject:items,options:[.prettyPrinted,.sortedKeys])
             print(String(decoding:data,as:UTF8.self))
         } else if args.count==4 && args[1]=="--check" {
