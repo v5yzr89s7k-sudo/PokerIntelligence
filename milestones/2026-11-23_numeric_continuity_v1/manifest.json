@@ -1,0 +1,28 @@
+{
+  "authoritative_actions_created": 0,
+  "candidate_sha256": "42bac06c1a120a1036b45587c2a89582e96aca6954d4b0167e941773af7d1d73",
+  "determinism": "3/3 per evidence root",
+  "does_not_publish_actions": true,
+  "network_calls": 0,
+  "original_image_provenance": "NATIVE_INCREMENTAL_REPLAY_VERIFIED_AND_EQUAL_TO_SCAN",
+  "protected_numeric_sha256": "88e60aafaf8b2e8995ba10b627da15567523c73b19cc6a1f57b1b28eb2cc6630",
+  "protected_observer_sha256": "04317f5a8b72a9ad18cac179f6f03e495141afe4e21b131b78f6181ea419d269",
+  "recorded_replays": {
+    "live236": {
+      "adjacent_balanced_pairs": 110,
+      "frames": 236,
+      "input_numeric_snapshots": 221,
+      "observations": 9,
+      "withheld": 109
+    },
+    "old353": {
+      "adjacent_balanced_pairs": 299,
+      "frames": 353,
+      "input_numeric_snapshots": 324,
+      "observations": 14,
+      "withheld": 23
+    }
+  },
+  "stage": "READ_ONLY_TEMPORAL_NUMERIC_EVIDENCE",
+  "synthetic_self_test": "3/3"
+}
