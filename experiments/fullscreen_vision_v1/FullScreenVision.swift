@@ -1581,6 +1581,7 @@ actor Recorder {
     var durableCommits = [DurableCommit]()
     var localOCR = [LocalOCRFrame]()
     var blindPositions = [String:BlindButtonEvidence]()
+    var handPhysicalBlinds = [String:HandPhysicalBlinds]()
     var blindEvidenceExaminedThrough = 1
     var physicalRosters = [String:PhysicalDealtInRoster]()
     var namedCardEvidence = [String:NamedCardPresence]()
@@ -1590,6 +1591,43 @@ actor Recorder {
     func refreshBlindEvidence() {
         while blindEvidenceExaminedThrough < localOCR.count {
             let i = blindEvidenceExaminedThrough
+            if let p = confirmedPhysicalBlinds(
+                localOCR[i-1],localOCR[i]
+            ),
+               handPhysicalBlinds[p.hand] == nil,
+               p.firstFrame >= 1,
+               p.confirmedFrame <= frames.count,
+               p.confirmedFrame <= localBoard.count,
+               localBoard[p.firstFrame-1].hand == p.hand,
+               localBoard[p.confirmedFrame-1].hand == p.hand,
+               localBoard[p.firstFrame-1].visibleBoardCount == 0,
+               localBoard[p.confirmedFrame-1].visibleBoardCount == 0 {
+
+                func imageOwned(_ n:Int,_ fp:String) -> Bool {
+                    let f = frames[n-1]
+
+                    guard f.id == n,
+                          f.file.hasPrefix("frames/"),
+                          !f.file.contains(".."),
+                          let data = try? Data(
+                              contentsOf:directory.appendingPathComponent(
+                                  f.file
+                              ))
+                    else {return false}
+
+                    return frameFingerprint(data) == fp
+                }
+
+                if imageOwned(
+                    p.firstFrame,p.firstFingerprint
+                ) && imageOwned(
+                    p.confirmedFrame,p.confirmedFingerprint
+                ) {
+                    // Freeze first verified blind seats by hand ID.
+                    handPhysicalBlinds[p.hand] = p
+                }
+            }
+
             if let proof = confirmedBlindButton(localOCR[i-1],localOCR[i]) {
                 if let old = blindPositions[proof.hand] {
                     if proof.clockwiseRing.count > old.clockwiseRing.count {
@@ -2422,6 +2460,19 @@ actor Recorder {
         try encoded(blindPositions.values.sorted { $0.firstFrame < $1.firstFrame }).write(
             to:directory.appendingPathComponent("observed_button_from_blinds.json"),
             options:.atomic)
+        try encoded(
+            handPhysicalBlinds.values.filter {
+                $0.confirmedFrame <= cursor
+            }.sorted {
+                $0.firstFrame < $1.firstFrame
+            }
+        ).write(
+            to:directory.appendingPathComponent(
+                "observed_hand_blind_seats.json"
+            ),
+            options:.atomic
+        )
+
         // Projections cannot lead the durable transaction cursor.
         let committedNamedCards = checkpointEligibleNamedCards(
             Array(namedCardEvidence.values), through:cursor
@@ -4043,6 +4094,127 @@ func live354RecorderWagerReplay(
         "RECORDER_CHECKPOINT_MISMATCH"
     )
 
+
+    let saved = try d.decode(
+        [HandPhysicalBlinds].self,
+        from:Data(contentsOf:temp.appendingPathComponent(
+            "observed_hand_blind_seats.json"
+        ))
+    )
+
+    try require(
+        saved.count == 2,
+        "PHYSICAL_BLIND_COUNT_CHANGED"
+    )
+
+    let h1 = saved.first {$0.hand == "2874688303"}
+    let h2 = saved.first {$0.hand == "2874689539"}
+
+    try require(
+        h1 != nil && h2 != nil &&
+        h1!.firstFrame == 7 &&
+        h1!.confirmedFrame == 8 &&
+        h1!.smallBlind.name == "Kkos101" &&
+        h1!.bigBlind.name == "poker5068" &&
+        h2!.firstFrame == 166 &&
+        h2!.confirmedFrame == 167 &&
+        h2!.smallBlind.name == "poker5068" &&
+        h2!.bigBlind.name == nil &&
+        abs(h2!.bigBlind.seatX - 0.279) < 0.012 &&
+        abs(h2!.bigBlind.seatY - 0.233) < 0.012,
+        "PER_HAND_BLIND_SEAT_IDENTITY_CHANGED"
+    )
+
+    for proof in saved {
+        for (n, fp) in [
+            (proof.firstFrame, proof.firstFingerprint),
+            (proof.confirmedFrame, proof.confirmedFingerprint)
+        ] {
+            let frame = frames[n-1]
+
+            try require(
+                frame.id == n &&
+                frame.file.hasPrefix("frames/") &&
+                !frame.file.contains("..") &&
+                frameFingerprint(
+                    try Data(contentsOf:
+                        input.appendingPathComponent(frame.file))
+                ) == fp &&
+                boards[n-1].hand == proof.hand &&
+                boards[n-1].visibleBoardCount == 0,
+                "BLIND_ORIGINAL_FRAME_PROVENANCE_FAILED"
+            )
+        }
+    }
+
+    func prior(_ n:Int) throws -> LocalOCRFrame {
+        try d.decode(
+            LocalOCRFrame.self,
+            from:Data(contentsOf:
+                input.appendingPathComponent(
+                    String(format:"local_ocr/%06d.json",n)
+                )
+            )
+        )
+    }
+
+    let a = try prior(166)
+    let b = try prior(167)
+
+    try require(
+        confirmedPhysicalBlinds(a,b) != nil &&
+        confirmedPhysicalBlinds(a,a) == nil &&
+        confirmedPhysicalBlinds(
+            try prior(159),try prior(160)
+        ) == nil,
+        "INVALID_HAND_BOUNDARY_PROOF"
+    )
+
+    let without = LocalOCRFrame(
+        frame:b.frame,
+        sourceFingerprint:b.sourceFingerprint,
+        capture:LocalOCRCapture(
+            elapsed_ms:b.capture.elapsed_ms,
+            lines:b.capture.lines.filter {
+                $0.text.trimmingCharacters(
+                    in:.whitespaces
+                ) != "1 BB"
+            },
+            error:b.capture.error
+        )
+    )
+
+    try require(
+        confirmedPhysicalBlinds(a,without) == nil,
+        "MISSING_BIG_BLIND_ACCEPTED"
+    )
+
+    let duplicated = LocalOCRFrame(
+        frame:b.frame,
+        sourceFingerprint:b.sourceFingerprint,
+        capture:LocalOCRCapture(
+            elapsed_ms:b.capture.elapsed_ms,
+            lines:b.capture.lines +
+                b.capture.lines.filter {
+                    $0.text.trimmingCharacters(
+                        in:.whitespaces
+                    ) == "1 BB"
+                },
+            error:b.capture.error
+        )
+    )
+
+    try require(
+        confirmedPhysicalBlinds(a,duplicated) == nil,
+        "DUPLICATE_BLIND_ACCEPTED"
+    )
+
+    print(
+        "PHYSICAL_BLIND_MEMORY_PASS hands=2 " +
+        "second_BB=UNNAMED_PHYSICAL_SEAT " +
+        "negatives=4 actions=0"
+    )
+
     let named = try d.decode(
         [NamedCardPresence].self,
         from: Data(contentsOf:
@@ -4814,6 +4986,202 @@ func visualBoard(image: CGImage) -> [Box] {
 struct BlindSeat: Equatable {
     let name: String, x: Double, y: Double
 }
+import Foundation
+
+// Freeze observed blind seats by hand ID, independently of player names.
+struct PhysicalBlindSeat: Codable, Equatable {
+    let seatX: Double
+    let seatY: Double
+    let name: String?
+    let postX: Double
+    let postY: Double
+}
+
+struct HandPhysicalBlinds: Codable, Equatable {
+    let hand: String
+    let firstFrame: Int
+    let confirmedFrame: Int
+    let firstFingerprint: String
+    let confirmedFingerprint: String
+    let smallBlind: PhysicalBlindSeat
+    let bigBlind: PhysicalBlindSeat
+    let basis: String
+}
+
+struct PhysicalBlindSnapshot {
+    let hand: String
+    let frame: Int
+    let fingerprint: String
+    let sb: PhysicalBlindSeat
+    let bb: PhysicalBlindSeat
+}
+
+func physicalBlindSnapshot(
+    _ frame: LocalOCRFrame
+) -> PhysicalBlindSnapshot? {
+    guard frame.capture.error == nil,
+          let hand = currentLocalHand(frame.capture)
+    else { return nil }
+
+    let lines = frame.capture.lines
+
+    func stack(_ text: String) -> Bool {
+        text.range(
+            of: #"^[0-9]{1,4}(\.[0-9]{1,3})?\s+BB$"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
+    }
+
+    // Keep a SITTING OUT seat as a physical location,
+    // never as a known player identity.
+    let seats = lines.filter { line in
+        let value = line.text.trimmingCharacters(
+            in: .whitespaces
+        )
+        guard line.confidence >= 0.8,
+              value == "SITTING OUT" ||
+              plausibleACRPlayerName(value)
+        else { return false }
+
+        return lines.filter { amount in
+            amount.confidence >= 0.8 &&
+            stack(amount.text) &&
+            abs(amount.x-line.x) < 0.028 &&
+            line.y-amount.y > 0.025 &&
+            line.y-amount.y < 0.058
+        }.count == 1
+    }
+
+    guard (3...10).contains(seats.count)
+    else { return nil }
+
+    let cx = (
+        seats.map { $0.x }.min()! +
+        seats.map { $0.x }.max()!
+    ) / 2
+
+    let cy = (
+        seats.map { $0.y }.min()! +
+        seats.map { $0.y }.max()!
+    ) / 2
+
+    func owner(_ label: String) -> PhysicalBlindSeat? {
+        var candidates = [PhysicalBlindSeat]()
+
+        for chip in lines where
+            chip.confidence >= 0.8 &&
+            chip.text.trimmingCharacters(
+                in: .whitespaces
+            ) == label {
+
+            let ranked = seats.compactMap {
+                seat -> (Double, LocalOCRLine)? in
+
+                let dx = chip.x-seat.x
+                let dy = chip.y-seat.y
+                let distance = hypot(dx,dy)
+                let inward =
+                    dx*(cx-seat.x) + dy*(cy-seat.y)
+
+                guard distance >= 0.07,
+                      distance <= 0.235,
+                      inward > 0.01
+                else { return nil }
+
+                return (distance,seat)
+            }.sorted { $0.0 < $1.0 }
+
+            guard let first = ranked.first,
+                  ranked.count == 1 ||
+                  ranked[1].0-first.0 > 0.025
+            else { continue }
+
+            candidates.append(PhysicalBlindSeat(
+                seatX:first.1.x,
+                seatY:first.1.y,
+                name:first.1.text == "SITTING OUT"
+                    ? nil : first.1.text,
+                postX:chip.x,
+                postY:chip.y
+            ))
+        }
+
+        return candidates.count == 1
+            ? candidates[0] : nil
+    }
+
+    guard let sb = owner("0.5 BB"),
+          let bb = owner("1 BB"),
+          hypot(
+              sb.seatX-bb.seatX,
+              sb.seatY-bb.seatY
+          ) > 0.09
+    else { return nil }
+
+    return PhysicalBlindSnapshot(
+        hand:hand,
+        frame:frame.frame,
+        fingerprint:frame.sourceFingerprint,
+        sb:sb,
+        bb:bb
+    )
+}
+
+func confirmedPhysicalBlinds(
+    _ a: LocalOCRFrame,
+    _ b: LocalOCRFrame
+) -> HandPhysicalBlinds? {
+    guard a.frame+1 == b.frame,
+          a.sourceFingerprint != b.sourceFingerprint,
+          let x = physicalBlindSnapshot(a),
+          let y = physicalBlindSnapshot(b),
+          x.hand == y.hand
+    else { return nil }
+
+    func stable(
+        _ p:PhysicalBlindSeat,
+        _ q:PhysicalBlindSeat
+    ) -> Bool {
+        abs(p.seatX-q.seatX) < 0.012 &&
+        abs(p.seatY-q.seatY) < 0.012 &&
+        abs(p.postX-q.postX) < 0.012 &&
+        abs(p.postY-q.postY) < 0.012 &&
+        (
+            p.name == nil ||
+            q.name == nil ||
+            p.name == q.name
+        )
+    }
+
+    guard stable(x.sb,y.sb),
+          stable(x.bb,y.bb)
+    else { return nil }
+
+    return HandPhysicalBlinds(
+        hand:x.hand,
+        firstFrame:a.frame,
+        confirmedFrame:b.frame,
+        firstFingerprint:x.fingerprint,
+        confirmedFingerprint:y.fingerprint,
+        smallBlind:PhysicalBlindSeat(
+            seatX:x.sb.seatX,
+            seatY:x.sb.seatY,
+            name:x.sb.name ?? y.sb.name,
+            postX:x.sb.postX,
+            postY:x.sb.postY
+        ),
+        bigBlind:PhysicalBlindSeat(
+            seatX:x.bb.seatX,
+            seatY:x.bb.seatY,
+            name:x.bb.name ?? y.bb.name,
+            postX:x.bb.postX,
+            postY:x.bb.postY
+        ),
+        basis:
+          "TWO_SAME_HAND_POSTED_BLINDS; PHYSICAL_SEATS; NO_UNKNOWN_PLAYER_NAME_INVENTED"
+    )
+}
+
 struct BlindButtonSnapshot: Equatable {
     let hand: String, frame: Int, fingerprint: String
     let ring: [String], smallBlind: String, bigBlind: String, dealer: String

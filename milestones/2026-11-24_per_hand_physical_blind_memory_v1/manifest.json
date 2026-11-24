@@ -1,0 +1,16 @@
+{
+  "authoritative_actions_created": 0,
+  "full_recorder_determinism": "3/3",
+  "original_blind_frames": [
+    7,
+    8,
+    166,
+    167
+  ],
+  "parent_commit": "b47e01517289af929cd5ce722a4b1d751236e53d",
+  "per_hand_frozen_blind_seats": true,
+  "positions_from_dealer": "NOT_YET_CERTIFIED",
+  "second_big_blind_player_name": "UNKNOWN",
+  "sidecar": "observed_hand_blind_seats.json",
+  "source_sha256": "34c0d48bb6e96986e85e22f83d21441e1303bb69b5ea7173cb8c0abde472d143"
+}
