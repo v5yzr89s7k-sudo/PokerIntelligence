@@ -2187,12 +2187,11 @@ actor Recorder {
         try encoded(blindPositions.values.sorted { $0.firstFrame < $1.firstFrame }).write(
             to:directory.appendingPathComponent("observed_button_from_blinds.json"),
             options:.atomic)
-        // Recorder-owned observation only; no action authority.
-        try encoded(namedCardEvidence.values.sorted {
-            $0.hand == $1.hand
-                ? $0.player < $1.player
-                : $0.hand < $1.hand
-        }).write(
+        // Projections cannot lead the durable transaction cursor.
+        let committedNamedCards = checkpointEligibleNamedCards(
+            Array(namedCardEvidence.values), through:cursor
+        )
+        try encoded(committedNamedCards).write(
             to:directory.appendingPathComponent(
                 "observed_named_hole_card_pairs.json"),
             options:.atomic
@@ -3552,6 +3551,39 @@ func readOnlyNamedCardRegression(_ root:URL) throws {
         "SAME_FRAME_PROOF"
     )
 
+    let sourced=Array(earliest.values)
+    for (cursor,expected) in [
+        (7,0),(8,6),(166,6),(167,12),(354,12)
+    ] {
+        let published=checkpointEligibleNamedCards(
+            sourced,through:cursor
+        )
+        try require(
+            published.count==expected,
+            "NAMED_CARD_PROOF_AHEAD_OF_DURABLE_CURSOR_\(cursor)"
+        )
+        try require(
+            published.allSatisfy{$0.confirmedFrame <= cursor},
+            "UNCOMMITTED_CARD_PROOF_PUBLISHED"
+        )
+    }
+    let at166=checkpointEligibleNamedCards(
+        sourced,through:166
+    )
+    try require(
+        at166.allSatisfy{$0.hand == "2874688303"},
+        "SECOND_HAND_VISIBLE_BEFORE_CHECKPOINT"
+    )
+    let at167=checkpointEligibleNamedCards(
+        sourced,through:167
+    )
+    try require(
+        at167.filter{$0.hand == "2874689539"}.count==6,
+        "SECOND_HAND_NOT_PUBLISHED_AT_COMMIT"
+    )
+    print(
+        "NAMED_CARD_CHECKPOINT_GATE_PASS 7:0 8:6 166:6 167:12 354:12"
+    )
     print(
         "NAMED_CARD_MEMBERSHIP_PASS hand1=6@8 hand2=6@167 negative=7 unknown_blind=WITHHELD actions_created=0"
     )
@@ -4355,6 +4387,24 @@ func namedCardPresence(
             $0.0.player == item.0.player
         }.count == 1
     }.map {$0.0}.sorted {$0.player < $1.player}
+}
+
+// Physical evidence can be computed ahead of publication,
+// but cannot appear in a Recorder sidecar before its checkpoint.
+func checkpointEligibleNamedCards(
+    _ evidence:[NamedCardPresence], through cursor:Int
+) -> [NamedCardPresence] {
+    evidence.filter {
+        $0.priorFrame >= 1 &&
+        $0.confirmedFrame == $0.priorFrame+1 &&
+        $0.confirmedFrame <= cursor &&
+        $0.sourceFingerprints.count == 2 &&
+        $0.sourceFingerprints[0] != $0.sourceFingerprints[1]
+    }.sorted {
+        $0.hand == $1.hand
+            ? $0.player < $1.player
+            : $0.hand < $1.hand
+    }
 }
 
 struct PhysicalDealtInRoster: Codable, Equatable {

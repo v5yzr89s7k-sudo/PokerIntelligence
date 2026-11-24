@@ -1,0 +1,21 @@
+{
+  "authoritative_actions_created": 0,
+  "checkpoint_cursor_gate": true,
+  "current_hand_semantics_changed": false,
+  "named_card_determinism": "3/3",
+  "new_source_sha256": "9fa7bccff0969680cfec75ef783d0ea7f1278f18cdd5197d440123223f3f9914",
+  "old_source_sha256": "f2359a6a2dbc15ee019d7daf0cad7511df35d1d9506363ed38b19c78257cd657",
+  "parent_commit": "19946cf5a502ad3c09c03adda497be4963a1f21d",
+  "previous_negative_cases": 7,
+  "rapid_determinism": "3/3",
+  "sidecar": "observed_named_hole_card_pairs.json",
+  "test_cutoffs": {
+    "166": 6,
+    "167": 12,
+    "354": 12,
+    "7": 0,
+    "8": 6
+  },
+  "unknown_big_blind": "UNRESOLVED",
+  "wager_determinism": "3/3"
+}
