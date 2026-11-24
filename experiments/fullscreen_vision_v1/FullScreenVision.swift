@@ -1183,6 +1183,132 @@ func physicalWagerContribution(
     return String(describing:value)
 }
 
+
+// Same-hand named hole-card proof can authorize a player's OBSERVED chip
+// contribution without authorizing button positions or a raise-to amount.
+// This is an alternative eligibility gate, not a second event writer.
+func namedCardWagerContribution(
+    _ c: LocalActionCandidate,
+    previous: LocalOCRFrame, current: LocalOCRFrame,
+    previousBoard: LocalBoardObservation, currentBoard: LocalBoardObservation,
+    previousImage: Frame, currentImage: Frame,
+    sameFrameCandidates: [LocalActionCandidate],
+    member: NamedCardPresence,
+    memberOlder: LocalOCRFrame, memberNow: LocalOCRFrame,
+    memberOlderBoard: LocalBoardObservation, memberNowBoard: LocalBoardObservation,
+    memberOlderCards: FrameCardPairs, memberNowCards: FrameCardPairs,
+    memberOlderImage: Frame, memberNowImage: Frame,
+    firstActionFrame: Int, root: URL
+) -> String? {
+    guard Set(["CALL","BET","RAISE"]).contains(c.overlay),
+          localSemanticSupported(c), !c.sameFrameOrderUnknown,
+          c.labelConfidence >= 0.8,
+          c.beforeFrame >= 2, c.beforeFrame+1 == c.frame,
+          previous.frame == c.beforeFrame, current.frame == c.frame,
+          previousImage.id == previous.frame, currentImage.id == current.frame,
+          previous.sourceFingerprint == c.beforeFingerprint,
+          current.sourceFingerprint == c.currentFingerprint,
+          c.beforeFingerprint != c.currentFingerprint,
+          previous.capture.error == nil, current.capture.error == nil,
+          currentLocalHand(previous.capture) == c.hand,
+          currentLocalHand(current.capture) == c.hand,
+          previousBoard.hand == c.hand, currentBoard.hand == c.hand,
+          previousBoard.frame == previous.frame,
+          currentBoard.frame == current.frame,
+          previousBoard.sourceFingerprint == c.beforeFingerprint,
+          currentBoard.sourceFingerprint == c.currentFingerprint,
+          previousBoard.visibleBoardCount == currentBoard.visibleBoardCount,
+          [0,3,4,5].contains(currentBoard.visibleBoardCount),
+          currentImage.captured > previousImage.captured,
+          currentImage.captured-currentImage.started < 1.5,
+          currentImage.captured-previousImage.captured < 1.5,
+          sameFrameCandidates.count == 1, sameFrameCandidates[0] == c,
+          member.hand == c.hand, member.player == c.player,
+          member.priorFrame >= 1,
+          member.confirmedFrame == member.priorFrame+1,
+          member.confirmedFrame < firstActionFrame,
+          firstActionFrame <= c.frame,
+          member.confirmedFrame < c.beforeFrame,
+          member.sourceFingerprints.count == 2,
+          member.sourceFingerprints[0] != member.sourceFingerprints[1],
+          memberOlderImage.id == member.priorFrame,
+          memberNowImage.id == member.confirmedFrame,
+          memberOlder.sourceFingerprint == member.sourceFingerprints[0],
+          memberNow.sourceFingerprint == member.sourceFingerprints[1],
+          let displayed=c.displayedWager, displayed.confidence>=0.8,
+          displayed.priorDisplayedWagerBB == nil,
+          let after=c.afterStackBB,
+          let stack0=Decimal(string:c.beforeStackBB,locale:Locale(identifier:"en_US_POSIX")),
+          let stack1=Decimal(string:after,locale:Locale(identifier:"en_US_POSIX")),
+          let value=Decimal(string:displayed.amountBB,locale:Locale(identifier:"en_US_POSIX")),
+          value > 0, stack0-stack1 == value,
+          c.observedStackDeltaBB == String(describing:stack1-stack0)
+    else {return nil}
+
+    func original(_ frame:Frame,_ fp:String) -> Bool {
+        guard frame.file.hasPrefix("frames/"),!frame.file.contains(".."),
+              let bytes=try? Data(contentsOf:root.appendingPathComponent(frame.file))
+        else {return false}
+        return frameFingerprint(bytes)==fp
+    }
+    guard original(previousImage,c.beforeFingerprint),
+          original(currentImage,c.currentFingerprint),
+          original(memberOlderImage,member.sourceFingerprints[0]),
+          original(memberNowImage,member.sourceFingerprints[1]),
+          namedCardPresence(
+            previous:memberOlder,current:memberNow,
+            previousBoard:memberOlderBoard,currentBoard:memberNowBoard,
+            previousCards:memberOlderCards,currentCards:memberNowCards
+          ).contains(member)
+    else {return nil}
+
+    let older=previous.capture.lines.filter{$0.confidence>=0.8}
+    let newer=current.capture.lines.filter{$0.confidence>=0.8}
+    func close(_ r:LocalOCRLine,_ x:Double,_ y:Double,_ dx:Double=0.017,_ dy:Double=0.020) -> Bool {
+        abs(r.x-x)<dx && abs(r.y-y)<dy
+    }
+    func exact(_ rows:[LocalOCRLine],_ t:String,_ x:Double,_ y:Double) -> Bool {
+        rows.filter{$0.text.trimmingCharacters(in:.whitespaces)==t && close($0,x,y)}.count==1
+    }
+    guard exact(older,c.player,c.x,c.y),
+          exact(newer,c.overlay,c.x,c.y),
+          exact(newer,displayed.text,displayed.x,displayed.y),
+          !older.contains(where:{
+             $0.text.trimmingCharacters(in:.whitespaces)==displayed.text && close($0,displayed.x,displayed.y)
+          }) else {return nil}
+
+    func numeric(_ t:String,_ kind:String) -> Decimal? {
+        let pattern:String
+        switch kind {
+        case "stack":pattern=#"^\s*([0-9]+(?:\.[0-9]{1,2})?)\s*BB\s*$"#
+        case "total":pattern=#"^\s*Total\s*:\s*([0-9]+(?:\.[0-9]{1,2})?)\s*BB\s*$"#
+        case "pot":pattern=#"^\s*Pot\s+([0-9]+(?:\.[0-9]{1,2})?)\s*BB\s*$"#
+        default:return nil
+        }
+        guard let re=try? NSRegularExpression(pattern:pattern,options:[.caseInsensitive]),
+              let m=re.firstMatch(in:t,range:NSRange(t.startIndex...,in:t)),
+              let r=Range(m.range(at:1),in:t) else{return nil}
+        return Decimal(string:String(t[r]),locale:Locale(identifier:"en_US_POSIX"))
+    }
+    func unique(_ rows:[LocalOCRLine],_ kind:String,
+                near:(Double,Double,Double,Double)?=nil) -> Decimal? {
+        let vals=rows.compactMap { r -> Decimal? in
+            if let p=near,!close(r,p.0,p.1,p.2,p.3){return nil}
+            return numeric(r.text,kind)
+        }
+        return vals.count==1 ? vals[0]:nil
+    }
+    guard unique(newer,"stack",near:(displayed.x,displayed.y,0.017,0.020)) == value,
+          unique(older,"stack",near:(displayed.x,displayed.y,0.017,0.020)) == nil,
+          unique(older,"stack",near:(c.x,c.y-0.042,0.020,0.023)) == stack0,
+          unique(newer,"stack",near:(c.x,c.y-0.042,0.020,0.023)) == stack1,
+          let total0=unique(older,"total"),let total1=unique(newer,"total"),
+          total1-total0 == value,
+          let pot0=unique(older,"pot"),let pot1=unique(newer,"pot"),pot0==pot1
+    else{return nil}
+    return String(describing:value) // Contribution now; NEVER a raise-to amount.
+}
+
 // Only evidence-backed local OCR transitions may enter semantic history.
 // No wager or raise-to amount is certified by the stack difference alone.
 func localSemanticSupported(_ c: LocalActionCandidate) -> Bool {
@@ -1856,40 +1982,58 @@ actor Recorder {
         for n in max(2,recorderWagerScannedThrough+1)...upper {
             let candidates=localActions.filter{$0.frame==n}
             for c in candidates {
-                guard let blind=blindPositions[c.hand],
-                      let roster=physicalRosters[c.hand],
-                      blind.firstFrame >= 1,
-                      blind.confirmedFrame <= frames.count,
-                      roster.priorFrame >= 1,
-                      roster.rosterFrame <= frames.count,
-                      roster.rosterFrame < c.beforeFrame,
-                      let contribution=physicalWagerContribution(
-                        c,
+                let positionalReady = blindPositions[c.hand] != nil && physicalRosters[c.hand] != nil
+                var contribution:String? = nil
+                var authority="READ_ONLY_ORIGINAL_FRAMES_AND_BLIND_PROOF; NO_RAISE_TO"
+                if positionalReady,
+                   let blind=blindPositions[c.hand],let roster=physicalRosters[c.hand],
+                   blind.firstFrame>=1,blind.confirmedFrame<=frames.count,
+                   roster.priorFrame>=1,roster.rosterFrame<=frames.count,
+                   roster.rosterFrame<c.beforeFrame {
+                    contribution=physicalWagerContribution(c,
                         previous:localOCR[n-2],current:localOCR[n-1],
                         previousBoard:localBoard[n-2],currentBoard:localBoard[n-1],
                         previousImage:frames[n-2],currentImage:frames[n-1],
-                        sameFrameCandidates:candidates,
-                        blind:blind,
+                        sameFrameCandidates:candidates,blind:blind,
                         blindFirst:frames[blind.firstFrame-1],
                         blindSecond:frames[blind.confirmedFrame-1],
-                        roster:roster,
-                        rosterFirst:frames[roster.priorFrame-1],
-                        rosterSecond:frames[roster.rosterFrame-1],
-                        root:directory
-                      ) else {continue}
-                let eventMatched=events.contains { event in
+                        roster:roster,rosterFirst:frames[roster.priorFrame-1],
+                        rosterSecond:frames[roster.rosterFrame-1],root:directory)
+                } else if !positionalReady,
+                          let p=namedCardEvidence[c.hand+"|"+c.player],
+                          p.priorFrame>=1,p.confirmedFrame<=frames.count,
+                          let first=localActions.filter({$0.hand==c.hand}).map(\.frame).min(),
+                          p.confirmedFrame<first,p.confirmedFrame<c.beforeFrame {
+                    contribution=namedCardWagerContribution(c,
+                        previous:localOCR[n-2],current:localOCR[n-1],
+                        previousBoard:localBoard[n-2],currentBoard:localBoard[n-1],
+                        previousImage:frames[n-2],currentImage:frames[n-1],
+                        sameFrameCandidates:candidates,member:p,
+                        memberOlder:localOCR[p.priorFrame-1],
+                        memberNow:localOCR[p.confirmedFrame-1],
+                        memberOlderBoard:localBoard[p.priorFrame-1],
+                        memberNowBoard:localBoard[p.confirmedFrame-1],
+                        memberOlderCards:localCardBacks[p.priorFrame-1],
+                        memberNowCards:localCardBacks[p.confirmedFrame-1],
+                        memberOlderImage:frames[p.priorFrame-1],
+                        memberNowImage:frames[p.confirmedFrame-1],
+                        firstActionFrame:first,root:directory)
+                    authority="READ_ONLY_NAMED_CARD_PROOF; BLIND_POSITION_UNKNOWN; NO_RAISE_TO"
+                }
+                guard let value=contribution else {continue}
+                let matched=events.contains { event in
                     event.hand==c.hand && event.frame==c.frame &&
                     event.kind=="action" && event.text==localSemanticText(c)
                 }
+                // A named-only attribution may annotate an EXISTING action,
+                // but may never create one or fill a missing chronology gap.
+                if !positionalReady && !matched {continue}
                 recorderWagerEvidence.append(RecorderObservedWager(
                     hand:c.hand,player:c.player,overlay:c.overlay,
                     fromFrame:c.beforeFrame,toFrame:c.frame,
-                    contributionBB:contribution,
-                    fromFingerprint:c.beforeFingerprint,
+                    contributionBB:value,fromFingerprint:c.beforeFingerprint,
                     toFingerprint:c.currentFingerprint,
-                    matchedCommittedAction:eventMatched,
-                    authority:"READ_ONLY_ORIGINAL_FRAMES_AND_BLIND_PROOF; DEALT_IN_NUMERIC_OWNER_NOT_CERTIFIED; NO_RAISE_TO"
-                ))
+                    matchedCommittedAction:matched,authority:authority))
             }
         }
         recorderWagerScannedThrough=upper
@@ -3589,11 +3733,83 @@ func readOnlyNamedCardRegression(_ root:URL) throws {
     )
 }
 
+
+func readOnlyNamedCardWagerRegression(_ root:URL) throws {
+    let d=JSONDecoder()
+    let frames=try d.decode([Frame].self,from:Data(contentsOf:root.appendingPathComponent("frames.json")))
+    let boards=try d.decode([LocalBoardObservation].self,from:Data(contentsOf:root.appendingPathComponent("local_board_observations.json")))
+    let cards=try d.decode([FrameCardPairs].self,from:Data(contentsOf:root.appendingPathComponent("observed_card_back_pairs.json")))
+    let actions=try d.decode([LocalActionCandidate].self,from:Data(contentsOf:root.appendingPathComponent("local_action_candidates.json")))
+    try require(frames.count==354 && boards.count==354 && cards.count==354,"NAMED_WAGER_REQUIRES_354_FRAMES")
+    func ocr(_ n:Int) throws -> LocalOCRFrame {
+        try d.decode(LocalOCRFrame.self,from:Data(contentsOf:root.appendingPathComponent(String(format:"local_ocr/%06d.json",n))))
+    }
+    let hand="2874689539"
+    let proofs=namedCardPresence(
+        previous:try ocr(166),current:try ocr(167),
+        previousBoard:boards[165],currentBoard:boards[166],
+        previousCards:cards[165],currentCards:cards[166]
+    )
+    try require(proofs.count==6,"CAUSAL_NAMED_SEAT_PROOF_CHANGED")
+    let firstAction=actions.filter{$0.hand==hand}.map(\.frame).min() ?? 0
+    try require(firstAction==175,"FIRST_OBSERVED_ACTION_CHANGED")
+    func attempt(_ c:LocalActionCandidate,_ p:NamedCardPresence,
+                 _ peers:[LocalActionCandidate]) throws -> String? {
+        let n=c.frame
+        return namedCardWagerContribution(c,
+           previous:try ocr(n-1),current:try ocr(n),
+           previousBoard:boards[n-2],currentBoard:boards[n-1],
+           previousImage:frames[n-2],currentImage:frames[n-1],
+           sameFrameCandidates:peers,
+           member:p,memberOlder:try ocr(p.priorFrame),memberNow:try ocr(p.confirmedFrame),
+           memberOlderBoard:boards[p.priorFrame-1],memberNowBoard:boards[p.confirmedFrame-1],
+           memberOlderCards:cards[p.priorFrame-1],memberNowCards:cards[p.confirmedFrame-1],
+           memberOlderImage:frames[p.priorFrame-1],memberNowImage:frames[p.confirmedFrame-1],
+           firstActionFrame:firstAction,root:root)
+    }
+    let expected:[Int:String]=[175:"2",186:"2",189:"2",219:"2.5",223:"2.5"]
+    var observed=[Int:String]()
+    for (n,value) in expected.sorted(by:{$0.key<$1.key}) {
+        let peers=actions.filter{$0.frame==n && $0.hand==hand}
+        try require(peers.count==1,"AMBIGUOUS_EXPECTED_BET_\(n)")
+        guard let p=proofs.first(where:{$0.player==peers[0].player}) else {throw Problem("PLAYER_NOT_IN_CARD_PROOFS")}
+        let result=try attempt(peers[0],p,peers)
+        try require(result==value,"NAMED_WAGER_CONTRIBUTION_MISMATCH_\(n)_\(result ?? "nil")")
+        observed[n]=result
+    }
+    let rejects=[201,240,262,265,348]
+    for n in rejects {
+        let peers=actions.filter{$0.frame==n && $0.hand==hand}
+        try require(peers.count==1,"NEGATIVE_ACTION_FRAME_CHANGED_\(n)")
+        let player=peers[0].player
+        let p=proofs.first{$0.player==player}!
+        try require(try attempt(peers[0],p,peers)==nil,"UNSUPPORTED_WAGER_ADMITTED_\(n)")
+    }
+    let c=actions.first{$0.hand==hand && $0.frame==219}!
+    let proof=proofs.first{$0.player==c.player}!
+    var forged=NamedCardPresence(hand:"FORGED",player:proof.player,
+        priorFrame:proof.priorFrame,confirmedFrame:proof.confirmedFrame,
+        sourceFingerprints:proof.sourceFingerprints,cardX:proof.cardX,cardY:proof.cardY,basis:proof.basis)
+    try require(try attempt(c,forged,[c])==nil,"CROSS_HAND_CARD_PROOF_ADMITTED")
+    forged=NamedCardPresence(hand:proof.hand,player:proof.player,
+        priorFrame:proof.priorFrame,confirmedFrame:proof.confirmedFrame,
+        sourceFingerprints:["sha256:"+String(repeating:"0",count:64),proof.sourceFingerprints[1]],
+        cardX:proof.cardX,cardY:proof.cardY,basis:proof.basis)
+    try require(try attempt(c,forged,[c])==nil,"FORGED_CARD_FINGERPRINT_ADMITTED")
+    try require(try attempt(c,proof,[c,c])==nil,"SAME_FRAME_AMBIGUITY_ADMITTED")
+    print("NAMED_CARD_WAGER_PASS second_hand=5 frames=175:2,186:2,189:2,219:2.5,223:2.5 negatives=8 positions=UNKNOWN new_actions=0")
+}
+
 @main
 struct FullScreenVision {
     @MainActor static func main() async {
         setbuf(stdout, nil)
         do {
+            if CommandLine.arguments.count == 3 &&
+                CommandLine.arguments[1] == "--named-wager-proof-test" {
+                try readOnlyNamedCardWagerRegression(URL(fileURLWithPath:CommandLine.arguments[2]))
+                return
+            }
             if CommandLine.arguments.count == 3 &&
                 CommandLine.arguments[1] == "--named-card-membership-test" {
                 try readOnlyNamedCardRegression(

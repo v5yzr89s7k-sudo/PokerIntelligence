@@ -1,0 +1,19 @@
+{
+  "before_sha256": "9fa7bccff0969680cfec75ef783d0ea7f1278f18cdd5197d440123223f3f9914",
+  "checkpoint_bound": true,
+  "existing_regressions": "PASS",
+  "named_wager_determinism": "3/3",
+  "new_authoritative_actions": 0,
+  "parent_commit": "5d06c9434813c2cefe1a9c455f29b57342f24f3a",
+  "positions_and_blinds": "UNRESOLVED",
+  "raise_to": "UNVERIFIED",
+  "read_only_sidecar": "observed_native_wager_correlations.json",
+  "second_hand_named_only_contributions": {
+    "175": "2",
+    "186": "2",
+    "189": "2",
+    "219": "2.5",
+    "223": "2.5"
+  },
+  "source_sha256": "367f6bbfc4c6bfa67d2a0696d0821d166d3c60d2222448b3a2b152c22dcea4c5"
+}
