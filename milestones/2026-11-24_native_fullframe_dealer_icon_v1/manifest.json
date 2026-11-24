@@ -1,0 +1,18 @@
+{
+  "authoritative_actions_created": 0,
+  "deterministic_replays": "3/3",
+  "fully_scanned_original_frames": [
+    7,
+    8,
+    166,
+    167
+  ],
+  "hand_2874688303_button_pixel_nearest": "urchdog07",
+  "hand_2874689539_button_pixel_nearest": "Kkos101",
+  "negative_tests": 3,
+  "observed_button_evidence_only": true,
+  "parent_commit": "67329ae5378aacd8dd11550507944b1fbbbd5e97",
+  "production_recorder_modified": false,
+  "source_sha256": "eaaf7f1c9db3876e06f21927934a0ff3475ba589443c14bfa4aab63e2a40d4cb",
+  "unnamed_big_blind": "UNCHANGED"
+}

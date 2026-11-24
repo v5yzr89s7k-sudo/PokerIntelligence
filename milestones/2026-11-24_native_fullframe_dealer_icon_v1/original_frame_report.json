@@ -1,0 +1,28 @@
+[
+  {
+    "authority" : "TWO_ORIGINAL_FULL_FRAME_DEALER_DISCS; MATCHED_NAMED_BUTTON_SEAT; NO_ACTION_AUTHORITY",
+    "confirmedFingerprint" : "sha256:f0c55b9dd44fabcd590881928d365448b7b3443079b17cec9337127800440294",
+    "confirmedFrame" : 8,
+    "dealerPixelX" : 0.73990885416666663,
+    "dealerPixelYBottom" : 0.43403826787512589,
+    "firstFingerprint" : "sha256:0ca73a9fd1b945bb8000b3980d4d368d8c37aa34bfd7255047c8c9059c1804e4",
+    "firstFrame" : 7,
+    "hand" : "2874688303",
+    "rasterOrientation" : "raster_top",
+    "seatDistance" : 0.095850241696604527,
+    "seatName" : "urchdog07"
+  },
+  {
+    "authority" : "TWO_ORIGINAL_FULL_FRAME_DEALER_DISCS; MATCHED_NAMED_BUTTON_SEAT; NO_ACTION_AUTHORITY",
+    "confirmedFingerprint" : "sha256:5ee39788e4a50b9c3bbf66a5ff025c98b0276fa25e7e2d7de61f7a16c3a4b13f",
+    "confirmedFrame" : 167,
+    "dealerPixelX" : 0.642578125,
+    "dealerPixelYBottom" : 0.28600201409869086,
+    "firstFingerprint" : "sha256:824b009732494dabe7f4ab1960f13664b56fa795d2bbff31e738d196d6187085",
+    "firstFrame" : 166,
+    "hand" : "2874689539",
+    "rasterOrientation" : "raster_top",
+    "seatDistance" : 0.096063638378326724,
+    "seatName" : "Kkos101"
+  }
+]
