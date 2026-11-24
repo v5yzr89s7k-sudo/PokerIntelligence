@@ -1,0 +1,23 @@
+{
+  "authoritative_actions_created": 0,
+  "dealer_button_icon_confirmed": false,
+  "deterministic_replays": "3/3",
+  "hand_seat_rings": {
+    "2874688303": {
+      "big_blind": "poker5068",
+      "button_inferred": "urchdog07",
+      "count": 6,
+      "small_blind": "Kkos101"
+    },
+    "2874689539": {
+      "big_blind": "UNNAMED_PHYSICAL_SEAT",
+      "button_inferred": "Kkos101",
+      "count": 7,
+      "small_blind": "poker5068"
+    }
+  },
+  "parent_commit": "e96db31f206572c58aa5437f26beaaf5083eb151",
+  "position_authority": "READ_ONLY_INFERRED",
+  "sidecar": "observed_hand_seat_order.json",
+  "source_sha256": "9c84f9717e0e71f2579812df89d2aaae84855f425bc69e8ff8b251b13b0e3a86"
+}
