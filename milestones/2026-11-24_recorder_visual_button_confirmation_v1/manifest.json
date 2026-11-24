@@ -1,0 +1,21 @@
+{
+  "big_blind_2874689539": "UNNAMED",
+  "determinism": "3/3",
+  "durable_checkpoint_required": true,
+  "image_frames": [
+    7,
+    8,
+    166,
+    167
+  ],
+  "negative_cases": 6,
+  "new_authoritative_actions": 0,
+  "parent_commit": "35ff68ea2ae0ba1250a8d01d7bf7367f0e3dbbf1",
+  "sidecar": "observed_hand_visual_dealer.json",
+  "source_sha256": "ad5c4cdd93e827035f5768c41c491b22a13ace04028ea4ffb4ae3b0c4f7efa80",
+  "visual_buttons": {
+    "2874688303": "urchdog07",
+    "2874689539": "Kkos101"
+  },
+  "visual_confirmation_in_hand_seat_order": true
+}

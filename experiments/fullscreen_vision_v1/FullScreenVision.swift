@@ -1582,6 +1582,8 @@ actor Recorder {
     var localOCR = [LocalOCRFrame]()
     var blindPositions = [String:BlindButtonEvidence]()
     var handPhysicalBlinds = [String:HandPhysicalBlinds]()
+    var verifiedVisualButtons = [String:OriginalVisualButton]()
+    var checkedVisualButtonHands = Set<String>()
     var blindEvidenceExaminedThrough = 1
     var physicalRosters = [String:PhysicalDealtInRoster]()
     var namedCardEvidence = [String:NamedCardPresence]()
@@ -2500,7 +2502,60 @@ actor Recorder {
             $0.firstFrame < $1.firstFrame
         }
 
-        try encoded(seatOrders).write(
+
+        // Run original-image dealer verification once per hand.
+        // Do not publish a proof ahead of the durable cursor.
+        for order in seatOrders where order.confirmedFrame <= cursor {
+            guard checkedVisualButtonHands.insert(order.hand).inserted,
+                  let blind=handPhysicalBlinds[order.hand]
+            else {continue}
+
+            if let proof=visualButtonProof(
+                blind,order,
+                frames:frames,
+                root:directory,
+                through:cursor
+            ) {
+                verifiedVisualButtons[order.hand]=proof
+            }
+        }
+
+        let publishedSeatOrders=seatOrders.map {
+            order -> HandSeatOrder in
+
+            guard let visual=verifiedVisualButtons[order.hand],
+                  visual.confirmedFrame<=cursor,
+                  visual.buttonPlayer==order.buttonPlayerInferred
+            else {return order}
+
+            return HandSeatOrder(
+                hand:order.hand,
+                firstFrame:order.firstFrame,
+                confirmedFrame:order.confirmedFrame,
+                buttonPlayerInferred:order.buttonPlayerInferred,
+                buttonIconConfirmed:true,
+                basis:order.basis.replacingOccurrences(
+                    of:"DEALER_INFERRED_NOT_BUTTON_ICON_VERIFIED",
+                    with:"ORIGINAL_FRAME_DEALER_ICON_CONFIRMED"
+                ),
+                seats:order.seats
+            )
+        }
+
+        try encoded(
+            verifiedVisualButtons.values.filter {
+                $0.confirmedFrame<=cursor
+            }.sorted {
+                $0.firstFrame<$1.firstFrame
+            }
+        ).write(
+            to:directory.appendingPathComponent(
+                "observed_hand_visual_dealer.json"
+            ),
+            options:.atomic
+        )
+
+        try encoded(publishedSeatOrders).write(
             to:directory.appendingPathComponent(
                 "observed_hand_seat_order.json"
             ),
@@ -4263,6 +4318,117 @@ func live354RecorderWagerReplay(
         "HAND_POSITION_PROJECTION_MISSING"
     )
 
+
+    let visual=try d.decode(
+        [OriginalVisualButton].self,
+        from:Data(contentsOf:
+            temp.appendingPathComponent(
+                "observed_hand_visual_dealer.json"
+            ))
+    )
+
+    try require(
+        visual.count==2,
+        "MISSING_OR_NONUNIQUE_VISUAL_BUTTONS"
+    )
+
+    for (hand,a,b,name) in [
+        ("2874688303",7,8,"urchdog07"),
+        ("2874689539",166,167,"Kkos101")
+    ] {
+        guard let p=visual.first(where:{$0.hand==hand}),
+              let ring=positionRows.first(where:{$0.hand==hand}),
+              let blind=saved.first(where:{$0.hand==hand})
+        else {throw Problem("HAND_BUTTON_PROOF_MISSING")}
+
+        try require(
+            p.firstFrame==a &&
+            p.confirmedFrame==b &&
+            p.buttonPlayer==name &&
+            p.sourceFingerprints==[
+                blind.firstFingerprint,
+                blind.confirmedFingerprint
+            ] &&
+            p.nearestSeatDistance<0.17 &&
+            p.authority.contains("NO_ACTION_AUTHORITY") &&
+            ring.buttonIconConfirmed &&
+            ring.buttonPlayerInferred==name,
+            "VISUAL_BUTTON_CONTRADICTS_PHYSICAL_SEAT_ORDER"
+        )
+
+        for (n,fingerprint) in [
+            (a,p.sourceFingerprints[0]),
+            (b,p.sourceFingerprints[1])
+        ] {
+            let row=frames[n-1]
+
+            try require(
+                row.id==n &&
+                frameFingerprint(
+                    try Data(contentsOf:
+                        input.appendingPathComponent(row.file))
+                )==fingerprint,
+                "VISUAL_BUTTON_FRAME_OWNER_CHANGED"
+            )
+        }
+
+        let unverified=HandSeatOrder(
+            hand:ring.hand,
+            firstFrame:ring.firstFrame,
+            confirmedFrame:ring.confirmedFrame,
+            buttonPlayerInferred:ring.buttonPlayerInferred,
+            buttonIconConfirmed:false,
+            basis:ring.basis,
+            seats:ring.seats
+        )
+
+        let impostor=HandSeatOrder(
+            hand:unverified.hand,
+            firstFrame:unverified.firstFrame,
+            confirmedFrame:unverified.confirmedFrame,
+            buttonPlayerInferred:"FORGED",
+            buttonIconConfirmed:false,
+            basis:unverified.basis,
+            seats:unverified.seats
+        )
+
+        try require(
+            visualButtonProof(
+                blind,impostor,
+                frames:frames,root:input,through:354
+            )==nil &&
+            visualButtonProof(
+                blind,unverified,
+                frames:frames,root:input,through:b-1
+            )==nil,
+            "FORGED_OR_FUTURE_BUTTON_ACCEPTED"
+        )
+
+        let tampered=HandPhysicalBlinds(
+            hand:blind.hand,
+            firstFrame:blind.firstFrame,
+            confirmedFrame:blind.confirmedFrame,
+            firstFingerprint:
+                "sha256:"+String(repeating:"0",count:64),
+            confirmedFingerprint:blind.confirmedFingerprint,
+            smallBlind:blind.smallBlind,
+            bigBlind:blind.bigBlind,
+            basis:blind.basis
+        )
+
+        try require(
+            visualButtonProof(
+                tampered,unverified,
+                frames:frames,root:input,through:354
+            )==nil,
+            "FORGED_IMAGE_FINGERPRINT_ACCEPTED"
+        )
+    }
+
+    print(
+        "RECORDER_VISUAL_BUTTON_PASS hands=2 originals=4 negatives=6 actions=0"
+    )
+
     func checkPositions(
         _ hand:String,
         _ expected:[String:String?],
@@ -4276,10 +4442,10 @@ func live354RecorderWagerReplay(
 
         try require(
             row.buttonPlayerInferred == button &&
-            !row.buttonIconConfirmed &&
+            row.buttonIconConfirmed &&
             row.seats.count == expected.count &&
             row.basis.contains(
-                "DEALER_INFERRED_NOT_BUTTON_ICON_VERIFIED"
+                "ORIGINAL_FRAME_DEALER_ICON_CONFIRMED"
             ),
             "DEALER_POSITION_SCOPE_CHANGED"
         )
@@ -4408,7 +4574,7 @@ func live354RecorderWagerReplay(
         "HAND_SEAT_ORDER_PASS hand1=6_BTN_urchdog07 " +
         "hand2=7_BTN_Kkos101 SB=poker5068 " +
         "BB=UNNAMED negatives=4 " +
-        "button_icon=UNVERIFIED actions=0"
+        "button_icon=VERIFIED_ORIGINAL_IMAGES actions=0"
     )
     let named = try d.decode(
         [NamedCardPresence].self,
@@ -5650,6 +5816,283 @@ func checkpointEligibleNamedCards(
 
 // Hand-local positional inference from two-frame blind postings
 // and card pairs. The dealer-button icon is not yet confirmed.
+
+struct OriginalVisualButton: Codable, Equatable {
+    let hand: String
+    let firstFrame: Int
+    let confirmedFrame: Int
+    let sourceFingerprints: [String]
+    let buttonPlayer: String
+    let x: Double
+    let y: Double
+    let nearestSeatDistance: Double
+    let authority: String
+}
+
+#if os(macOS)
+struct DealerDisc: Codable, Equatable {
+    let x: Double
+    let yTop: Double
+    let width: Double
+    let height: Double
+    let whiteArea: Int
+    let brightRim: Double
+    let darkCenter: Double
+    let greenSurround: Double
+}
+
+struct Raster {
+    let w:Int
+    let h:Int
+    let rgba:[UInt8]
+}
+
+func dealerDiscs(_ f:Raster) -> [DealerDisc] {
+    let n=f.w*f.h
+    guard f.w>=800 && f.h>=400 && f.rgba.count==n*4 else {return []}
+    var white=[UInt8](repeating:0,count:n)
+    for i in 0..<n {
+        let j=i*4
+        let r=Int(f.rgba[j]),g=Int(f.rgba[j+1]),b=Int(f.rgba[j+2])
+        if r>190 && g>190 && b>190 && abs(r-g)<38 && abs(r-b)<38 {white[i]=1}
+    }
+    var component=[Int32](repeating:0,count:n)
+    var index:Int32=0
+    var hits=[DealerDisc]()
+
+    for start in 0..<n where white[start] == 1 && component[start] == 0 {
+        index+=1
+        var q=[Int]()
+        q.reserveCapacity(2048)
+        q.append(start)
+        component[start]=index
+        var head=0, xmin=f.w, xmax=0, ymin=f.h, ymax=0
+
+        while head<q.count {
+            let pos=q[head]
+            head+=1
+            let x=pos%f.w,y=pos/f.w
+            xmin=min(xmin,x)
+            xmax=max(xmax,x)
+            ymin=min(ymin,y)
+            ymax=max(ymax,y)
+
+            for dy in -1...1 {
+                let yy=y+dy
+                if yy<0 || yy>=f.h {continue}
+                for dx in -1...1 {
+                    if dx == 0 && dy == 0 {continue}
+                    let xx=x+dx
+                    if xx<0 || xx>=f.w {continue}
+                    let next=yy*f.w+xx
+                    if white[next] == 1 && component[next] == 0 {
+                        component[next]=index
+                        q.append(next)
+                    }
+                }
+            }
+        }
+
+        let w=xmax-xmin+1,h=ymax-ymin+1,area=q.count
+        if !(28...56).contains(w) || !(22...40).contains(h) ||
+            !(400...1400).contains(area) {continue}
+
+        let ratio=Double(w)/Double(h)
+        let density=Double(area)/Double(w*h)
+        if ratio<1.08 || ratio>1.8 || density<0.42 || density>0.75 {continue}
+
+        var rimN=0,rimWhite=0,centerN=0,darkN=0
+
+        for yy in ymin...ymax {
+            for xx in xmin...xmax {
+                let dx=(Double(xx-xmin)-Double(w-1)/2)/(0.45*Double(w))
+                let dy=(Double(yy-ymin)-Double(h-1)/2)/(0.45*Double(h))
+                let ell=dx*dx+dy*dy
+
+                if ell>0.45 && ell<0.9 {
+                    rimN+=1
+                    if component[yy*f.w+xx]==index {rimWhite+=1}
+                }
+
+                if ell<0.35 {
+                    centerN+=1
+                    let pos=(yy*f.w+xx)*4
+                    if max(f.rgba[pos],f.rgba[pos+1],f.rgba[pos+2])<115 {
+                        darkN+=1
+                    }
+                }
+            }
+        }
+
+        guard rimN>0 && centerN>0 else {continue}
+        let rim=Double(rimWhite)/Double(rimN)
+        let dark=Double(darkN)/Double(centerN)
+        if rim<=0.85 || dark<=0.24 || dark>=0.70 {continue}
+
+        let left=max(0,xmin-14),right=min(f.w-1,xmax+14)
+        let top=max(0,ymin-14),bottom=min(f.h-1,ymax+14)
+        var surroundN=0,greenN=0
+
+        for y in top...bottom {
+            for x in left...right {
+                if x>=xmin && x<=xmax && y>=ymin && y<=ymax {continue}
+                surroundN+=1
+                let off=(y*f.w+x)*4
+                let r=Double(f.rgba[off])
+                let g=Double(f.rgba[off+1])
+                let b=Double(f.rgba[off+2])
+                if g>45 && g>r*1.25 && g>b*1.10 {greenN+=1}
+            }
+        }
+
+        guard surroundN>0 else {continue}
+        let green=Double(greenN)/Double(surroundN)
+        if green<=0.55 {continue}
+
+        hits.append(DealerDisc(
+            x:(Double(xmin+xmax)+1)/(2*Double(f.w)),
+            yTop:(Double(ymin+ymax)+1)/(2*Double(f.h)),
+            width:Double(w)/Double(f.w),
+            height:Double(h)/Double(f.h),
+            whiteArea:area,
+            brightRim:rim,
+            darkCenter:dark,
+            greenSurround:green
+        ))
+    }
+    return hits.sorted{$0.x<$1.x}
+}
+
+#if canImport(CoreGraphics)
+func decodeOriginalJPEG(_ url:URL) throws -> Raster {
+    guard let source=CGImageSourceCreateWithURL(url as CFURL,nil),
+          let original=CGImageSourceCreateImageAtIndex(source,0,nil) else {
+        throw NSError(domain:"OriginalJPEG",code:1,userInfo:[
+            NSLocalizedDescriptionKey:"Cannot decode original JPEG"
+        ])
+    }
+
+    let w=1536
+    let h=Int(
+        (Double(original.height)*Double(w)/Double(original.width)).rounded()
+    )
+    var rgba=[UInt8](repeating:0,count:w*h*4)
+
+    let ok=rgba.withUnsafeMutableBytes{memory -> Bool in
+        guard let context=CGContext(
+            data:memory.baseAddress,
+            width:w,
+            height:h,
+            bitsPerComponent:8,
+            bytesPerRow:w*4,
+            space:CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo:CGBitmapInfo.byteOrder32Big.rawValue |
+                CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {return false}
+
+        context.interpolationQuality = .high
+        context.draw(
+            original,
+            in:CGRect(x:0,y:0,width:w,height:h)
+        )
+        return true
+    }
+
+    if !ok {throw NSError(domain:"Raster",code:2,userInfo:nil)}
+    return Raster(w:w,h:h,rgba:rgba)
+}
+#endif
+
+
+// Confirm the button using two independently hashed original images.
+// The stored blind seats and hole-card seat ring must agree.
+func visualButtonProof(
+    _ blind:HandPhysicalBlinds,_ order:HandSeatOrder,
+    frames:[Frame],root:URL,through cursor:Int
+) -> OriginalVisualButton? {
+    let a=blind.firstFrame,b=blind.confirmedFrame
+
+    guard a>=1,b==a+1,b<=cursor,b<=frames.count,
+          order.hand==blind.hand,
+          order.firstFrame==a,order.confirmedFrame==b,
+          !order.buttonIconConfirmed,
+          order.seats.count>=3,
+          order.seats.filter({$0.role=="BTN"}).count==1,
+          let button=order.seats.first(where:{$0.role=="BTN"}),
+          let name=button.player,
+          name==order.buttonPlayerInferred,
+          !name.isEmpty,
+          blind.firstFingerprint != blind.confirmedFingerprint
+    else {return nil}
+
+    func original(_ n:Int,_ expected:String) -> DealerDisc? {
+        let frame=frames[n-1]
+
+        guard frame.id==n,
+              frame.file.hasPrefix("frames/"),
+              !frame.file.contains(".."),
+              let data=try? Data(contentsOf:
+                  root.appendingPathComponent(frame.file)),
+              frameFingerprint(data)==expected,
+              let raster=try? decodeOriginalJPEG(
+                  root.appendingPathComponent(frame.file))
+        else {return nil}
+
+        let discs=dealerDiscs(raster)
+        return discs.count==1 ? discs[0]:nil
+    }
+
+    guard let first=original(a,blind.firstFingerprint),
+          let second=original(b,blind.confirmedFingerprint),
+          abs(first.x-second.x)<0.012,
+          abs(first.yTop-second.yTop)<0.012
+    else {return nil}
+
+    func owner(_ disc:DealerDisc) -> (String,Double)? {
+        let y=1.0-disc.yTop
+
+        let ranked=order.seats.map { seat in
+            (seat,hypot(disc.x-seat.x,y-seat.y))
+        }.sorted {$0.1<$1.1}
+
+        guard ranked.count>=2,
+              ranked[0].0.role=="BTN",
+              ranked[0].0.player==name,
+              ranked[0].1<0.17,
+              ranked[1].1-ranked[0].1>0.028
+        else {return nil}
+
+        return (name,ranked[0].1)
+    }
+
+    guard let x=owner(first),
+          let y=owner(second),
+          x.0==y.0
+    else {return nil}
+
+    return OriginalVisualButton(
+        hand:order.hand,
+        firstFrame:a,
+        confirmedFrame:b,
+        sourceFingerprints:[
+            blind.firstFingerprint,
+            blind.confirmedFingerprint
+        ],
+        buttonPlayer:name,
+        x:second.x,
+        y:1.0-second.yTop,
+        nearestSeatDistance:max(x.1,y.1),
+        authority:
+            "TWO_ORIGINAL_FULL_DISPLAY_DEALER_ICONS; BLIND_AND_CARD_RING_CROSSCHECK; NO_ACTION_AUTHORITY"
+    )
+}
+#else
+func visualButtonProof(
+    _ blind:HandPhysicalBlinds,_ order:HandSeatOrder,
+    frames:[Frame],root:URL,through cursor:Int
+) -> OriginalVisualButton? {nil}
+#endif
+
 struct HandSeatPosition: Codable, Equatable {
     let role: String
     let player: String?
