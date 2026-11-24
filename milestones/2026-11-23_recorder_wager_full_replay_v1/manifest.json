@@ -1,0 +1,15 @@
+{
+  "api_calls": 0,
+  "committed_actions_preserved": 27,
+  "current_hand_byte_identical": true,
+  "determinism": "3/3",
+  "named_card_proofs": 12,
+  "original_events_preserved": 33,
+  "original_frames": 354,
+  "parent_commit": "a728f38f19f8c82f5c3618c085230503da446e41",
+  "production_behavior_change": "NONE; OFFLINE REPLAY ENTRY ONLY",
+  "raise_to_certified": false,
+  "recording": "pi_recorder_wager_live_20261123_181921_38961",
+  "source_sha256": "c24cb8f036cdfb7632d1aa07dd881f77f883caa369697facd14389721040e5a8",
+  "verified_contributions": 7
+}

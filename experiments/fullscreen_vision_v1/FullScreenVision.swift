@@ -3800,11 +3800,276 @@ func readOnlyNamedCardWagerRegression(_ root:URL) throws {
     print("NAMED_CARD_WAGER_PASS second_hand=5 frames=175:2,186:2,189:2,219:2.5,223:2.5 negatives=8 positions=UNKNOWN new_actions=0")
 }
 
+
+#if os(macOS)
+// Full native Recorder replay, not merely a helper-function test.
+// All writes go to a disposable temporary directory.
+func live354RecorderWagerReplay(
+    _ input: URL, output: URL
+) async throws {
+    let d = JSONDecoder()
+    let frames = try d.decode(
+        [Frame].self,
+        from: Data(contentsOf:
+            input.appendingPathComponent("frames.json"))
+    )
+    let boards = try d.decode(
+        [LocalBoardObservation].self,
+        from: Data(contentsOf:
+            input.appendingPathComponent("local_board_observations.json"))
+    )
+    let cards = try d.decode(
+        [FrameCardPairs].self,
+        from: Data(contentsOf:
+            input.appendingPathComponent("observed_card_back_pairs.json"))
+    )
+    let original = try d.decode(
+        DurableState.self,
+        from: Data(contentsOf:
+            input.appendingPathComponent("authoritative_checkpoint.json"))
+    )
+    let expectedEvents = original.commits.flatMap { $0.accepted }
+
+    try require(
+        frames.count == 354 &&
+        boards.count == 354 &&
+        cards.count == 354 &&
+        original.cursor == 354 &&
+        expectedEvents.count == 33 &&
+        expectedEvents.filter { $0.kind == "action" }.count == 27,
+        "ORIGINAL_354_RECORDING_CHANGED"
+    )
+
+    let temp = FileManager.default.temporaryDirectory
+        .appendingPathComponent(
+            "pi-recorder-wager-" + UUID().uuidString
+        )
+    defer {
+        try? FileManager.default.removeItem(at: temp)
+    }
+
+    for sub in ["frames", "accepted", "responses"] {
+        try FileManager.default.createDirectory(
+            at: temp.appendingPathComponent(sub),
+            withIntermediateDirectories: true
+        )
+    }
+
+    let recorder = Recorder(
+        directory: temp,
+        live: temp.appendingPathComponent("live.txt"),
+        verbose: false,
+        localSemanticOnly: true
+    )
+
+    try await recorder.publish()
+
+    for n in 1...354 {
+        let frame = frames[n-1]
+        let ocr = try d.decode(
+            LocalOCRFrame.self,
+            from: Data(contentsOf:
+                input.appendingPathComponent(
+                    String(format: "local_ocr/%06d.json", n)
+                )
+            )
+        )
+
+        let bytes = try Data(contentsOf:
+            input.appendingPathComponent(frame.file))
+        let fingerprint = frameFingerprint(bytes)
+
+        try require(
+            frame.id == n &&
+            ocr.frame == n &&
+            fingerprint == ocr.sourceFingerprint &&
+            boards[n-1].frame == n &&
+            boards[n-1].sourceFingerprint == fingerprint &&
+            cards[n-1].frame == n &&
+            cards[n-1].sourceFingerprint == fingerprint &&
+            boards[n-1].hand == currentLocalHand(ocr.capture) &&
+            cards[n-1].hand == currentLocalHand(ocr.capture),
+            "ORIGINAL_FRAME_OWNERSHIP_FAILED_\(n)"
+        )
+
+        try await recorder.add(
+            bytes,
+            start: frame.started,
+            end: frame.captured,
+            width: frame.width,
+            height: frame.height,
+            local: ocr.capture,
+            boardCount: boards[n-1].visibleBoardCount,
+            cardBackPairs: cards[n-1].pairs,
+            faceUpCardPairs: cards[n-1].faceUpPairs
+        )
+
+        // No card proof can be published ahead of the durable cursor.
+        if [8,166,167,175,223,354].contains(n) {
+            let cursor = await recorder.cursor
+            let path = temp.appendingPathComponent(
+                "observed_named_hole_card_pairs.json"
+            )
+            if FileManager.default.fileExists(atPath:path.path) {
+                let present = try d.decode(
+                    [NamedCardPresence].self,
+                    from: Data(contentsOf:path)
+                )
+                try require(
+                    present.allSatisfy {
+                        $0.confirmedFrame <= cursor
+                    },
+                    "NAMED_CARD_PUBLICATION_AHEAD_OF_CHECKPOINT"
+                )
+            }
+        }
+
+        if n % 100 == 0 {
+            print("FULL_RECORDER_REPLAY_PROGRESS \(n)/354")
+        }
+    }
+
+    try await recorder.finish()
+
+    let events = await recorder.events
+    let calls = await recorder.calls
+
+    try require(
+        events == expectedEvents &&
+        calls == 0,
+        "AUTHORITATIVE_EVENT_HISTORY_CHANGED"
+    )
+
+    let checkpoint = try d.decode(
+        DurableState.self,
+        from: Data(contentsOf:
+            temp.appendingPathComponent("authoritative_checkpoint.json"))
+    )
+
+    try require(
+        checkpoint.cursor == 354 &&
+        checkpoint.commits.flatMap({$0.accepted}) == events,
+        "RECORDER_CHECKPOINT_MISMATCH"
+    )
+
+    let named = try d.decode(
+        [NamedCardPresence].self,
+        from: Data(contentsOf:
+            temp.appendingPathComponent(
+                "observed_named_hole_card_pairs.json"
+            ))
+    )
+
+    try require(
+        named.count == 12 &&
+        named.filter{$0.hand == "2874688303"}.count == 6 &&
+        named.filter{$0.hand == "2874689539"}.count == 6,
+        "NAMED_CARD_PROJECTION_MISMATCH"
+    )
+
+    let wagers = try d.decode(
+        [RecorderObservedWager].self,
+        from: Data(contentsOf:
+            temp.appendingPathComponent(
+                "observed_native_wager_correlations.json"
+            ))
+    ).sorted {$0.toFrame < $1.toFrame}
+
+    let expected: [(Int,String,String,String)] = [
+        (113,"Kkos101","BET","1.5"),
+        (129,"poker5068","RAISE","6.3"),
+        (175,"Santiago1516jf","RAISE","2"),
+        (186,"luckycryak","CALL","2"),
+        (189,"urchdog07","CALL","2"),
+        (219,"Santiago1516jf","BET","2.5"),
+        (223,"luckycryak","CALL","2.5")
+    ]
+
+    try require(wagers.count == expected.count,
+        "WAGER_SIDECAR_COUNT_MISMATCH_\(wagers.count)")
+
+    for (i,w) in wagers.enumerated() {
+        let e = expected[i]
+
+        try require(
+            w.toFrame == e.0 &&
+            w.fromFrame + 1 == w.toFrame &&
+            w.player == e.1 &&
+            w.overlay == e.2 &&
+            w.contributionBB == e.3 &&
+            w.matchedCommittedAction,
+            "WAGER_PUBLICATION_MISMATCH_\(w.toFrame)"
+        )
+
+        if w.hand == "2874689539" {
+            try require(
+                w.authority.contains("NAMED_CARD_PROOF") &&
+                w.authority.contains("BLIND_POSITION_UNKNOWN") &&
+                w.authority.contains("NO_RAISE_TO"),
+                "UNKNOWN_BLIND_WAS_PROMOTED"
+            )
+        }
+    }
+
+    // The authoritative presentation must remain byte-identical.
+    let current = try Data(contentsOf:
+        temp.appendingPathComponent("current_hand.txt"))
+    let historical = try Data(contentsOf:
+        input.appendingPathComponent("current_hand.txt"))
+
+    try require(
+        current == historical,
+        "CURRENT_HAND_HISTORY_CHANGED"
+    )
+
+    let summary: [String:Any] = [
+        "schema":"PI_RECORDER_WAGER_FULL_REPLAY_V1",
+        "original_frames_verified":354,
+        "checkpoint_cursor":checkpoint.cursor,
+        "authoritative_events":events.count,
+        "authoritative_actions":27,
+        "named_card_proofs":named.count,
+        "wagers":wagers.map { w in
+            [
+                "frame":String(w.toFrame),
+                "hand":w.hand,
+                "player":w.player,
+                "action":w.overlay,
+                "contribution_bb":w.contributionBB,
+                "authority":w.authority
+            ]
+        },
+        "api_calls":calls,
+        "new_authoritative_actions":0,
+        "current_hand_unchanged":true,
+        "raise_to_certified":false
+    ]
+
+    try json(summary).write(to:output,options:.atomic)
+
+    print(
+        "RECORDER_354_INTEGRATION_PASS " +
+        "frames=354 events=33 actions=27 named=12 " +
+        "wagers=7 positional=2 named_only=5 " +
+        "api_calls=0 current_hand_unchanged=YES"
+    )
+}
+#endif
+
 @main
 struct FullScreenVision {
     @MainActor static func main() async {
         setbuf(stdout, nil)
         do {
+            #if os(macOS)
+            if CommandLine.arguments.count == 4 &&
+                CommandLine.arguments[1] == "--recorder-live354-replay" {
+                try await live354RecorderWagerReplay(
+                    URL(fileURLWithPath:CommandLine.arguments[2]),
+                    output:URL(fileURLWithPath:CommandLine.arguments[3]))
+                return
+            }
+            #endif
             if CommandLine.arguments.count == 3 &&
                 CommandLine.arguments[1] == "--named-wager-proof-test" {
                 try readOnlyNamedCardWagerRegression(URL(fileURLWithPath:CommandLine.arguments[2]))
