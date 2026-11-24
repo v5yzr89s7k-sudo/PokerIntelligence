@@ -1,0 +1,19 @@
+{
+  "authoritative_actions_preserved": 27,
+  "authoritative_events_preserved": 33,
+  "big_blind": "UNNAMED_PHYSICAL_SEAT; PARTICIPATION_UNKNOWN",
+  "button": "Kkos101",
+  "determinism": "3/3",
+  "new_authoritative_actions": 0,
+  "new_source_sha256": "d258497fcbe6aa6e1b66d8d170359826c0fe67a5ee6fcfd60ed2725698fea1be",
+  "observed_contributions_preserved": 5,
+  "parent_commit": "c15a733cd2aefa50f407ca77ce2e34929ca8f98a",
+  "presentation_only": true,
+  "previous_source_sha256": "ad5c4cdd93e827035f5768c41c491b22a13ace04028ea4ffb4ae3b0c4f7efa80",
+  "small_blind": "poker5068",
+  "source_original_frames": [
+    166,
+    167
+  ],
+  "verified_current_hand_positions": 7
+}

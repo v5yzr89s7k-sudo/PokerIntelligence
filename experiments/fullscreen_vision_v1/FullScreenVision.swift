@@ -2225,7 +2225,14 @@ actor Recorder {
             var lines = [
                 "HAND \(hand) — COMMITTED HAND EVENTS (INCOMPLETE)"
             ]
-            if let position = blindPositions[hand] {
+            let verifiedPositions=verifiedHandPositionLines(
+                hand:hand,through:cursor,blinds:handPhysicalBlinds,
+                visuals:verifiedVisualButtons,ocr:localOCR,
+                board:localBoard,cards:localCardBacks
+            )
+            if !verifiedPositions.isEmpty {
+                lines.append(contentsOf:verifiedPositions)
+            } else if let position = blindPositions[hand] {
                 lines.append("  BUTTON INFERRED FROM BLINDS (candidate, not independently certified): \(position.dealer); SB \(position.smallBlind); BB \(position.bigBlind); evidence frames \(position.firstFrame),\(position.confirmedFrame)")
             }
 
@@ -4653,9 +4660,31 @@ func live354RecorderWagerReplay(
     let withoutNotes = regex.stringByReplacingMatches(
         in:shown,range:range,withTemplate:""
     )
+    let positionLines=shown.components(separatedBy:"\n").filter {
+        $0.hasPrefix("  [POSITION] ")
+    }
+    let withoutPositions=withoutNotes.components(
+        separatedBy:"\n"
+    ).filter {
+        !$0.hasPrefix("  [POSITION] ")
+    }.joined(separator:"\n")
 
     try require(
-        notes.count == 5 && withoutNotes == originalText,
+        positionLines.count==8 &&
+        positionLines.contains(where:{
+            $0.contains("BTN: Kkos101")
+        }) &&
+        positionLines.contains(where:{
+            $0.contains("SB: poker5068")
+        }) &&
+        positionLines.contains(where:{
+            $0.contains("BB: NAME UNKNOWN")
+        }),
+        "CURRENT_HAND_VERIFIED_POSITION_HEADER_MISSING"
+    )
+
+    try require(
+        notes.count == 5 && withoutPositions == originalText,
         "CURRENT_HAND_CONTRIBUTION_PROJECTION_CHANGED"
     )
 
@@ -4680,6 +4709,108 @@ func live354RecorderWagerReplay(
         )
     }
 
+
+    let positionBlinds=await recorder.handPhysicalBlinds
+    let positionVisuals=await recorder.verifiedVisualButtons
+    let positionOCR=await recorder.localOCR
+    let positionBoards=await recorder.localBoard
+    let positionCards=await recorder.localCardBacks
+
+    func positions(
+        _ hand:String,_ cursor:Int,
+        _ visual:[String:OriginalVisualButton]
+    ) -> [String] {
+        verifiedHandPositionLines(
+            hand:hand,through:cursor,blinds:positionBlinds,
+            visuals:visual,ocr:positionOCR,
+            board:positionBoards,cards:positionCards
+        )
+    }
+
+    let firstPositions=positions(
+        "2874688303",354,positionVisuals
+    )
+    let secondPositions=positions(
+        "2874689539",354,positionVisuals
+    )
+
+    try require(
+        firstPositions.count==7 &&
+        secondPositions.count==8 &&
+        firstPositions.contains(where:{
+            $0.contains("BTN: urchdog07")
+        }) &&
+        secondPositions.contains(where:{
+            $0.contains("BTN: Kkos101")
+        }) &&
+        secondPositions.contains(where:{
+            $0.contains("SB: poker5068")
+        }) &&
+        secondPositions.contains(where:{
+            $0.contains("BB: NAME UNKNOWN")
+        }) &&
+        !secondPositions.contains(where:{
+            $0.contains("BB: SITTING OUT")
+        }),
+        "VERIFIED_POSITION_DISPLAY_MISMATCH"
+    )
+
+    try require(
+        positions("2874689539",166,positionVisuals).isEmpty &&
+        positions("FORGED",354,positionVisuals).isEmpty,
+        "PREMATURE_OR_CROSS_HAND_POSITION_VISIBLE"
+    )
+
+    guard let realIcon=positionVisuals["2874689539"] else {
+        throw Problem("SECOND_HAND_VISUAL_PROOF_MISSING")
+    }
+
+    func alteredIcon(
+        _ newHand:String,_ newButton:String,
+        _ fps:[String]
+    ) -> OriginalVisualButton {
+        OriginalVisualButton(
+            hand:newHand,
+            firstFrame:realIcon.firstFrame,
+            confirmedFrame:realIcon.confirmedFrame,
+            sourceFingerprints:fps,
+            buttonPlayer:newButton,
+            x:realIcon.x,y:realIcon.y,
+            nearestSeatDistance:realIcon.nearestSeatDistance,
+            authority:realIcon.authority
+        )
+    }
+
+    for changed in [
+        alteredIcon(
+            "FORGED",realIcon.buttonPlayer,
+            realIcon.sourceFingerprints
+        ),
+        alteredIcon(
+            realIcon.hand,"FORGED",
+            realIcon.sourceFingerprints
+        ),
+        alteredIcon(
+            realIcon.hand,realIcon.buttonPlayer,[
+                "sha256:"+String(repeating:"0",count:64),
+                realIcon.sourceFingerprints[1]
+            ]
+        )
+    ] {
+        var testVisuals=positionVisuals
+        testVisuals["2874689539"]=changed
+
+        try require(
+            positions(
+                "2874689539",354,testVisuals
+            ).isEmpty,
+            "FORGED_VISUAL_POSITION_ACCEPTED"
+        )
+    }
+
+    print(
+        "CURRENT_HAND_POSITION_NEGATIVES_PASS future=1 cross_hand=1 forged=3"
+    )
     let proof = wagers.first {
         $0.toFrame == 219 && $0.hand == "2874689539"
     }!
@@ -4772,6 +4903,8 @@ func live354RecorderWagerReplay(
         "new_authoritative_actions":0,
         "current_hand_unchanged":false,
         "inline_verified_contributions":5,
+        "displayed_verified_seat_positions":7,
+        "unnamed_big_blind":"UNRESOLVED",
         "raise_to_certified":false
     ]
 
@@ -6109,6 +6242,81 @@ struct HandSeatOrder: Codable, Equatable {
     let buttonIconConfirmed: Bool
     let basis: String
     let seats: [HandSeatPosition]
+}
+
+
+// Presentation only: an unnamed physical BB is not a player identity.
+func verifiedHandPositionLines(
+    hand:String, through cursor:Int,
+    blinds:[String:HandPhysicalBlinds],
+    visuals:[String:OriginalVisualButton],
+    ocr:[LocalOCRFrame], board:[LocalBoardObservation],
+    cards:[FrameCardPairs]
+) -> [String] {
+    guard let blind=blinds[hand], let visual=visuals[hand],
+          blind.hand==hand, visual.hand==hand,
+          blind.firstFrame>=1,
+          blind.confirmedFrame==blind.firstFrame+1,
+          blind.confirmedFrame<=cursor,
+          blind.confirmedFrame<=ocr.count,
+          blind.confirmedFrame<=board.count,
+          blind.confirmedFrame<=cards.count,
+          visual.firstFrame==blind.firstFrame,
+          visual.confirmedFrame==blind.confirmedFrame,
+          visual.sourceFingerprints==[
+              blind.firstFingerprint,blind.confirmedFingerprint
+          ],
+          visual.nearestSeatDistance<0.17,
+          visual.authority.contains(
+              "TWO_ORIGINAL_FULL_DISPLAY_DEALER_ICONS"
+          )
+    else {return []}
+
+    let n=blind.confirmedFrame
+
+    guard let order=handSeatOrder(
+              blind,prior:ocr[n-2],now:ocr[n-1],
+              priorBoard:board[n-2],nowBoard:board[n-1],
+              priorCards:cards[n-2],nowCards:cards[n-1]
+          ),
+          order.hand==hand,
+          order.buttonPlayerInferred==visual.buttonPlayer,
+          (3...10).contains(order.seats.count),
+          Set(order.seats.map{$0.role}).count==order.seats.count,
+          order.seats.first?.role=="SB",
+          order.seats.last?.role=="BB",
+          let sb=order.seats.first(where:{$0.role=="SB"}),
+          let bb=order.seats.first(where:{$0.role=="BB"}),
+          let btn=order.seats.first(where:{$0.role=="BTN"}),
+          btn.player==visual.buttonPlayer,
+          abs(sb.x-blind.smallBlind.seatX)<0.012,
+          abs(sb.y-blind.smallBlind.seatY)<0.012,
+          abs(bb.x-blind.bigBlind.seatX)<0.012,
+          abs(bb.y-blind.bigBlind.seatY)<0.012,
+          (blind.smallBlind.name==nil ||
+           sb.player==blind.smallBlind.name),
+          (blind.bigBlind.name==nil ||
+           bb.player==blind.bigBlind.name),
+          (blind.bigBlind.name != nil || bb.player==nil)
+    else {return []}
+
+    var lines=[
+        "  [POSITION] VERIFIED BUTTON \(visual.buttonPlayer); SB/BB physical postings; hand \(hand); original frames \(blind.firstFrame)->\(blind.confirmedFrame); positions frozen"
+    ]
+
+    for seat in order.seats {
+        let identity=seat.player ??
+            "NAME UNKNOWN (1 BB physical posting only)"
+        let scope=seat.player==nil
+            ? "name and dealt-in status unverified"
+            : "same-hand hole-card name proof"
+
+        lines.append(
+            "  [POSITION] \(seat.role): \(identity) [\(scope)]"
+        )
+    }
+
+    return lines
 }
 
 func handSeatOrder(
