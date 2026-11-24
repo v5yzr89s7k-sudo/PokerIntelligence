@@ -1040,6 +1040,94 @@ struct RecorderObservedWager: Codable, Equatable {
     let authority: String
 }
 
+
+// Display-only annotation for an existing durable action.
+// Never changes the event journal or claims a total bet/raise-to amount.
+func verifiedActionContributionSuffix(
+    _ e:Event, _ proofs:[RecorderObservedWager],
+    _ candidates:[LocalActionCandidate], _ ocr:[LocalOCRFrame],
+    through cursor:Int
+) -> String {
+    guard e.kind == "action", e.frame >= 2, e.frame <= cursor
+    else {return ""}
+
+    let eligible = proofs.filter { p in
+        guard p.matchedCommittedAction,
+              p.hand == e.hand,
+              p.toFrame == e.frame,
+              p.fromFrame == p.toFrame-1,
+              p.fromFrame >= 1,
+              p.toFrame <= cursor,
+              p.toFrame <= ocr.count,
+              p.fromFingerprint != p.toFingerprint,
+              p.fromFingerprint == ocr[p.fromFrame-1].sourceFingerprint,
+              p.toFingerprint == ocr[p.toFrame-1].sourceFingerprint,
+              currentLocalHand(ocr[p.fromFrame-1].capture) == p.hand,
+              currentLocalHand(ocr[p.toFrame-1].capture) == p.hand,
+              e.text.hasPrefix(p.player + " "),
+              ["BET","RAISE","CALL"].contains(p.overlay),
+              p.authority.contains("NO_RAISE_TO"),
+              (
+                p.authority.contains("READ_ONLY_NAMED_CARD_PROOF") ||
+                p.authority.contains(
+                    "READ_ONLY_ORIGINAL_FRAMES_AND_BLIND_PROOF"
+                )
+              ),
+              p.contributionBB.range(
+                of: #"^[0-9]+(?:\.[0-9]{1,2})?$"#,
+                options: .regularExpression
+              ) != nil,
+              let amount = Decimal(
+                string:p.contributionBB,
+                locale:Locale(identifier:"en_US_POSIX")
+              ),
+              amount > 0
+        else {return false}
+
+        let matching = candidates.filter { c in
+            c.hand == p.hand &&
+            c.player == p.player &&
+            c.overlay == p.overlay &&
+            c.frame == p.toFrame &&
+            c.beforeFrame == p.fromFrame &&
+            !c.sameFrameOrderUnknown &&
+            c.beforeFingerprint == p.fromFingerprint &&
+            c.currentFingerprint == p.toFingerprint &&
+            localSemanticText(c) == e.text
+        }
+
+        guard matching.count == 1,
+              let c = matching.first,
+              let display = c.displayedWager,
+              display.priorDisplayedWagerBB == nil,
+              let after = c.afterStackBB,
+              let beforeValue = Decimal(
+                string:c.beforeStackBB,
+                locale:Locale(identifier:"en_US_POSIX")
+              ),
+              let afterValue = Decimal(
+                string:after,
+                locale:Locale(identifier:"en_US_POSIX")
+              ),
+              let shown = Decimal(
+                string:display.amountBB,
+                locale:Locale(identifier:"en_US_POSIX")
+              )
+        else {return false}
+
+        return beforeValue-afterValue == amount &&
+               shown == amount &&
+               candidates.filter {
+                   $0.hand == p.hand && $0.frame == p.toFrame
+               }.count == 1
+    }
+
+    guard eligible.count == 1, let p = eligible.first
+    else {return ""}
+
+    return " [OBSERVED CONTRIBUTION +\(p.contributionBB) BB; NOT total bet/raise-to; source frames \(p.fromFrame)->\(p.toFrame)]"
+}
+
 func physicalWagerContribution(
     _ c: LocalActionCandidate,
     previous: LocalOCRFrame, current: LocalOCRFrame,
@@ -2257,17 +2345,20 @@ actor Recorder {
 
                 for entry in ordered {
                     let event = entry.element
+                    let note = verifiedActionContributionSuffix(
+                        event,recorderWagerEvidence,localActions,localOCR,through:cursor
+                    )
                     let physical = evidenceBackedDisplayFrame(event)
 
                     if physical != event.frame {
                         lines.append(
                             "  frame \(physical) " +
                             "(confirmed frame \(event.frame)): " +
-                            "\(event.text)"
+                            "\(event.text)\(note)"
                         )
                     } else {
                         lines.append(
-                            "  frame \(event.frame): \(event.text)"
+                            "  frame \(event.frame): \(event.text)\(note)"
                         )
                     }
                 }
@@ -4017,10 +4108,115 @@ func live354RecorderWagerReplay(
     let historical = try Data(contentsOf:
         input.appendingPathComponent("current_hand.txt"))
 
-    try require(
-        current == historical,
-        "CURRENT_HAND_HISTORY_CHANGED"
+
+    let shown = String(decoding:current,as:UTF8.self)
+    let originalText = String(decoding:historical,as:UTF8.self)
+
+    let pattern = #" \[OBSERVED CONTRIBUTION \+[0-9]+(?:\.[0-9]{1,2})? BB; NOT total bet/raise-to; source frames [0-9]+->[0-9]+\]"#
+    let regex = try NSRegularExpression(pattern:pattern)
+    let range = NSRange(shown.startIndex...,in:shown)
+    let notes = regex.matches(in:shown,range:range)
+
+    let withoutNotes = regex.stringByReplacingMatches(
+        in:shown,range:range,withTemplate:""
     )
+
+    try require(
+        notes.count == 5 && withoutNotes == originalText,
+        "CURRENT_HAND_CONTRIBUTION_PROJECTION_CHANGED"
+    )
+
+    for w in wagers where w.hand == "2874689539" {
+        let matched = events.filter {
+            $0.kind == "action" &&
+            $0.hand == w.hand &&
+            $0.frame == w.toFrame &&
+            $0.text.hasPrefix(w.player + " ")
+        }
+
+        try require(
+            matched.count == 1,
+            "WAGER_HAS_NO_UNIQUE_DURABLE_ACTION"
+        )
+
+        let line = "  frame \(w.toFrame): \(matched[0].text) [OBSERVED CONTRIBUTION +\(w.contributionBB) BB; NOT total bet/raise-to; source frames \(w.fromFrame)->\(w.toFrame)]"
+
+        try require(
+            shown.contains(line),
+            "WAGER_NOT_INLINE_\(w.toFrame)"
+        )
+    }
+
+    let proof = wagers.first {
+        $0.toFrame == 219 && $0.hand == "2874689539"
+    }!
+
+    let event = events.first {
+        $0.kind == "action" &&
+        $0.hand == proof.hand &&
+        $0.frame == proof.toFrame
+    }!
+
+    let ledger = await recorder.localActions
+    let ocrLedger = await recorder.localOCR
+
+    try require(
+        !verifiedActionContributionSuffix(
+            event,[proof],ledger,ocrLedger,through:354
+        ).isEmpty,
+        "POSITIVE_ANNOTATION_PROOF_MISSING"
+    )
+
+    func altered(
+        _ edits:[String:Any]
+    ) throws -> RecorderObservedWager {
+        var obj = try JSONSerialization.jsonObject(
+            with:encoded(proof)
+        ) as! [String:Any]
+
+        for (k,v) in edits {
+            obj[k] = v
+        }
+
+        return try JSONDecoder().decode(
+            RecorderObservedWager.self,
+            from:json(obj)
+        )
+    }
+
+    let invalid = try [
+        altered(["hand":"FORGED"]),
+        altered(["player":"FORGED"]),
+        altered([
+            "fromFingerprint":
+                "sha256:" + String(repeating:"0",count:64)
+        ]),
+        altered(["matchedCommittedAction":false]),
+        altered(["contributionBB":"2.51"]),
+        altered(["authority":"UNVERIFIED"])
+    ]
+
+    for p in invalid {
+        try require(
+            verifiedActionContributionSuffix(
+                event,[p],ledger,ocrLedger,through:354
+            ).isEmpty,
+            "FORGED_INLINE_PROOF_ACCEPTED"
+        )
+    }
+
+    try require(
+        verifiedActionContributionSuffix(
+            event,[proof,proof],ledger,ocrLedger,through:354
+        ).isEmpty &&
+        verifiedActionContributionSuffix(
+            event,[proof],ledger,ocrLedger,through:218
+        ).isEmpty,
+        "DUPLICATE_OR_FUTURE_PROOF_ACCEPTED"
+    )
+
+    print("INLINE_CONTRIBUTION_NEGATIVES_PASS rejected=8")
+
 
     let summary: [String:Any] = [
         "schema":"PI_RECORDER_WAGER_FULL_REPLAY_V1",
@@ -4041,7 +4237,8 @@ func live354RecorderWagerReplay(
         },
         "api_calls":calls,
         "new_authoritative_actions":0,
-        "current_hand_unchanged":true,
+        "current_hand_unchanged":false,
+        "inline_verified_contributions":5,
         "raise_to_certified":false
     ]
 
@@ -4051,7 +4248,7 @@ func live354RecorderWagerReplay(
         "RECORDER_354_INTEGRATION_PASS " +
         "frames=354 events=33 actions=27 named=12 " +
         "wagers=7 positional=2 named_only=5 " +
-        "api_calls=0 current_hand_unchanged=YES"
+        "api_calls=0 current_hand_contributions=5"
     )
 }
 #endif

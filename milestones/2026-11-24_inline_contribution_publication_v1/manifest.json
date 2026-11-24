@@ -1,0 +1,13 @@
+{
+  "current_hand_inline_contributions": 5,
+  "determinism": "3/3",
+  "negative_tests": 8,
+  "new_actions": 0,
+  "parent_commit": "75d11f3db56e8c17a6a8dcfcac582fb53920c8cd",
+  "preserved_action_count": 27,
+  "preserved_event_count": 33,
+  "raise_to": "UNVERIFIED",
+  "source_sha256": "ee7e5ec456ac08d39c675f45722120a0c3aa1e527a0117a8f9643b664f8b793a",
+  "total_recorded_wagers": 7,
+  "unknown_big_blind": "UNRESOLVED"
+}
