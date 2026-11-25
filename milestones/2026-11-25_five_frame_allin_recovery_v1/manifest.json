@@ -1,0 +1,28 @@
+{
+  "api_calls": 0,
+  "base_commit": "f6ab698a5a3b6070c531feefb6386601f40e557f",
+  "certified_361_actions": 27,
+  "certified_361_events": 34,
+  "determinism": "3/3",
+  "negative_tests": 5,
+  "original_361_actions": 25,
+  "original_361_events": 32,
+  "payout": "UNKNOWN",
+  "physical_allins": [
+    {
+      "confirmed_frame": 69,
+      "hand": "2875801623",
+      "initial_frame": 67,
+      "wager_bb": "22.77"
+    },
+    {
+      "confirmed_frame": 306,
+      "hand": "2875802737",
+      "initial_frame": 304,
+      "wager_bb": "21.06"
+    }
+  ],
+  "rabbit_street_frame320": "SUPPRESSED",
+  "source_sha256": "1902c38dd13bbb7bee9686a77695e2d5ade3e4316859fdde09203014ee527ba2",
+  "street": "UNKNOWN"
+}

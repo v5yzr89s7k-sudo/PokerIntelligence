@@ -1734,6 +1734,243 @@ func verifiedRiverAllIns(
     return found.sorted{$0.frame<$1.frame}
 }
 
+
+// Certify a physical ALL-IN without claiming street, payout or raise-to.
+// Five frame-owned original images, named cards and blinds must agree.
+func verifiedFiveFrameAllIns(
+    actions:[LocalActionCandidate], ocr:[LocalOCRFrame],
+    boards:[LocalBoardObservation], cards:[FrameCardPairs],
+    frames:[Frame], named:[String:NamedCardPresence],
+    blinds:[String:HandPhysicalBlinds],
+    committed:[Event], root:URL
+)->[Event] {
+    guard ocr.count==boards.count &&
+          boards.count==cards.count &&
+          cards.count==frames.count else{return []}
+
+    var result=[Event]()
+    let locale=Locale(identifier:"en_US_POSIX")
+
+    for c in actions where c.overlay=="ALL-IN" &&
+        !c.sameFrameOrderUnknown && c.labelConfidence>=0.8 {
+
+        let f=c.frame,hand=c.hand
+
+        guard f>=4,f+2<=frames.count,c.beforeFrame==f-1,
+              actions.filter({
+                  $0.frame==f && $0.hand==hand
+              }).count==1,
+              let member=named[hand+"|"+c.player],
+              member.priorFrame>=1,
+              member.confirmedFrame==member.priorFrame+1,
+              member.confirmedFrame<f-1,
+              member.sourceFingerprints.count==2,
+              let blind=blinds[hand],
+              blind.hand==hand,
+              blind.firstFrame>=1,
+              blind.confirmedFrame==blind.firstFrame+1,
+              blind.confirmedFrame<f,
+              !committed.contains(where:{
+                  $0.hand==hand && $0.kind=="action" &&
+                  ($0.text=="\(c.player) folds." ||
+                   $0.text.hasPrefix("\(c.player) goes all-in"))
+              }),
+              !committed.contains(where:{
+                  $0.hand==hand &&
+                  $0.kind=="result" &&
+                  $0.frame<f
+              }),
+              let before=Decimal(
+                  string:c.beforeStackBB,locale:locale),
+              let afterText=c.afterStackBB,
+              let after=Decimal(
+                  string:afterText,locale:locale),
+              before>0,after==0,
+              let wager=c.displayedWager,
+              wager.confidence>=0.8,
+              wager.priorDisplayedWagerBB==nil,
+              let displayed=Decimal(
+                  string:wager.amountBB,locale:locale),
+              displayed==before,
+              c.observedStackDeltaBB == ("-" + String(describing: before))
+        else{continue}
+
+        let observed=Array((f-2)...(f+2))
+
+        func original(
+            _ n:Int,_ fingerprint:String
+        )->Bool {
+            guard n>=1,n<=frames.count,
+                  frames[n-1].id==n,
+                  frames[n-1].file.hasPrefix("frames/"),
+                  !frames[n-1].file.contains(".."),
+                  let bytes=try? Data(
+                      contentsOf:root.appendingPathComponent(
+                          frames[n-1].file))
+            else{return false}
+
+            return frameFingerprint(bytes)==fingerprint
+        }
+
+        guard observed.allSatisfy({n in
+            let i=n-1
+            let fp=ocr[i].sourceFingerprint
+
+            return ocr[i].frame==n &&
+                ocr[i].capture.error==nil &&
+                currentLocalHand(ocr[i].capture)==hand &&
+                boards[i].frame==n &&
+                boards[i].hand==hand &&
+                boards[i].visibleBoardCount != 5 &&
+                cards[i].frame==n &&
+                cards[i].hand==hand &&
+                boards[i].sourceFingerprint==fp &&
+                cards[i].sourceFingerprint==fp &&
+                original(n,fp)
+        }),
+        c.beforeFingerprint==ocr[f-2].sourceFingerprint,
+        c.currentFingerprint==ocr[f-1].sourceFingerprint,
+        member.hand==hand,
+        member.player==c.player,
+        original(
+            member.priorFrame,
+            member.sourceFingerprints[0]),
+        original(
+            member.confirmedFrame,
+            member.sourceFingerprints[1]),
+        original(
+            blind.firstFrame,
+            blind.firstFingerprint),
+        original(
+            blind.confirmedFrame,
+            blind.confirmedFingerprint),
+        namedCardPresence(
+            previous:ocr[member.priorFrame-1],
+            current:ocr[member.confirmedFrame-1],
+            previousBoard:boards[member.priorFrame-1],
+            currentBoard:boards[member.confirmedFrame-1],
+            previousCards:cards[member.priorFrame-1],
+            currentCards:cards[member.confirmedFrame-1]
+        ).contains(member)
+        else{continue}
+
+        func near(
+            _ l:LocalOCRLine,
+            _ x:Double,
+            _ y:Double,
+            _ dx:Double=0.03,
+            _ dy:Double=0.038
+        )->Bool {
+            abs(l.x-x)<dx && abs(l.y-y)<dy
+        }
+
+        func priorName(_ n:Int)->Bool {
+            ocr[n-1].capture.lines.filter {
+                $0.confidence>=0.8 &&
+                $0.text==c.player &&
+                near($0,c.x,c.y)
+            }.count==1
+        }
+
+        func keptCards(_ n:Int)->Bool {
+            let presentCards = cards[n-1].pairs + (cards[n-1].faceUpPairs ?? [])
+            return presentCards.filter { p in
+                abs(p.x-c.x)<0.03 &&
+                (1.0-c.y)-p.y>0.03 &&
+                (1.0-c.y)-p.y<0.085
+            }.count==1
+        }
+
+        func label(_ n:Int)->Bool {
+            let lines=ocr[n-1].capture.lines
+
+            let overlay=lines.filter {
+                $0.confidence>=0.8 &&
+                near($0,c.x,c.y) &&
+                $0.text.trimmingCharacters(
+                    in:.whitespaces
+                ).uppercased()=="ALL-IN"
+            }
+
+            let zero=lines.filter {
+                $0.confidence>=0.8 &&
+                $0.text.trimmingCharacters(
+                    in:.whitespaces
+                )=="0 BB" &&
+                abs($0.x-c.x)<0.024 &&
+                c.y-$0.y>0.025 &&
+                c.y-$0.y<0.065
+            }
+
+            let amount=lines.filter {
+                $0.confidence>=0.8 &&
+                near($0,wager.x,wager.y) &&
+                $0.text.trimmingCharacters(
+                    in:.whitespaces
+                )==wager.text
+            }
+
+            return overlay.count==1 &&
+                   zero.count==1 &&
+                   amount.count==1
+        }
+
+        // OCR arrays are zero-indexed. These are the two
+        // frames preceding the first ALL-IN overlay.
+        let beforeOverlayLines = ocr[f-3].capture.lines + ocr[f-2].capture.lines
+        let previous = beforeOverlayLines.contains { l in
+            l.text.trimmingCharacters(
+                in:.whitespaces
+            ).uppercased()=="ALL-IN" &&
+            near(l,c.x,c.y)
+        }
+
+        guard priorName(f-2),
+              priorName(f-1),
+              !previous,
+              observed.allSatisfy(keptCards),
+              (f...(f+2)).allSatisfy(label),
+              ocr[f-2].capture.lines.filter {l in
+                  l.confidence>=0.8 &&
+                  l.text.trimmingCharacters(
+                      in:.whitespaces
+                  )=="\(c.beforeStackBB) BB" &&
+                  abs(l.x-c.x)<0.024 &&
+                  c.y-l.y>0.025 &&
+                  c.y-l.y<0.065
+              }.count==1
+        else{continue}
+
+        let evidence =
+            "ALL_IN_PHYSICAL_CERTIFIED; FIVE_ORIGINAL_FRAMES; " +
+            "street_UNVERIFIED; " +
+            "physical_overlay_frame=\(f); " +
+            "confirmation_frame=\(f+2); " +
+            "observed_stack=\(c.beforeStackBB)->0 BB; " +
+            "displayed_wager=\(wager.amountBB) BB; " +
+            "named_cards_earlier=\(member.confirmedFrame); " +
+            "blind_original_images=" +
+            "\(blind.firstFrame),\(blind.confirmedFrame); " +
+            "pot_and_raise_to_UNKNOWN; fingerprints: " +
+            observed.map {
+                ocr[$0-1].sourceFingerprint
+            }.joined(separator:",")
+
+        result.append(Event(
+            frame:f+2,
+            hand:hand,
+            kind:"action",
+            basis:"inferred",
+            text:"\(c.player) goes all-in " +
+                 "(displayed wager \(wager.amountBB) BB; " +
+                 "exact contribution unverified).",
+            evidence:evidence
+        ))
+    }
+
+    return result.sorted{$0.frame<$1.frame}
+}
+
 // Only evidence-backed local OCR transitions may enter semantic history.
 // No wager or raise-to amount is certified by the stack difference alone.
 func localSemanticSupported(_ c: LocalActionCandidate) -> Bool {
@@ -3088,6 +3325,20 @@ actor Recorder {
             frames:frames,named:namedCardEvidence,blinds:handPhysicalBlinds,
             visuals:verifiedVisualButtons,committed:events,root:directory
         ).filter {$0.frame >= first && $0.frame <= last}
+        let fiveFrameAllIns = verifiedFiveFrameAllIns(
+            actions:localActions,
+            ocr:localOCR,
+            boards:localBoard,
+            cards:localCardBacks,
+            frames:frames,
+            named:namedCardEvidence,
+            blinds:handPhysicalBlinds,
+            committed:events,
+            root:directory
+        ).filter {
+            $0.frame >= first && $0.frame <= last
+        }
+
         let staggeredFolds = certifiedStaggeredPreflopFolds(
             actions:localActions,
             overlays:localCandidates,
@@ -3152,7 +3403,7 @@ actor Recorder {
                 )
             }
 
-        let accepted = (acceptedActions + unorderedEpisodes + winnerEvents + streetEvents + promotedRapidFolds + recoveredOpening + mixedActions + laggedBlindFolds + namedOpening + confirmedAllIns + riverAllIns + staggeredFolds).sorted { a,b in
+        let accepted = (acceptedActions + unorderedEpisodes + winnerEvents + streetEvents + promotedRapidFolds + recoveredOpening + mixedActions + laggedBlindFolds + namedOpening + confirmedAllIns + riverAllIns + fiveFrameAllIns + staggeredFolds).sorted { a,b in
             if a.frame != b.frame { return a.frame < b.frame }
             if a.kind == "action" && b.kind == "action" &&
                 a.evidence.contains("RAPID_ORDER_CERTIFIED") &&
@@ -3339,6 +3590,23 @@ actor Recorder {
                 frames:frames,named:namedCardEvidence,blinds:handPhysicalBlinds,
                 visuals:verifiedVisualButtons,committed:events,root:directory
             ).contains {$0.frame == id}
+            let freshFiveFrameAllIn = localActions.contains {
+                $0.frame == id-2 &&
+                $0.overlay == "ALL-IN"
+            } && verifiedFiveFrameAllIns(
+                actions:localActions,
+                ocr:localOCR,
+                boards:localBoard,
+                cards:localCardBacks,
+                frames:frames,
+                named:namedCardEvidence,
+                blinds:handPhysicalBlinds,
+                committed:events,
+                root:directory
+            ).contains {
+                $0.frame == id
+            }
+
             let freshStaggered = certifiedStaggeredPreflopFolds(
                 actions:localActions,
                 overlays:localCandidates,
@@ -3373,7 +3641,7 @@ actor Recorder {
                 !winnerPrecludesNewStreet(
                     $0,candidates:localCandidates,ocr:localOCR)
             }
-            if !fresh.isEmpty || freshEpisode || freshWinner || freshStreet || freshCertifiedFolds || freshOpening || freshMixed || freshLaggedFold || freshNamedOpening || freshAllIn || freshRiverAllIn || freshStaggered {
+            if !fresh.isEmpty || freshEpisode || freshWinner || freshStreet || freshCertifiedFolds || freshOpening || freshMixed || freshLaggedFold || freshNamedOpening || freshAllIn || freshRiverAllIn || freshFiveFrameAllIn || freshStaggered {
                 try commitLocalOCRThrough(id)
             } else {
                 try publish()
