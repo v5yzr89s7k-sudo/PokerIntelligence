@@ -1,0 +1,14 @@
+{
+  "determinism": "3/3",
+  "minimum_seconds": 180,
+  "mode": "--local-hand-aware",
+  "network_calls": 0,
+  "new_authoritative_actions": 0,
+  "operator_signal_stop": true,
+  "parent_commit": "b548b09182301082e09859c85ab95c0b1a7cebdb",
+  "previous_local_20s_mode_preserved": true,
+  "safety_seconds": 360,
+  "source_sha256": "4fa9063e6242460d701a8fa772ae7858b401b1e864cd4b2bc74760bad21704a0",
+  "stop_condition": "TWO_DISTINCT_NEXT_HAND_FRAMES",
+  "unobserved_settlement": "UNKNOWN"
+}

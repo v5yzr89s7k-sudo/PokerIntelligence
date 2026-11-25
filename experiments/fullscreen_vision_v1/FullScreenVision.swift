@@ -17,6 +17,217 @@ import Darwin
 import Glibc
 #endif
 
+
+// A winner overlay alone does not terminate recording.
+// Stop only after two distinct images confirm the next hand.
+struct HandWindowGate {
+    let minimumSeconds: Double
+    let maximumSeconds: Double
+    private(set) var targetHand: String? = nil
+    private(set) var nextHand: String? = nil
+    private(set) var reason: String? = nil
+    private var lastBeforeMinimum: String? = nil
+    private var candidateFingerprint: String? = nil
+    private var candidateCount = 0
+
+    init(minimumSeconds: Double, maximumSeconds: Double) {
+        self.minimumSeconds = minimumSeconds
+        self.maximumSeconds = maximumSeconds
+    }
+
+    mutating func observe(
+        elapsed: Double, hand: String?, fingerprint: String
+    ) -> String? {
+        if let reason = reason { return reason }
+
+        if elapsed >= maximumSeconds {
+            reason = "SAFETY_LIMIT_UNRESOLVED"
+            return reason
+        }
+
+        let valid: String? = hand?.range(
+            of: "^[0-9]{8,12}$",
+            options: .regularExpression
+        ) != nil ? hand : nil
+
+        if elapsed < minimumSeconds {
+            if let valid = valid {
+                lastBeforeMinimum = valid
+            }
+            return nil
+        }
+
+        if targetHand == nil {
+            targetHand = lastBeforeMinimum ?? valid
+        }
+        guard let target = targetHand else { return nil }
+
+        guard let valid = valid, valid != target else {
+            nextHand = nil
+            candidateFingerprint = nil
+            candidateCount = 0
+            return nil
+        }
+
+        if valid != nextHand {
+            nextHand = valid
+            candidateCount = 1
+        } else if fingerprint != candidateFingerprint {
+            candidateCount += 1
+        } else {
+            return nil
+        }
+
+        candidateFingerprint = fingerprint
+
+        if candidateCount >= 2 {
+            reason = "NEXT_HAND_ID_CONFIRMED"
+        }
+        return reason
+    }
+}
+
+actor HandWindowOperatorStop {
+    private var requested = false
+    func request() { requested = true }
+    func isRequested() -> Bool { requested }
+}
+
+func handWindowRegression(_ root: URL) async throws {
+    var gate = HandWindowGate(
+        minimumSeconds:180, maximumSeconds:360
+    )
+
+    for n in 1...359 {
+        let hand = n < 160 ? "11111111" : "22222222"
+        try require(
+            gate.observe(
+                elapsed:Double(n)*0.5,
+                hand:hand,
+                fingerprint:"sha256:\(n)"
+            ) == nil,
+            "HAND_WINDOW_PREMATURE_STOP"
+        )
+    }
+
+    try require(
+        gate.observe(
+            elapsed:180,hand:"22222222",fingerprint:"x360"
+        ) == nil && gate.targetHand == "22222222",
+        "HAND_WINDOW_WRONG_TARGET"
+    )
+
+    try require(
+        gate.observe(
+            elapsed:180.5,hand:"33333333",fingerprint:"x361"
+        ) == nil &&
+        gate.observe(
+            elapsed:181,hand:"33333333",fingerprint:"x361"
+        ) == nil &&
+        gate.observe(
+            elapsed:181.5,hand:nil,fingerprint:"x363"
+        ) == nil &&
+        gate.observe(
+            elapsed:182,hand:"22222222",fingerprint:"x364"
+        ) == nil &&
+        gate.observe(
+            elapsed:182.5,hand:"33333333",fingerprint:"x365"
+        ) == nil &&
+        gate.observe(
+            elapsed:183,hand:"33333333",fingerprint:"x366"
+        ) == "NEXT_HAND_ID_CONFIRMED",
+        "HAND_WINDOW_NEXT_HAND_NOT_CONFIRMED"
+    )
+
+    var hard = HandWindowGate(
+        minimumSeconds:180,maximumSeconds:360
+    )
+
+    try require(
+        hard.observe(
+            elapsed:179,hand:"44444444",fingerprint:"a"
+        ) == nil &&
+        hard.observe(
+            elapsed:181,hand:"44444444",fingerprint:"b"
+        ) == nil &&
+        hard.observe(
+            elapsed:360,hand:"44444444",fingerprint:"c"
+        ) == "SAFETY_LIMIT_UNRESOLVED",
+        "HAND_WINDOW_HARD_LIMIT_MISSING"
+    )
+
+    let stop = HandWindowOperatorStop()
+    await stop.request()
+    try require(
+        await stop.isRequested(),
+        "HAND_WINDOW_OPERATOR_STOP_FAILED"
+    )
+
+    let d = JSONDecoder()
+    let frames = try d.decode(
+        [Frame].self,
+        from:Data(contentsOf:
+            root.appendingPathComponent("frames.json"))
+    )
+    try require(
+        frames.count == 354,
+        "HAND_WINDOW_RECORDING_LENGTH_CHANGED"
+    )
+
+    var real = HandWindowGate(
+        minimumSeconds:160,maximumSeconds:360
+    )
+
+    for f in frames {
+        let ocr = try d.decode(
+            LocalOCRFrame.self,
+            from:Data(contentsOf:
+                root.appendingPathComponent(
+                    String(format:"local_ocr/%06d.json",f.id)
+                )
+            )
+        )
+
+        try require(
+            ocr.frame == f.id,
+            "HAND_WINDOW_FRAME_OWNER_CHANGED"
+        )
+
+        try require(
+            real.observe(
+                elapsed:f.captured-frames[0].started,
+                hand:currentLocalHand(ocr.capture),
+                fingerprint:ocr.sourceFingerprint
+            ) == nil,
+            "HAND_WINDOW_STOPPED_ON_ORIGINAL_ALL_IN"
+        )
+    }
+
+    try require(
+        real.targetHand == "2874689539" &&
+        real.reason == nil,
+        "HAND_WINDOW_LAST_HAND_NOT_RETAINED"
+    )
+
+    try require(
+        real.observe(
+            elapsed:190,hand:"9999999999",
+            fingerprint:"first"
+        ) == nil &&
+        real.observe(
+            elapsed:190.5,hand:"9999999999",
+            fingerprint:"second"
+        ) == "NEXT_HAND_ID_CONFIRMED",
+        "HAND_WINDOW_FUTURE_HAND_NOT_CONFIRMED"
+    )
+
+    print(
+        "HAND_WINDOW_GATE_PASS original_frames=354 " +
+        "no_early_stop=YES next_hand=2_distinct_frames " +
+        "safety_limit=YES operator_stop=YES api_calls=0"
+    )
+}
+
 struct Problem: Error, CustomStringConvertible { let description: String; init(_ s: String) { description = s } }
 func require(_ ok: Bool, _ message: String) throws { if !ok { throw Problem(message) } }
 func encoded<T: Encodable>(_ value: T) throws -> Data {
@@ -3401,7 +3612,7 @@ func apiKey() throws -> String {
     return key
 }
 @available(macOS 14.0, *)
-func capture(_ recorder: Recorder, seconds: Double) async {
+func capture(_ recorder: Recorder, seconds: Double, handAware: Bool = false, operatorStop: HandWindowOperatorStop? = nil) async {
     do {
         guard CGPreflightScreenCaptureAccess() else {
             _ = CGRequestScreenCaptureAccess()
@@ -3426,9 +3637,24 @@ func capture(_ recorder: Recorder, seconds: Double) async {
             "title": target.title ?? "", "model": "gpt-5.4", "interval_target_s": 0.5,
             "api_detail": "original"]).write(to: recorder.directory.appendingPathComponent("capture_config.json"), options: .atomic)
         print("[CAPTURE] WHOLE display \(display.displayID): \(config.width)x\(config.height); no crops, no OCR")
-        let until = ProcessInfo.processInfo.systemUptime + seconds
+        let began=ProcessInfo.processInfo.systemUptime
+        let until=began+seconds
+        var gate:HandWindowGate?=handAware
+            ? HandWindowGate(
+                minimumSeconds:180,maximumSeconds:seconds)
+            : nil
+        var stopReason:String?=nil
+
         while ProcessInfo.processInfo.systemUptime < until {
-            if (await recorder.status()).stopped { break }
+            if (await recorder.status()).stopped {
+                stopReason="RECORDER_STOP"
+                break
+            }
+            if let request=operatorStop,
+               await request.isRequested() {
+                stopReason="OPERATOR_STOP"
+                break
+            }
             let tick = ProcessInfo.processInfo.systemUptime
             let started = Date().timeIntervalSince1970
             let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
@@ -3457,7 +3683,50 @@ func capture(_ recorder: Recorder, seconds: Double) async {
                 local: local, boardCount: boardCount,
                 cardBackPairs:cardPairs.0,
                 faceUpCardPairs:cardPairs.1)
+
+            if var policy=gate {
+                let decision=policy.observe(
+                    elapsed:ProcessInfo.processInfo.systemUptime-began,
+                    hand:currentLocalHand(local),
+                    fingerprint:frameFingerprint(bytes as Data)
+                )
+                gate=policy
+
+                if let decision=decision {
+                    stopReason=decision
+                    print(
+                        "[CAPTURE_BOUNDARY] \(decision) " +
+                        "current=\(policy.targetHand ?? "UNKNOWN") " +
+                        "next=\(policy.nextHand ?? "UNKNOWN")"
+                    )
+                    break
+                }
+            }
             await pause(0.5 - (ProcessInfo.processInfo.systemUptime - tick))
+        }
+        if handAware {
+            let why=stopReason ?? "SAFETY_LIMIT_UNRESOLVED"
+
+            let metadata:[String:Any]=[
+                "stop_reason":why,
+                "minimum_seconds":180,
+                "safety_seconds":seconds,
+                "hand_at_minimum":
+                    gate?.targetHand ?? "UNKNOWN",
+                "confirmed_next_hand":
+                    why=="NEXT_HAND_ID_CONFIRMED"
+                    ? (gate?.nextHand ?? "UNKNOWN")
+                    : "UNKNOWN",
+                "hand_history_completeness":"UNVERIFIED",
+                "winner_payout":"NOT_CERTIFIED"
+            ]
+
+            try json(metadata).write(
+                to:recorder.directory.appendingPathComponent(
+                    "capture_stop.json"
+                ),
+                options:.atomic
+            )
         }
         await recorder.captureDone()
     } catch { await recorder.captureDone(String(describing: error)); print("[CAPTURE STOP] \(error)") }
@@ -5270,9 +5539,17 @@ struct FullScreenVision {
                     URL(fileURLWithPath:CommandLine.arguments[2]))
                 return
             }
+            if CommandLine.arguments.count == 3 &&
+                CommandLine.arguments[1] == "--hand-window-test" {
+                try await handWindowRegression(
+                    URL(fileURLWithPath:CommandLine.arguments[2])
+                )
+                return
+            }
             _ = NSApplication.shared
             if CommandLine.arguments.count == 3 &&
-                CommandLine.arguments[1] == "--local-fold-20s" {
+                (CommandLine.arguments[1] == "--local-fold-20s" ||
+                 CommandLine.arguments[1] == "--local-hand-aware") {
 
                 let out = URL(
                     fileURLWithPath: CommandLine.arguments[2],
@@ -5301,7 +5578,38 @@ struct FullScreenVision {
                 )
 
                 print("HOST_PID=\(getpid()) ENGINE_PID=none API_REQUESTS=0")
-                await capture(recorder,seconds:20)
+                if CommandLine.arguments[1] == "--local-hand-aware" {
+                    let request=HandWindowOperatorStop()
+                    var signals=[DispatchSourceSignal]()
+
+                    for number in [SIGINT,SIGTERM] {
+                        signal(number,SIG_IGN)
+                        let handler=DispatchSource.makeSignalSource(
+                            signal:number,queue:.main
+                        )
+                        handler.setEventHandler {
+                            Task {await request.request()}
+                        }
+                        handler.resume()
+                        signals.append(handler)
+                    }
+
+                    print(
+                        "HAND_AWARE_CAPTURE min=180s " +
+                        "safety=360s; Ctrl+C requests clean stop"
+                    )
+
+                    await capture(
+                        recorder,seconds:360,
+                        handAware:true,operatorStop:request
+                    )
+
+                    for handler in signals {
+                        handler.cancel()
+                    }
+                } else {
+                    await capture(recorder,seconds:20)
+                }
 
                 if let failure = await recorder.failure() {
                     throw Problem(failure)
