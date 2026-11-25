@@ -1,0 +1,18 @@
+{
+  "action_first_observed_frame": 348,
+  "confirmation_frame": 350,
+  "correction": "prior overlay arrays f-3/f-2, not f-2/f-1",
+  "determinism": "3/3",
+  "displayed_wager_bb": "74.75",
+  "final_actions": 28,
+  "final_original_and_added_events": 34,
+  "hand": "2874689539",
+  "negative_tests": 5,
+  "parent_commit": "c9a6b19fae1d68747f8d167cc8a50fce7fc7fd66",
+  "player": "urchdog07",
+  "pot_payout": "UNKNOWN",
+  "prior_original_events": 33,
+  "raise_to": "UNKNOWN",
+  "recording_ends_before_settlement": true,
+  "source_sha256": "35414fac12cb523213baf5ca840c378bd11dfb65797dd680275fe00059952dfb"
+}

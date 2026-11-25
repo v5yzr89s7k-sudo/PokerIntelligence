@@ -1397,6 +1397,132 @@ func namedCardWagerContribution(
     return String(describing:value) // Contribution now; NEVER a raise-to amount.
 }
 
+import Foundation
+// A river all-in is an observed physical action, not a pot/raise-to claim.
+// All original images, the prior named card proof, and button evidence must agree.
+func verifiedRiverAllIns(
+    actions:[LocalActionCandidate], ocr:[LocalOCRFrame],
+    boards:[LocalBoardObservation], cards:[FrameCardPairs],
+    frames:[Frame], named:[String:NamedCardPresence],
+    blinds:[String:HandPhysicalBlinds],visuals:[String:OriginalVisualButton],
+    committed:[Event],root:URL
+) -> [Event] {
+    guard ocr.count==boards.count && boards.count==cards.count &&
+          cards.count==frames.count else{return []}
+    var found=[Event]()
+    for c in actions where c.overlay=="ALL-IN" && !c.sameFrameOrderUnknown && c.labelConfidence>=0.8 {
+        let f=c.frame, hand=c.hand
+        guard f>=4,f+2<=frames.count,c.beforeFrame==f-1,
+              actions.filter({$0.hand==hand && $0.frame==f}).count==1,
+              let member=named[hand+"|"+c.player],
+              member.confirmedFrame < f-1,member.priorFrame>=1,
+              member.confirmedFrame==member.priorFrame+1,
+              member.sourceFingerprints.count==2,
+              let blind=blinds[hand],let visual=visuals[hand],
+              blind.firstFrame>=1,blind.confirmedFrame<f,
+              visual.hand==hand,
+              visual.sourceFingerprints==[blind.firstFingerprint,blind.confirmedFingerprint],
+              visual.authority.contains("TWO_ORIGINAL_FULL_DISPLAY_DEALER_ICONS"),
+              let order=handSeatOrder(blind,
+                prior:ocr[blind.firstFrame-1],now:ocr[blind.confirmedFrame-1],
+                priorBoard:boards[blind.firstFrame-1],nowBoard:boards[blind.confirmedFrame-1],
+                priorCards:cards[blind.firstFrame-1],nowCards:cards[blind.confirmedFrame-1]),
+              order.buttonPlayerInferred==visual.buttonPlayer,
+              order.seats.filter({$0.player==c.player}).count==1,
+              !committed.contains(where:{$0.hand==hand && $0.kind=="action" &&
+                 ($0.text=="\(c.player) folds." || $0.text.hasPrefix("\(c.player) goes all-in"))}),
+              committed.contains(where:{$0.hand==hand && $0.kind=="street_visibility" &&
+                 $0.frame < f && $0.text.hasPrefix("RIVER visible")}),
+              let stack0=Decimal(string:c.beforeStackBB,locale:Locale(identifier:"en_US_POSIX")),
+              let afterText=c.afterStackBB,
+              let stack1=Decimal(string:afterText,locale:Locale(identifier:"en_US_POSIX")),
+              stack0>0,stack1==0,
+              let wager=c.displayedWager,wager.confidence>=0.8,
+              wager.priorDisplayedWagerBB==nil,
+              let value=Decimal(string:wager.amountBB,locale:Locale(identifier:"en_US_POSIX")),
+              value==stack0,
+              c.observedStackDeltaBB=="-"+String(describing:stack0)
+        else{continue}
+
+        let observationFrames=Array((f-2)...(f+2))
+        func original(_ n:Int,_ fp:String) -> Bool {
+            guard n>=1,n<=frames.count,frames[n-1].id==n,
+                  frames[n-1].file.hasPrefix("frames/"),
+                  !frames[n-1].file.contains(".."),
+                  let bytes=try? Data(contentsOf:root.appendingPathComponent(frames[n-1].file))
+            else{return false}
+            return frameFingerprint(bytes)==fp
+        }
+        guard observationFrames.allSatisfy({ n in
+            let i=n-1,fp=ocr[i].sourceFingerprint
+            return ocr[i].frame==n && ocr[i].capture.error==nil &&
+                currentLocalHand(ocr[i].capture)==hand &&
+                boards[i].frame==n && boards[i].hand==hand && boards[i].visibleBoardCount==5 &&
+                cards[i].frame==n && cards[i].hand==hand &&
+                boards[i].sourceFingerprint==fp && cards[i].sourceFingerprint==fp &&
+                original(n,fp)
+        }),
+        c.beforeFingerprint==ocr[f-2].sourceFingerprint,
+        c.currentFingerprint==ocr[f-1].sourceFingerprint,
+        member.hand==hand,member.player==c.player,
+        original(member.priorFrame,member.sourceFingerprints[0]),
+        original(member.confirmedFrame,member.sourceFingerprints[1]),
+        namedCardPresence(
+            previous:ocr[member.priorFrame-1],current:ocr[member.confirmedFrame-1],
+            previousBoard:boards[member.priorFrame-1],currentBoard:boards[member.confirmedFrame-1],
+            previousCards:cards[member.priorFrame-1],currentCards:cards[member.confirmedFrame-1]
+        ).contains(member)
+        else{continue}
+
+        func near(_ line:LocalOCRLine,_ x:Double,_ y:Double,_ dx:Double=0.03,_ dy:Double=0.038)->Bool {
+            abs(line.x-x)<dx && abs(line.y-y)<dy
+        }
+        func name(_ n:Int)->Bool {
+            ocr[n-1].capture.lines.filter { line in
+                line.confidence>=0.8 && line.text==c.player && near(line,c.x,c.y)
+            }.count==1
+        }
+        func cardsAtSeat(_ n:Int)->Bool {
+            let nearby=(cards[n-1].pairs+(cards[n-1].faceUpPairs ?? [])).filter { p in
+                abs(p.x-c.x)<0.03 && (1.0-c.y)-p.y > 0.03 && (1.0-c.y)-p.y < 0.085
+            }
+            return nearby.count==1
+        }
+        func allIn(_ n:Int)->Bool {
+            let lines=ocr[n-1].capture.lines
+            let labels=lines.filter { line in
+                line.confidence>=0.8 && near(line,c.x,c.y) &&
+                line.text.trimmingCharacters(in:.whitespaces).uppercased()=="ALL-IN"
+            }
+            let zero=lines.filter { line in
+                line.confidence>=0.8 && line.text.trimmingCharacters(in:.whitespaces)=="0 BB" &&
+                abs(line.x-c.x)<0.024 && c.y-line.y>0.025 && c.y-line.y<0.065
+            }
+            let wagers=lines.filter {line in
+                line.confidence>=0.8 && near(line,wager.x,wager.y) &&
+                line.text.trimmingCharacters(in:.whitespaces)==wager.text
+            }
+            return labels.count==1 && zero.count==1 && wagers.count==1
+        }
+        guard name(f-2),name(f-1),
+              !(ocr[f-3].capture.lines+ocr[f-2].capture.lines).contains(where:{
+                  $0.text.trimmingCharacters(in:.whitespaces).uppercased()=="ALL-IN" && near($0,c.x,c.y)
+              }),
+              observationFrames.allSatisfy(cardsAtSeat),
+              (f...(f+2)).allSatisfy(allIn)
+        else{continue}
+        let proof="ALL_IN_PHYSICAL_CERTIFIED; RIVER_ALLIN_ORIGINAL_FRAMES; physical_overlay_frame=\(f); confirmation_frame=\(f+2); " +
+            "observed_stack=\(c.beforeStackBB)->0 BB; displayed_wager=\(wager.amountBB) BB; " +
+            "named_cards_earlier=\(member.confirmedFrame); dealer_button_original_images=\(visual.firstFrame),\(visual.confirmedFrame); " +
+            "pot_and_raise_to_UNKNOWN; original fingerprints: " +
+            observationFrames.map{ocr[$0-1].sourceFingerprint}.joined(separator:",")
+        found.append(Event(frame:f+2,hand:hand,kind:"action",basis:"inferred",
+            text:"\(c.player) goes all-in (displayed wager \(wager.amountBB) BB; exact contribution unverified).",
+            evidence:proof))
+    }
+    return found.sorted{$0.frame<$1.frame}
+}
+
 // Only evidence-backed local OCR transitions may enter semantic history.
 // No wager or raise-to amount is certified by the stack difference alone.
 func localSemanticSupported(_ c: LocalActionCandidate) -> Bool {
@@ -2728,6 +2854,11 @@ actor Recorder {
             actions:localActions,ocr:localOCR,board:localBoard,
             cards:localCardBacks,buttons:blindPositions,committed:events
         ).filter { $0.frame >= first && $0.frame <= last }
+        let riverAllIns = verifiedRiverAllIns(
+            actions:localActions,ocr:localOCR,boards:localBoard,cards:localCardBacks,
+            frames:frames,named:namedCardEvidence,blinds:handPhysicalBlinds,
+            visuals:verifiedVisualButtons,committed:events,root:directory
+        ).filter {$0.frame >= first && $0.frame <= last}
         let staggeredFolds = certifiedStaggeredPreflopFolds(
             actions:localActions,
             overlays:localCandidates,
@@ -2789,7 +2920,7 @@ actor Recorder {
                 )
             }
 
-        let accepted = (acceptedActions + unorderedEpisodes + winnerEvents + streetEvents + promotedRapidFolds + recoveredOpening + mixedActions + laggedBlindFolds + namedOpening + confirmedAllIns + staggeredFolds).sorted { a,b in
+        let accepted = (acceptedActions + unorderedEpisodes + winnerEvents + streetEvents + promotedRapidFolds + recoveredOpening + mixedActions + laggedBlindFolds + namedOpening + confirmedAllIns + riverAllIns + staggeredFolds).sorted { a,b in
             if a.frame != b.frame { return a.frame < b.frame }
             if a.kind == "action" && b.kind == "action" &&
                 a.evidence.contains("RAPID_ORDER_CERTIFIED") &&
@@ -2971,6 +3102,11 @@ actor Recorder {
                 actions:localActions,ocr:localOCR,board:localBoard,
                 cards:localCardBacks,buttons:blindPositions,committed:events
             ).contains { $0.frame == id }
+            let freshRiverAllIn = verifiedRiverAllIns(
+                actions:localActions,ocr:localOCR,boards:localBoard,cards:localCardBacks,
+                frames:frames,named:namedCardEvidence,blinds:handPhysicalBlinds,
+                visuals:verifiedVisualButtons,committed:events,root:directory
+            ).contains {$0.frame == id}
             let freshStaggered = certifiedStaggeredPreflopFolds(
                 actions:localActions,
                 overlays:localCandidates,
@@ -3003,7 +3139,7 @@ actor Recorder {
             let freshStreet = confirmedBoardStreets(localBoard).contains {
                 $0.confirmedFrame == id
             }
-            if !fresh.isEmpty || freshEpisode || freshWinner || freshStreet || freshCertifiedFolds || freshOpening || freshMixed || freshLaggedFold || freshNamedOpening || freshAllIn || freshStaggered {
+            if !fresh.isEmpty || freshEpisode || freshWinner || freshStreet || freshCertifiedFolds || freshOpening || freshMixed || freshLaggedFold || freshNamedOpening || freshAllIn || freshRiverAllIn || freshStaggered {
                 try commitLocalOCRThrough(id)
             } else {
                 try publish()
@@ -4173,10 +4309,57 @@ func live354RecorderWagerReplay(
     let calls = await recorder.calls
 
     try require(
-        events == expectedEvents &&
+        events.filter{!$0.evidence.contains("RIVER_ALLIN_ORIGINAL_FRAMES")} == expectedEvents &&
+        events.count == 34 &&
+        events.filter{$0.kind == "action"}.count == 28 &&
+        events.filter{$0.evidence.contains("RIVER_ALLIN_ORIGINAL_FRAMES")}.count == 1 &&
         calls == 0,
         "AUTHORITATIVE_EVENT_HISTORY_CHANGED"
     )
+
+    let addedRiverAllIn = events.filter {$0.evidence.contains("RIVER_ALLIN_ORIGINAL_FRAMES")}
+    try require(addedRiverAllIn.count==1 &&
+        addedRiverAllIn[0].frame==350 &&
+        addedRiverAllIn[0].hand=="2874689539" &&
+        addedRiverAllIn[0].text=="urchdog07 goes all-in (displayed wager 74.75 BB; exact contribution unverified).",
+        "RIVER_ALL_IN_EVENT_NOT_PROVEN")
+    let originalActionCandidates=await recorder.localActions
+    let originalOCR=await recorder.localOCR
+    let originalBoards=await recorder.localBoard
+    let originalCards=await recorder.localCardBacks
+    let namedProofs=await recorder.namedCardEvidence
+    let blindProofs=await recorder.handPhysicalBlinds
+    let dealerProofs=await recorder.verifiedVisualButtons
+    let storedFrames=await recorder.frames
+    func replayProbe(_ a:[LocalActionCandidate],_ b:[LocalBoardObservation],
+                     _ c:[FrameCardPairs],_ n:[String:NamedCardPresence],
+                     _ v:[String:OriginalVisualButton])->[Event] {
+        verifiedRiverAllIns(actions:a,ocr:originalOCR,boards:b,cards:c,frames:storedFrames,
+            named:n,blinds:blindProofs,visuals:v,committed:expectedEvents,root:temp)
+    }
+    try require(replayProbe(originalActionCandidates,originalBoards,originalCards,namedProofs,dealerProofs).count==1,
+        "RIVER_ALLIN_POSITIVE_REPLAY_MISSING")
+    var withoutMember=namedProofs
+    withoutMember.removeValue(forKey:"2874689539|urchdog07")
+    var withoutDealer=dealerProofs
+    withoutDealer.removeValue(forKey:"2874689539")
+    var doubled=originalActionCandidates
+    doubled.append(originalActionCandidates.first{$0.frame==348 && $0.hand=="2874689539"}!)
+    var damagedBoard=originalBoards
+    let bd=damagedBoard[347]
+    damagedBoard[347]=LocalBoardObservation(frame:bd.frame,sourceFingerprint:bd.sourceFingerprint,
+        hand:bd.hand,visibleBoardCount:4)
+    var damagedCards=originalCards
+    let cd=damagedCards[347]
+    damagedCards[347]=FrameCardPairs(frame:cd.frame,sourceFingerprint:cd.sourceFingerprint,hand:cd.hand,
+        pairs:cd.pairs.filter{$0.x<0.80},faceUpPairs:cd.faceUpPairs)
+    try require(replayProbe(originalActionCandidates,originalBoards,originalCards,withoutMember,dealerProofs).isEmpty &&
+        replayProbe(originalActionCandidates,originalBoards,originalCards,namedProofs,withoutDealer).isEmpty &&
+        replayProbe(doubled,originalBoards,originalCards,namedProofs,dealerProofs).isEmpty &&
+        replayProbe(originalActionCandidates,damagedBoard,originalCards,namedProofs,dealerProofs).isEmpty &&
+        replayProbe(originalActionCandidates,originalBoards,damagedCards,namedProofs,dealerProofs).isEmpty,
+        "FORGED_RIVER_ALLIN_EVIDENCE_ACCEPTED")
+    print("RIVER_ALLIN_NEGATIVES_PASS count=5; original_frame=348 confirmation_frame=350")
 
     let checkpoint = try d.decode(
         DurableState.self,
@@ -4684,7 +4867,11 @@ func live354RecorderWagerReplay(
     )
 
     try require(
-        notes.count == 5 && withoutPositions == originalText,
+        notes.count == 5 &&
+        withoutPositions.components(separatedBy:"\n").filter {
+            !$0.contains("urchdog07 goes all-in (displayed wager 74.75 BB")
+        }.joined(separator:"\n") == originalText &&
+        shown.contains("frame 348 (confirmed frame 350): urchdog07 goes all-in"),
         "CURRENT_HAND_CONTRIBUTION_PROJECTION_CHANGED"
     )
 
@@ -4887,7 +5074,9 @@ func live354RecorderWagerReplay(
         "original_frames_verified":354,
         "checkpoint_cursor":checkpoint.cursor,
         "authoritative_events":events.count,
-        "authoritative_actions":27,
+        "authoritative_actions":28,
+        "river_allin_original_frame":348,
+        "river_allin_confirmation_frame":350,
         "named_card_proofs":named.count,
         "wagers":wagers.map { w in
             [
@@ -4900,7 +5089,7 @@ func live354RecorderWagerReplay(
             ]
         },
         "api_calls":calls,
-        "new_authoritative_actions":0,
+        "new_authoritative_actions":1,
         "current_hand_unchanged":false,
         "inline_verified_contributions":5,
         "displayed_verified_seat_positions":7,
@@ -4912,7 +5101,7 @@ func live354RecorderWagerReplay(
 
     print(
         "RECORDER_354_INTEGRATION_PASS " +
-        "frames=354 events=33 actions=27 named=12 " +
+        "frames=354 events=34 actions=28 named=12 " +
         "wagers=7 positional=2 named_only=5 " +
         "api_calls=0 current_hand_contributions=5"
     )
