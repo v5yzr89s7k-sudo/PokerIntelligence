@@ -1868,6 +1868,22 @@ func confirmedBoardStreets(
 
 // Suppress replay of the same physical WINNER animation after an OCR
 // dropout. Raw candidate observations remain unchanged.
+
+// Publication rule, not a claim of completed pot settlement:
+// a physically verified same-hand WINNER blocks later dealt-street events.
+// Keep underlying full-screen OCR and board candidates unmodified.
+func winnerPrecludesNewStreet(
+    _ street: LocalStreetVisibility,
+    candidates: [LocalOverlayCandidate],
+    ocr: [LocalOCRFrame]
+) -> Bool {
+    candidates.contains { c in
+        c.hand == street.hand &&
+        c.frame < street.confirmedFrame &&
+        supportedLocalWinner(c, ocr)
+    }
+}
+
 func repeatedPhysicalWinner(
     _ candidate: LocalOverlayCandidate,
     candidates: [LocalOverlayCandidate],
@@ -2748,7 +2764,9 @@ actor Recorder {
                 }
             }
             let streets = confirmedBoardStreets(localBoard)
-                .filter { $0.hand == hand }
+                .filter { $0.hand == hand &&
+                    !winnerPrecludesNewStreet(
+                        $0,candidates:localCandidates,ocr:localOCR) }
 
             if !streets.isEmpty {
                 lines.append(
@@ -3115,6 +3133,9 @@ actor Recorder {
         // Retained by the same authoritative checkpoint as player actions.
         let streetEvents = confirmedBoardStreets(localBoard)
             .filter { street in
+                !winnerPrecludesNewStreet(
+                    street,candidates:localCandidates,ocr:localOCR
+                ) &&
                 street.confirmedFrame >= first &&
                 street.confirmedFrame <= last &&
                 street.imageFingerprints.count == 3 &&
@@ -3348,7 +3369,9 @@ actor Recorder {
                 !localActions.contains(where: { $0.frame == id })
             }
             let freshStreet = confirmedBoardStreets(localBoard).contains {
-                $0.confirmedFrame == id
+                $0.confirmedFrame == id &&
+                !winnerPrecludesNewStreet(
+                    $0,candidates:localCandidates,ocr:localOCR)
             }
             if !fresh.isEmpty || freshEpisode || freshWinner || freshStreet || freshCertifiedFolds || freshOpening || freshMixed || freshLaggedFold || freshNamedOpening || freshAllIn || freshRiverAllIn || freshStaggered {
                 try commitLocalOCRThrough(id)

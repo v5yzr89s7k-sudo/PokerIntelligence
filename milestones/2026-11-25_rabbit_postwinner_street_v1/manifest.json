@@ -1,0 +1,15 @@
+{
+  "actions_preserved": 25,
+  "actual_flop": "UNRESOLVED",
+  "api_calls": 0,
+  "base_commit": "fd33030a3112ec82e358aa62440ac3bb9d5cfbbe",
+  "events_after": 32,
+  "events_before": 33,
+  "frame304_allin": "UNCOMMITTED",
+  "frames": 361,
+  "native_original_replays": "3/3 + 3/3",
+  "real_board_cards_vs_rabbit": "NOT_INFERRED",
+  "source_sha256": "8f84374a5fc19e46794165066dc4fc9eb7d61986c344e195ccdb1d9fe1863361",
+  "suppressed_street_frame": 320,
+  "winner_frame": 319
+}
