@@ -2151,6 +2151,22 @@ func repeatedPhysicalWinner(
     }
 }
 
+
+// Recorder-owned read-only projections, never a second event writer.
+struct HandArchiveEntry: Codable {
+    let hand: String
+    let firstFrame: Int
+    let lastFrame: Int
+    let events: Int
+    let actions: Int
+}
+struct HandArchiveIndex: Codable {
+    let version: Int
+    let cursor: Int
+    let committedEvents: Int
+    let hands: [HandArchiveEntry]
+}
+
 actor Recorder {
     var nativeCaptureTimingEnabled = false
 
@@ -2757,6 +2773,77 @@ actor Recorder {
         recorderWagerScannedThrough=upper
     }
 
+
+    func publishHandArchives() throws {
+        guard localSemanticOnly && cursor > 0 else { return }
+        try require(cursor <= localOCR.count &&
+            durableCommits.last?.reading.through_frame == cursor &&
+            durableCommits.flatMap({ $0.accepted }) == events,
+            "Hand archive requires a matching authoritative checkpoint")
+
+        var sequence = [String]()
+        var spans = [String:(first:Int,last:Int)]()
+        for row in localOCR.prefix(cursor) {
+            guard let hand = currentLocalHand(row.capture),
+                hand.range(of:"^[0-9]{8,12}$",options:.regularExpression) != nil
+            else { continue }
+            if let span = spans[hand] {
+                spans[hand] = (span.first, row.frame)
+            } else {
+                sequence.append(hand)
+                spans[hand] = (row.frame, row.frame)
+            }
+        }
+        try require(events.allSatisfy({ spans[$0.hand] != nil && $0.frame <= cursor }),
+            "Committed event has no observed hand or lies beyond archive cursor")
+        guard !sequence.isEmpty else { return }
+
+        let folder = directory.appendingPathComponent("history",isDirectory:true)
+        try FileManager.default.createDirectory(at:folder,withIntermediateDirectories:true)
+        func update(_ name:String,_ data:Data) throws {
+            let url = folder.appendingPathComponent(name)
+            if (try? Data(contentsOf:url)) != data {
+                try data.write(to:url,options:.atomic)
+            }
+        }
+        var entries = [HandArchiveEntry]()
+        for (i, hand) in sequence.enumerated() {
+            guard let span = spans[hand] else { continue }
+            let accepted = events.filter { $0.hand == hand }
+            let actionCount = accepted.filter { $0.kind == "action" }.count
+            entries.append(HandArchiveEntry(hand:hand,firstFrame:span.first,
+                lastFrame:span.last,events:accepted.count,actions:actionCount))
+            var lines = [
+                "HAND \(hand) — AUTHORITATIVE CHECKPOINT PROJECTION",
+                "Observed frames \(span.first)-\(span.last)",
+                "Committed events \(accepted.count); actions \(actionCount)",
+                i == sequence.count-1 ? "Latest hand: completion UNKNOWN" :
+                    "Later hand observed: settlement NOT CERTIFIED",
+                "Only committed events are included. OCR candidates are not actions.",
+                "Rabbit cards are not dealt streets; WINNER does not certify payout.",
+                "Missing actions, exact contributions and payouts remain UNKNOWN.", ""
+            ]
+            let ordered = accepted.enumerated().sorted { x,y in
+                let a = evidenceBackedDisplayFrame(x.element)
+                let b = evidenceBackedDisplayFrame(y.element)
+                return a == b ? x.offset < y.offset : a < b
+            }
+            if ordered.isEmpty { lines.append("No committed events in this segment.") }
+            for item in ordered {
+                let e = item.element
+                let physical = evidenceBackedDisplayFrame(e)
+                let timing = physical == e.frame ? "f\(e.frame)" :
+                    "f\(physical) (confirmed f\(e.frame))"
+                lines.append("\(timing) [\(e.kind)/\(e.basis)] \(e.text)")
+                lines.append("  evidence: \(e.evidence)")
+            }
+            try update("hand_\(hand).txt",Data((lines.joined(separator:"\n")+"\n").utf8))
+        }
+        let index = HandArchiveIndex(version:1,cursor:cursor,
+            committedEvents:events.count,hands:entries)
+        try update("index.json",try encoded(index))
+    }
+
     func publish() throws {
         try recover()
         refreshBlindEvidence()
@@ -3214,6 +3301,7 @@ actor Recorder {
         try Data(committedCurrentHand.utf8).write(
             to: directory.appendingPathComponent("current_hand.txt"),
             options: .atomic)
+        try publishHandArchives()
         try publishFoldReceipts(hand:observedCurrentHand)
         try encoded(committedFoldFacts(events)).write(to: directory.appendingPathComponent("committed_fold_facts.json"), options: .atomic)
         try Data(text.utf8).write(to: directory.appendingPathComponent("hand.txt"), options: .atomic)
