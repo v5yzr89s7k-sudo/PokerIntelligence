@@ -6063,7 +6063,7 @@ func whiteCardComponents(
            Double(ww) <= 0.14*Double(w) &&
            Double(hh) >= 0.045*Double(h) &&
            Double(hh) <= 0.30*Double(h) &&
-           aspect >= 1.04 &&
+           aspect >= 1.00 &&
            aspect <= 1.75 &&
            fill >= 0.57 {
             result.append(Box(

@@ -1,0 +1,16 @@
+{
+  "api_calls": 0,
+  "aspect_min_new": 1.0,
+  "aspect_min_old": 1.04,
+  "deterministic_replays": "3/3 PLUS 3/3",
+  "full_361_authoritative_actions": 27,
+  "full_361_authoritative_events": 35,
+  "old_354_board_counts": "UNCHANGED",
+  "parent_commit": "85fd107aa490e7671f6ef856d289d7451aa611a0",
+  "rabbit_false_street_320": "NOT_PUBLISHED",
+  "real_flop_visible_by_frame": 296,
+  "reason": "Third flop card partially occluded by chips; aspect 82/80",
+  "recovered_flop_confirmed_frame": 297,
+  "source_sha256": "7c053332780cb1671c1352bebe5b8905c938dcba7c0f57bb07247d6c82544656",
+  "two_physical_allins": "PRESERVED 69 AND 306"
+}
